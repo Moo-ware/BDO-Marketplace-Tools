@@ -153,8 +153,8 @@ cython_debug/
 
 *.pkl
 *.json
-# Legacy in-repo data dir (kept as a migration backup). Live data now lives in the per-user
-# dir resolved by bdo_marketplace_tools/storage/paths.py (%LOCALAPPDATA%\bdo-marketplace-tools).
+# Legacy/private in-repo data dir. Live data now lives in the per-user dir resolved by
+# bdo_marketplace_tools/storage/paths.py (%LOCALAPPDATA%\bdo-marketplace-tools).
 data/
 docs/dev/
 .changesets/

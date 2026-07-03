@@ -32,6 +32,35 @@ BANNER_ART = r"""
 ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝                ███████████
 """.strip("\n")
 
+# Same art with the mascot's eyes closed (blink frame) — the eyes are the two gaps in the
+# "████  █████████  ████" row. Line widths must match BANNER_ART exactly so the blink never
+# shifts layout.
+BANNER_BLINK_ART = r"""
+██████╗ ██████╗  ██████╗                                             ███████████
+██╔══██╗██╔══██╗██╔═══██╗                                        █████████████████
+██████╔╝██║  ██║██║   ██║                                      ███████     ███████
+██╔══██╗██║  ██║██║   ██║                                     ██████   █   ███████
+██████╔╝██████╔╝╚██████╔╝                                    █████████   █████████
+╚═════╝ ╚═════╝  ╚═════╝                                     █████████████████████
+███╗   ███╗ █████╗ ██████╗ ██╗  ██╗███████╗████████╗        ████▄▄█████████▄▄████
+████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔════╝╚══██╔══╝        █████████████████████
+██╔████╔██║███████║██████╔╝█████╔╝ █████╗     ██║            ███████   █████████
+██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══╝     ██║            ███████████████████
+██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗███████╗   ██║             ████████████████
+╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝                ███████████
+""".strip("\n")
+
+# Rotating footer lines while the monitor runs. Index 0 is the default; the pool is
+# cosmetic and safe to edit freely.
+RUNNING_QUIPS = (
+    "watching the marketplace",
+    "eyes on the listings…",
+    "nothing gets past me",
+    "refreshing so you don't have to",
+    "waiting for someone to blink first",
+    "pearl outfits won't hide forever",
+)
+
 TEST_LOG_MESSAGES = [
     ("Synthetic scan completed: no outfits detected.", "info"),
     ("Synthetic outfit detected in premium category.", "success"),

@@ -1,4 +1,5 @@
 import random
+import time
 from typing import Optional
 
 from rich.align import Align
@@ -24,7 +25,9 @@ from bdo_marketplace_tools.ui.display import (
     APP_TITLE,
     COLOR_BRAND,
     COLOR_ERROR,
+    COLOR_GOLD,
     COLOR_INFO,
+    COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
     format_compact_number,
@@ -47,8 +50,10 @@ from bdo_marketplace_tools.ui.modals import (
 from bdo_marketplace_tools.ui.styles import APP_CSS
 from bdo_marketplace_tools.ui.theme import (
     BANNER_ART,
+    BANNER_BLINK_ART,
     DEFAULT_THEME,
     IDLE_DOT,
+    RUNNING_QUIPS,
     STATUS_DOT,
     STATUS_STYLES,
     TEST_LOG_MESSAGES,
@@ -116,6 +121,10 @@ class MarketplaceToolsApp(App[None]):
         self._rendered_events: tuple[str, ...] | None = None
         self._dashboard_snapshot: tuple[str, ...] | None = None
         self._syncing_controls = False
+        # Cosmetic animations (pulse/blink/quips); tests turn this off for determinism.
+        self.animations_enabled = True
+        self._pulse_index = 0
+        self._quip_index = 0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
@@ -168,6 +177,9 @@ class MarketplaceToolsApp(App[None]):
     async def on_mount(self) -> None:
         await self.show_view("dashboard")
         self.set_interval(1, self.refresh_live_widgets)
+        self.set_interval(0.12, self.advance_running_pulse)
+        self.set_interval(4.0, self.blink_mascot)
+        self.set_interval(30.0, self.advance_running_quip)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
 
     def on_resize(self, event) -> None:
@@ -631,6 +643,8 @@ class MarketplaceToolsApp(App[None]):
             return label[3:]
         return label
 
+    RUNNING_PULSE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
     def refresh_chrome_status(self) -> None:
         tm = self.task_manager
         running = tm.monitor_running()
@@ -696,15 +710,79 @@ class MarketplaceToolsApp(App[None]):
             card.display = self.current_view == "dashboard"
             card.set_class(not self.should_show_banner(), "-compact")
             self.query_one("#banner", Static).display = self.should_show_banner()
+        except Exception:
+            pass
+        self.refresh_welcome_footer(running)
+
+    def time_greeting(self) -> str:
+        hour = time.localtime().tm_hour
+        if 5 <= hour < 12:
+            return "Good morning"
+        if 12 <= hour < 17:
+            return "Good afternoon"
+        if 17 <= hour < 22:
+            return "Good evening"
+        # "Good night" is a farewell, not a greeting — the night bucket gets its own voice.
+        return "Up late?"
+
+    def refresh_welcome_footer(self, running: bool) -> None:
+        # One centered line: status · greeting/chatter · lifetime record. The stats tail is
+        # identical in both states so the run/idle switch stays calm.
+        try:
+            tm = self.task_manager
             footer = Text()
             if running:
-                footer.append("◉ ", style=COLOR_BRAND)
+                frame = self.RUNNING_PULSE_FRAMES[self._pulse_index]
+                footer.append(f"{frame} ", style=COLOR_BRAND)
                 footer.append("Running", style=STATUS_STYLES["success"])
-                footer.append("  ·  watching the marketplace", style=COLOR_TEXT_MUTED)
+                chatter_line = RUNNING_QUIPS[self._quip_index % len(RUNNING_QUIPS)]
             else:
                 footer.append(f"{IDLE_DOT} Idle", style="#777777")
-                footer.append("  ·  ready when you are", style=COLOR_TEXT_MUTED)
+                chatter_line = self.time_greeting()
+            footer.append("  ·  ", style="#3a3a3a")
+            footer.append(chatter_line, style="bold #d8d3c8")
+            footer.append("  ·  ", style="#3a3a3a")
+            footer.append(f"{tm.lifetime_successful_purchases:,}", style=COLOR_GOLD)
+            footer.append(" outfits · ", style=COLOR_TEXT_MUTED)
+            footer.append(format_compact_number(tm.lifetime_silver_spent), style=COLOR_GOLD)
+            footer.append(" silver all-time", style=COLOR_TEXT_MUTED)
             self.query_one("#welcome-footer", Static).update(footer)
+        except Exception:
+            pass
+
+    def advance_running_pulse(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if not self.task_manager.monitor_running():
+            return
+        self._pulse_index = (self._pulse_index + 1) % len(self.RUNNING_PULSE_FRAMES)
+        self.refresh_welcome_footer(True)
+
+    def advance_running_quip(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if not self.task_manager.monitor_running():
+            return
+        # Random pick, but never the same line twice in a row.
+        choices = [i for i in range(len(RUNNING_QUIPS)) if i != self._quip_index]
+        self._quip_index = random.choice(choices)
+        self.refresh_welcome_footer(True)
+
+    def blink_mascot(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        try:
+            banner = self.query_one("#banner", Static)
+        except Exception:
+            return
+        if not banner.display:
+            return
+        banner.update(BANNER_BLINK_ART)
+        self.set_timer(0.15, self._end_mascot_blink)
+
+    def _end_mascot_blink(self) -> None:
+        try:
+            self.query_one("#banner", Static).update(BANNER_ART)
         except Exception:
             pass
 
@@ -2227,17 +2305,18 @@ class MarketplaceToolsApp(App[None]):
 
         if self.task_manager.purchase_submission_enabled and not self.api_handler.login_status:
             if self.task_manager.uses_steam_browser_session():
-                self.set_status(
-                    "Steam Account refresh required before starting buy mode. Refresh Session first.",
-                    "warning",
-                )
+                message = "Steam Account refresh required before starting buy mode. Refresh Session first."
+                self.set_status(message)
+                self.task_manager.add_event(message, "warning")
                 self.refresh_live_widgets()
                 return
 
-            self.set_status(
-                "Login required before starting buy mode. Login or refresh the marketplace session before starting the monitor.",
-                "warning",
+            message = (
+                "Login required before starting buy mode. "
+                "Login or refresh the marketplace session before starting the monitor."
             )
+            self.set_status(message)
+            self.task_manager.add_event(message, "warning")
             self.refresh_live_widgets()
             return
 

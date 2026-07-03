@@ -2,13 +2,6 @@ import os
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-# Pre-AppData location: data used to live inside the app folder. Kept only as a migration
-# source (see storage/migration.py) so existing installs don't lose stats/session/profiles
-# when the user updates by re-downloading or re-cloning the app.
-LEGACY_DATA_DIR = PROJECT_ROOT / "data"
-
 APP_DIR_NAME = "bdo-marketplace-tools"
 # Set BDO_DATA_DIR to keep data anywhere you like (portable installs, tests, power users).
 DATA_DIR_ENV_VAR = "BDO_DATA_DIR"

@@ -86,7 +86,6 @@ from bdo_marketplace_tools.services import task_manager as task_manager_module
 from bdo_marketplace_tools.services import update_checker as update_checker_module
 from bdo_marketplace_tools.storage.paths import PA_MARKET_PROFILE_PATH
 from bdo_marketplace_tools.storage import paths as paths_module
-from bdo_marketplace_tools.storage import migration as migration_module
 from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.storage.browser_profile_cache import (
     BrowserProfileCleanupResult,
@@ -100,7 +99,9 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
+    BANNER_BLINK_ART,
     DEFAULT_THEME,
+    RUNNING_QUIPS,
     STATUS_STYLES,
     DashboardTile,
     MarketplaceToolsApp,
@@ -182,9 +183,7 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.APIHandler", return_value=fake_api), patch(
             "main.BackgroundTasks",
             return_value=fake_manager,
-        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
-            "main.migrate_legacy_data_dir", return_value=False
-        ):
+        ), patch("main.MarketplaceToolsApp", FakeApp):
             await app_main.run_app(test_mode=True)
 
         fake_manager.initial_login_check.assert_not_called()
@@ -202,30 +201,11 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.APIHandler", return_value=fake_api), patch(
             "main.BackgroundTasks",
             return_value=fake_manager,
-        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
-            "main.migrate_legacy_data_dir", return_value=False
-        ):
+        ), patch("main.MarketplaceToolsApp", FakeApp):
             await app_main.run_app(test_mode=False)
 
         fake_manager.initial_login_check.assert_awaited_once()
         self.assertEqual(FakeApp.instances[0].launch_mode, "live")
-
-    async def test_run_app_announces_data_migration(self):
-        fake_api = FakeAPI()
-        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
-        fake_manager.initial_login_check = AsyncMock()
-        FakeApp.instances = []
-
-        with patch("main.APIHandler", return_value=fake_api), patch(
-            "main.BackgroundTasks",
-            return_value=fake_manager,
-        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
-            "main.migrate_legacy_data_dir", return_value=True
-        ):
-            await app_main.run_app(test_mode=True)
-
-        self.assertTrue(any("moved to your user data folder" in event for event in fake_manager.events))
 
     def test_env_var_enables_test_mode(self):
         with patch.dict("os.environ", {"BDO_MARKET_TEST_MODE": "true"}):
@@ -5690,6 +5670,9 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         # UI tests must not perform the on-mount network update check; the startup-check
         # behavior is covered by the focused BackgroundTasks update tests instead.
         app.startup_update_check = AsyncMock()
+        # Cosmetic animation timers (pulse/blink/celebration) are disabled so renders stay
+        # deterministic; the animation tests call the animation methods directly.
+        app.animations_enabled = False
         return app
 
     async def test_app_launches_and_navigates_tabs(self):
@@ -5768,6 +5751,45 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.checker_enabled = False
                 app.refresh_live_widgets()
                 self.assertTrue(app.query_one("#banner").display)
+
+    async def test_dashboard_animations_pulse_and_blink(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(150, 45)) as pilot:
+                app.animations_enabled = True
+
+                # Mascot blink swaps the banner art and restores it shortly after.
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
+                app.blink_mascot()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)
+                await pilot.pause(0.3)
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
+
+                # Idle: one centered line — status · greeting · lifetime record.
+                footer = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Idle", footer)
+                self.assertIn(app.time_greeting(), footer)
+                self.assertIn(
+                    app.time_greeting(), ("Good morning", "Good afternoon", "Good evening", "Up late?")
+                )
+                self.assertIn("all-time", footer)
+
+                # Running: status spins, chatter rotates, the stats tail stays.
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+                footer = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("⠋", footer)
+                self.assertIn("Running", footer)
+                self.assertIn("watching the marketplace", footer)
+                self.assertIn("all-time", footer)
+                app.advance_running_pulse()
+                self.assertIn("⠙", str(app.query_one("#welcome-footer", Static).render()))
+                app.advance_running_quip()
+                footer = str(app.query_one("#welcome-footer", Static).render())
+                self.assertNotIn("watching the marketplace", footer)
+                self.assertTrue(any(quip in footer for quip in RUNNING_QUIPS[1:]))
+
+                app.task_manager.checker_enabled = False
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
@@ -6098,7 +6120,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.refresh_live_widgets()
                 self.assertTrue(app.query_one("#monitor-toggle").has_class("toggle-start"))
                 footer_text = str(app.query_one("#welcome-footer", Static).render())
-                self.assertIn("Idle", footer_text)
+                self.assertNotIn("Running", footer_text)
+                self.assertIn("all-time", footer_text)
 
                 self.assertIs(app.query_one("#tile-session").parent, app.query_one("#dashboard-primary-tiles"))
                 self.assertIs(app.query_one("#tile-buy-delay").parent, app.query_one("#dashboard-primary-tiles"))
@@ -6826,6 +6849,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         event_text = app.task_manager.events[0]
         self.assertIn("Login required before starting buy mode", event_text)
         self.assertIn("Login or refresh the marketplace session", event_text)
+        core_text = "\n".join(app.task_manager.events_for_channel("core"))
+        ui_text = "\n".join(app.task_manager.events_for_channel("ui"))
+        self.assertIn("Login required before starting buy mode", core_text)
+        self.assertNotIn("Login required before starting buy mode", ui_text)
 
     async def test_login_refresh_uses_browser_refresh_without_direct_pa_login(self):
         app = self.make_app()
@@ -7257,53 +7284,6 @@ class DataDirResolutionTests(unittest.TestCase):
                     paths_module.default_data_dir(),
                     Path(temp_dir) / paths_module.APP_DIR_NAME / "data",
                 )
-
-
-class LegacyDataMigrationTests(unittest.TestCase):
-    def _seed_legacy(self, legacy_dir):
-        legacy_dir.mkdir(parents=True, exist_ok=True)
-        (legacy_dir / "app_settings.json").write_text('{"legacy": true}', encoding="utf-8")
-        (legacy_dir / "local_stats.json").write_text('{"silver_spent": 5}', encoding="utf-8")
-        profile = legacy_dir / "browser_profiles" / "steam-market"
-        profile.mkdir(parents=True, exist_ok=True)
-        (profile / "marker.txt").write_text("profile", encoding="utf-8")
-
-    def test_migrates_legacy_data_and_keeps_backup(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            legacy = Path(temp_dir) / "repo" / "data"
-            target = Path(temp_dir) / "appdata" / "data"
-            self._seed_legacy(legacy)
-
-            self.assertTrue(migration_module.migrate_legacy_data_dir(legacy, target))
-            self.assertEqual((target / "app_settings.json").read_text(encoding="utf-8"), '{"legacy": true}')
-            self.assertTrue((target / "local_stats.json").exists())
-            self.assertTrue((target / "browser_profiles" / "steam-market" / "marker.txt").exists())
-            # Original folder is left in place as a backup.
-            self.assertTrue((legacy / "app_settings.json").exists())
-
-    def test_does_not_overwrite_existing_target_data(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            legacy = Path(temp_dir) / "repo" / "data"
-            target = Path(temp_dir) / "appdata" / "data"
-            self._seed_legacy(legacy)
-            target.mkdir(parents=True)
-            (target / "app_settings.json").write_text('{"existing": true}', encoding="utf-8")
-
-            self.assertFalse(migration_module.migrate_legacy_data_dir(legacy, target))
-            self.assertEqual((target / "app_settings.json").read_text(encoding="utf-8"), '{"existing": true}')
-
-    def test_no_op_when_legacy_missing(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            legacy = Path(temp_dir) / "repo" / "data"
-            target = Path(temp_dir) / "appdata" / "data"
-            self.assertFalse(migration_module.migrate_legacy_data_dir(legacy, target))
-            self.assertFalse(target.exists())
-
-    def test_no_op_when_legacy_and_target_are_same_path(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            same = Path(temp_dir) / "data"
-            self._seed_legacy(same)
-            self.assertFalse(migration_module.migrate_legacy_data_dir(same, same))
 
 
 if __name__ == "__main__":
