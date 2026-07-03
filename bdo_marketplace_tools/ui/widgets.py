@@ -83,6 +83,45 @@ class DashboardTile(Static, can_focus=True):
         self.blur()
 
 
+class MonitorToggleTile(Static, can_focus=True):
+    BINDINGS = [
+        Binding("enter", "press", "Press", show=False),
+    ]
+
+    class Pressed(Message):
+        def __init__(self, tile: "MonitorToggleTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self) -> None:
+        super().__init__("", id="monitor-toggle", classes="toggle-start")
+
+    def focus_on_click(self) -> bool:
+        return False
+
+    def action_press(self) -> None:
+        self.post_message(self.Pressed(self))
+
+    def on_click(self) -> None:
+        self.action_press()
+        self.blur()
+
+
+class MonitorModeTile(Static):
+    class Pressed(Message):
+        def __init__(self, tile: "MonitorModeTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self, mode_key: str, title: str) -> None:
+        super().__init__("", id=f"monitor-mode-{mode_key}", classes="modal-info-tile modal-info-clickable")
+        self.mode_key = mode_key
+        self.border_title = title
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
 class PollingPresetTile(Static):
     class Pressed(Message):
         def __init__(self, preset: "PollingPresetTile") -> None:

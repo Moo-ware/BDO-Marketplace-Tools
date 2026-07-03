@@ -5754,6 +5754,20 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#welcome-card").display)
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
+                self.assertTrue(app.query_one("#banner").display)
+                self.assertFalse(app.query_one("#welcome-card").has_class("-compact"))
+
+                # Running only flips the footer text; the banner stays (auto-collapse removed).
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+                self.assertTrue(app.query_one("#welcome-card").display)
+                self.assertTrue(app.query_one("#banner").display)
+                self.assertFalse(app.query_one("#welcome-card").has_class("-compact"))
+                footer_text = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Running", footer_text)
+                app.task_manager.checker_enabled = False
+                app.refresh_live_widgets()
+                self.assertTrue(app.query_one("#banner").display)
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
@@ -5997,7 +6011,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.refresh_live_widgets()
 
                 rendered_tiles = []
-                for tile_id in ("monitor", "spent", "credentials", "session", "polling", "buy-delay", "success", "runtime"):
+                for tile_id in ("monitor", "spent", "credentials", "session", "polling", "buy-delay"):
                     tile = app.query_one(f"#tile-{tile_id}", DashboardTile)
                     rendered_tiles.append(str(tile.border_title))
                 rendered_tiles.extend(
@@ -6005,35 +6019,87 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     for tile_id, value, detail, _level, _show_dot in app.dashboard_tile_data(app.dashboard_snapshot())
                 )
                 rendered_tiles = "\n".join(rendered_tiles)
-                self.assertIn("Monitor", rendered_tiles)
-                self.assertIn("Success Rate", rendered_tiles)
+                self.assertIn("Mode", rendered_tiles)
+                self.assertIn("Watch only", rendered_tiles)
                 self.assertIn("Spent", rendered_tiles)
                 self.assertIn("Credentials", rendered_tiles)
                 self.assertIn("Session", rendered_tiles)
                 self.assertIn("Polling", rendered_tiles)
                 self.assertIn("Buy Delay", rendered_tiles)
-                self.assertIn("Runtime", rendered_tiles)
                 self.assertIn("No account", rendered_tiles)
                 self.assertIn("Refresh required", rendered_tiles)
                 self.assertIn("15-30s", rendered_tiles)
                 self.assertIn("Slow", rendered_tiles)
                 self.assertIn("1-2.5s", rendered_tiles)
                 self.assertIn("Between buys", rendered_tiles)
-                self.assertIn("2/4 bought", rendered_tiles)
-                self.assertIn("50%", rendered_tiles)
                 self.assertIn("1.5B silver", rendered_tiles)
                 self.assertIn("Cap: ∞", rendered_tiles)
-                footer_state = str(app.query_one("#status-state", Static).render())
-                self.assertIn("cap", footer_state)
-                self.assertIn("∞", footer_state)
-                self.assertNotIn("silver", footer_state)
+                self.assertEqual(len(list(app.query("#tile-success"))), 0)
+                self.assertEqual(len(list(app.query("#tile-runtime"))), 0)
+                info_bar = str(app.query_one("#status-keys", Static).render())
+                self.assertIn("Watch only", info_bar)
+                self.assertIn("cap", info_bar)
+                self.assertIn("∞", info_bar)
+                self.assertNotIn("bought", info_bar)
+                quit_hint = str(app.query_one("#status-state", Static).render())
+                self.assertIn("quit", quit_hint)
                 app.task_manager.max_spend = 10_000_000_000
                 app.refresh_live_widgets()
-                footer_state = str(app.query_one("#status-state", Static).render())
-                self.assertIn("10B", footer_state)
-                self.assertNotIn("silver", footer_state)
+                info_bar = str(app.query_one("#status-keys", Static).render())
+                self.assertIn("10B", info_bar)
+                self.assertNotIn("silver", info_bar)
                 app.task_manager.max_spend = None
                 app.refresh_live_widgets()
+
+                # The toggle must actually be on screen, not just mounted (regression: fr-width
+                # rows once pushed it past the deck's right edge).
+                deck_region = app.query_one("#dashboard-deck").region
+                toggle_region = app.query_one("#monitor-toggle").region
+                self.assertGreaterEqual(toggle_region.width, 14)
+                self.assertLessEqual(toggle_region.right, deck_region.right)
+                self.assertGreater(toggle_region.x, app.query_one("#dashboard-tiles").region.right)
+
+                # Running state: toggle flips to STOP and the info bar picks up the session stats.
+                toggle_console = Console(width=40, color_system=None)
+                self.assertTrue(app.query_one("#monitor-toggle").has_class("toggle-start"))
+                with toggle_console.capture() as toggle_capture:
+                    toggle_console.print(app.query_one("#monitor-toggle", Static).content)
+                self.assertIn("START", toggle_capture.get())
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+                self.assertTrue(app.query_one("#monitor-toggle").has_class("toggle-stop"))
+                with toggle_console.capture() as toggle_capture:
+                    toggle_console.print(app.query_one("#monitor-toggle", Static).content)
+                self.assertIn("STOP", toggle_capture.get())
+                info_bar = str(app.query_one("#status-keys", Static).render())
+                self.assertIn("bought", info_bar)
+                self.assertIn("2/4", info_bar)
+                self.assertIn("50%", info_bar)
+                self.assertIn("run", info_bar)
+                footer_text = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Running", footer_text)
+
+                # A fresh run shows the stats immediately (dimmed zeros) but no misleading 0%.
+                app.task_manager.session_detected_outfits = 0
+                app.task_manager.session_successful_purchases = 0
+                app.task_manager.session_silver_spent = 0
+                app.refresh_live_widgets()
+                info_bar = str(app.query_one("#status-keys", Static).render())
+                self.assertIn("bought", info_bar)
+                self.assertIn("0/0", info_bar)
+                self.assertNotIn("%", info_bar)
+                self.assertIn("spent", info_bar)
+                self.assertIn("run", info_bar)
+                app.task_manager.session_detected_outfits = 4
+                app.task_manager.session_successful_purchases = 2
+                app.task_manager.session_silver_spent = 1_500_000_000
+                app.refresh_live_widgets()
+                app.task_manager.checker_enabled = False
+                app.refresh_live_widgets()
+                self.assertTrue(app.query_one("#monitor-toggle").has_class("toggle-start"))
+                footer_text = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Idle", footer_text)
+
                 self.assertIs(app.query_one("#tile-session").parent, app.query_one("#dashboard-primary-tiles"))
                 self.assertIs(app.query_one("#tile-buy-delay").parent, app.query_one("#dashboard-primary-tiles"))
                 self.assertIs(app.query_one("#tile-monitor").parent, app.query_one("#dashboard-secondary-tiles"))
@@ -6126,10 +6192,6 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Required", session_credentials_text)
                 self.assertIn("Save PA credentials first", session_credentials_text)
                 await pilot.press("escape")
-                await pilot.click("#tile-success")
-                self.assertEqual(app.current_view, "dashboard")
-                await pilot.click("#tile-runtime")
-                self.assertEqual(app.current_view, "dashboard")
 
     async def test_credentials_modal_can_select_steam_browser_session_mode(self):
         app = self.make_app()
@@ -6184,7 +6246,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Login method set to Steam Account", app.status_message)
                 self.assertEqual(app.credential_state()[0], "Steam Account")
                 self.assertEqual(app.credential_state()[2], "steam")
-                self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "error"))
+                self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "idle"))
                 self.assertFalse(app.query_visible_one("#clear-credentials", Button).display)
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
 
@@ -6659,8 +6721,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("200.0 MiB", rendered)
         self.assertEqual(cache_input_value, str(app.task_manager.browser_cache_cleanup_threshold_mb))
         self.assertEqual(cache_input_width, 8)
-        self.assertEqual(cache_input_height, 3)
-        self.assertEqual(cache_input_background, "Color(0, 0, 0, a=0)")
+        self.assertEqual(cache_input_height, 1)
+        self.assertEqual(cache_input_background, "Color(16, 16, 16)")
         self.assertEqual(settings_status_margin_bottom, 1)
         self.assertFalse(cache_input_kept_focus_after_click_away)
 
@@ -6719,10 +6781,13 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.1)
                 self.assertFalse(app.task_manager.single_item_test_checker_enabled)
                 self.assertIsInstance(app.query_visible_one("#confirm-start"), ModalAction)
-                confirmation_text = "\n".join(
-                    str(widget.render()) for widget in app.screen_stack[-1].query(Static)
-                )
-                self.assertIn("Buy delay: 3.25-5.5s", confirmation_text)
+                confirm_console = Console(width=80, color_system=None)
+                with confirm_console.capture() as confirm_capture:
+                    for widget in app.screen_stack[-1].query(Static):
+                        confirm_console.print(widget.content)
+                confirmation_text = confirm_capture.get()
+                self.assertIn("Buy delay", confirmation_text)
+                self.assertIn("3.25-5.5s", confirmation_text)
 
                 await pilot.click("#confirm-start")
                 await pilot.pause(0.1)
@@ -6897,34 +6962,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await app.stop_monitor()
                 self.assertFalse(app.task_manager.checker_enabled)
 
-    async def test_monitor_modal_buttons_follow_running_state_and_watch_start_closes_modal(self):
+    async def test_monitor_modal_mode_selection_toggles_buy_mode(self):
         app = self.make_app()
 
-        async def idle_checker():
-            await asyncio.sleep(60)
-
-        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
-            app.task_manager,
-            "checker",
-            new=idle_checker,
-        ):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-monitor")
                 await pilot.pause()
-                self.assertFalse(app.query_visible_one("#modal-start-monitor", Button).disabled)
-                self.assertTrue(app.query_visible_one("#modal-stop-monitor", Button).disabled)
+                # The modal no longer duplicates run control (big dashboard toggle owns it).
+                self.assertEqual(len(list(app.screen_stack[-1].query("#modal-start-monitor"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#modal-stop-monitor"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#buy-mode-switch"))), 0)
+                self.assertTrue(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
+                self.assertFalse(app.query_visible_one("#monitor-mode-buy").has_class("preset-selected"))
 
-                await pilot.click("#modal-start-monitor")
+                await pilot.click("#monitor-mode-buy")
                 await pilot.pause(0.1)
-                self.assertTrue(app.task_manager.checker_enabled)
-                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+                self.assertTrue(app.task_manager.purchase_submission_enabled)
+                self.assertTrue(app.query_visible_one("#monitor-mode-buy").has_class("preset-selected"))
+                self.assertFalse(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
+                self.assertIn("buy mode", app.status_message)
 
-                await pilot.click("#tile-monitor")
-                await pilot.pause()
-                self.assertTrue(app.query_visible_one("#modal-start-monitor", Button).disabled)
-                self.assertFalse(app.query_visible_one("#modal-stop-monitor", Button).disabled)
-
-                await app.stop_monitor()
+                await pilot.click("#monitor-mode-watch")
+                await pilot.pause(0.1)
+                self.assertFalse(app.task_manager.purchase_submission_enabled)
+                self.assertTrue(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
+                self.assertIn("watch only", app.status_message)
 
     async def test_buy_mode_start_confirmation_closes_monitor_modal_stack(self):
         app = self.make_app()
@@ -6944,13 +7007,17 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-monitor")
                 await pilot.pause()
-                await pilot.click("#modal-start-monitor")
+                # Starting (via the dashboard toggle / space) while buy mode is set asks for confirmation.
+                await app.start_monitor()
                 await pilot.pause(0.1)
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "ConfirmBuyModeScreen")
-                confirmation_text = "\n".join(
-                    str(widget.render()) for widget in app.screen_stack[-1].query(Static)
-                )
-                self.assertIn("Buy delay: 4.5-8s", confirmation_text)
+                confirm_console = Console(width=80, color_system=None)
+                with confirm_console.capture() as confirm_capture:
+                    for widget in app.screen_stack[-1].query(Static):
+                        confirm_console.print(widget.content)
+                confirmation_text = confirm_capture.get()
+                self.assertIn("Buy delay", confirmation_text)
+                self.assertIn("4.5-8s", confirmation_text)
 
                 await pilot.click("#confirm-start")
                 await pilot.pause(0.1)

@@ -112,6 +112,11 @@ APP_CSS = """
         border-top: solid #2b2b2b;
     }
 
+    #welcome-card.-compact #welcome-footer {
+        height: 1;
+        border-top: none;
+    }
+
     #body {
         height: 1fr;
     }
@@ -182,23 +187,29 @@ APP_CSS = """
 
     #settings-cache-threshold-input {
         width: 8;
-        height: 3;
+        height: 1;
+        margin-top: 1;
         margin-right: 1;
-        border: round #d8d3c8;
-        background: transparent;
+        border: none;
+        background: #101010;
         color: #d8d3c8;
         padding: 0 1;
     }
 
     #settings-cache-threshold-input:focus {
-        border: round #d8d3c8;
-        background: transparent;
+        border: none;
+        background: #241c12;
         color: #d8d3c8;
     }
 
     #settings-cache-threshold-input > .input--cursor {
-        background: #d8d3c8;
-        color: #111111;
+        background: transparent;
+        color: __COLOR_BRAND__;
+        text-style: underline;
+    }
+
+    #settings-cache-threshold-input > .input--selection {
+        background: #3a2c18;
     }
 
     #settings-cache-threshold-input > .input--placeholder {
@@ -220,11 +231,17 @@ APP_CSS = """
         margin-bottom: 0;
     }
 
+    #dashboard-deck {
+        height: 7;
+    }
+
     #dashboard-tiles {
+        width: auto;
         height: 7;
     }
 
     .dashboard-tile-row {
+        width: auto;
         height: 3;
         padding-left: 1;
     }
@@ -242,11 +259,6 @@ APP_CSS = """
         content-align: left middle;
     }
 
-    .dashboard-tile-gap {
-        width: 1fr;
-        min-width: 2;
-    }
-
     .tile-clickable {
         background: #262626;
         color: #d8d3c8;
@@ -260,9 +272,38 @@ APP_CSS = """
         background: #333231;
     }
 
-    .tile-muted {
-        background: #151515;
-        color: #777777;
+    #monitor-toggle {
+        width: 1fr;
+        min-width: 14;
+        height: 7;
+        margin: 0 1 0 1;
+        content-align: center middle;
+    }
+
+    .toggle-start {
+        background: #33230f;
+        color: __COLOR_BRAND__;
+    }
+
+    .toggle-start:hover {
+        background: #46301a;
+    }
+
+    .toggle-start:focus {
+        background: #46301a;
+    }
+
+    .toggle-stop {
+        background: #2e1a1a;
+        color: __COLOR_ERROR__;
+    }
+
+    .toggle-stop:hover {
+        background: #3d2222;
+    }
+
+    .toggle-stop:focus {
+        background: #3d2222;
     }
 
     #event-log {
@@ -396,6 +437,7 @@ APP_CSS = """
 
     .cache-controls-row, .danger-actions-row {
         height: 3;
+        align: left middle;
     }
 
     .cache-inline-label {
@@ -491,11 +533,12 @@ MODAL_CSS = """
         width: 68;
         max-width: 90%;
         height: auto;
-        border: round __COLOR_BRAND__;
+        border: round #3a3a3a;
         border-title-color: __COLOR_BRAND__;
         border-title-style: bold;
+        border-subtitle-color: #5f5f5f;
         background: #171717 96%;
-        padding: 1 2;
+        padding: 1 2 0 2;
     }
 
     .modal-heading {
@@ -523,7 +566,7 @@ MODAL_CSS = """
     }
 
     .modal-summary-row {
-        height: 4;
+        height: 3;
         margin-bottom: 1;
     }
 
@@ -537,32 +580,23 @@ MODAL_CSS = """
     .modal-info-tile {
         width: 1fr;
         min-width: 12;
-        height: 4;
+        height: 3;
         margin-right: 1;
         padding: 0 1;
-        content-align: center middle;
-        border: round #d8d3c8;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        border-title-align: center;
+        background: #232323;
+        content-align: left middle;
     }
 
     .modal-info-clickable:hover {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
-        color: __COLOR_BRAND__;
+        background: #333231;
     }
 
     .modal-info-muted {
-        border: round #2b2b2b;
-        border-title-color: #777777;
         color: #aaaaaa;
     }
 
     .preset-selected {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
-        color: __COLOR_BRAND__;
+        background: #33230f;
     }
 
     .modal-info-wide {
@@ -584,149 +618,180 @@ MODAL_CSS = """
 
     .modal-actions {
         height: auto;
-        margin-top: 1;
+        border-top: solid #262626;
+    }
+
+    .modal-actions-spacer {
+        width: 1fr;
+        height: 1;
     }
 
     .modal-actions Button {
-        border: round #d8d3c8;
-        background: #171717;
-        color: #d8d3c8;
-        margin-right: 1;
-    }
-
-    .modal-actions Button:hover {
-        border: round __COLOR_BRAND__;
-        background: #171717;
+        border: none;
+        height: 1;
+        min-width: 6;
+        padding: 0 1;
+        margin-right: 2;
+        content-align: center middle;
+        text-style: bold;
+        background: transparent;
         color: __COLOR_BRAND__;
     }
 
+    .modal-actions Button:hover,
     .modal-actions Button:focus {
-        border: round #d8d3c8;
-        background: #171717;
-        color: #d8d3c8;
+        border: none;
+        background: transparent;
+        color: #ffc389;
+        text-style: bold;
     }
 
-    .modal-actions Button:disabled,
-    .modal-actions Button.-primary:disabled,
-    .modal-actions Button.-warning:disabled,
-    .modal-actions Button.-error:disabled {
-        border: round #2b2b2b;
-        border-title-color: #777777;
-        background: #171717;
-        color: #777777;
+    .modal-actions Button.btn-danger {
+        color: __COLOR_ERROR__;
+    }
+
+    .modal-actions Button.btn-danger:hover,
+    .modal-actions Button.btn-danger:focus {
+        background: transparent;
+        color: #f2c0c0;
+        text-style: bold;
+    }
+
+    .modal-actions Button.btn-quiet {
+        color: #8f8f8f;
+        text-style: none;
+    }
+
+    .modal-actions Button.btn-quiet:hover,
+    .modal-actions Button.btn-quiet:focus {
+        color: __COLOR_BRAND__;
+        text-style: none;
+    }
+
+    .modal-actions Button:disabled {
+        border: none;
+        background: transparent;
+        color: #5a5a5a;
         text-opacity: 60%;
     }
 
-    .modal-actions Button.-primary,
-    .modal-actions Button.-warning,
-    .modal-actions Button.-error {
-        border: round #d8d3c8;
-        background: #171717;
-        color: #d8d3c8;
-    }
-
-    .modal-actions Button.-primary:hover,
-    .modal-actions Button.-warning:hover,
-    .modal-actions Button.-error:hover {
-        border: round __COLOR_BRAND__;
-        background: #171717;
-        color: __COLOR_BRAND__;
-    }
-
-    .modal-actions Button.-primary:focus,
-    .modal-actions Button.-warning:focus,
-    .modal-actions Button.-error:focus {
-        border: round #d8d3c8;
-        background: #171717;
-        color: #d8d3c8;
-    }
-
-    #clear-credentials {
-        border: round __COLOR_ERROR__;
-        color: __COLOR_ERROR__;
-    }
-
-    #clear-credentials:hover {
-        border: round __COLOR_ERROR__;
-        color: #f2c0c0;
-    }
-
-    #clear-credentials:focus {
-        border: round __COLOR_ERROR__;
-        color: __COLOR_ERROR__;
-    }
-
     .modal-action-tile {
-        width: 18;
-        height: 3;
-        margin-right: 1;
+        width: auto;
+        min-width: 6;
+        height: 1;
+        margin-right: 2;
+        padding: 0 1;
         content-align: center middle;
-        border: round #d8d3c8;
-        color: #d8d3c8;
-        background: #171717;
+        border: none;
+        text-style: bold;
+        background: transparent;
+        color: __COLOR_BRAND__;
     }
 
     .modal-action-tile:hover {
-        border: round __COLOR_BRAND__;
+        border: none;
+        background: transparent;
+        color: #ffc389;
+        text-style: bold;
+    }
+
+    #confirm-cancel, #cancel-refresh-session {
+        border: none;
+        background: transparent;
+        color: #8f8f8f;
+        text-style: none;
+    }
+
+    #confirm-cancel:hover, #cancel-refresh-session:hover {
+        border: none;
+        background: transparent;
         color: __COLOR_BRAND__;
-        background: #171717;
     }
 
     .modal-card Input {
-        border: round #d8d3c8;
-        background: #171717;
+        border: none;
+        background: #101010;
         color: #d8d3c8;
         width: 1fr;
+        height: 1;
+        padding: 0 1;
     }
 
     .modal-card Input:focus {
-        border: round __COLOR_BRAND__;
-        background: #171717;
+        border: none;
+        background: #241c12;
         background-tint: transparent;
     }
 
-    .modal-card Select > SelectCurrent {
-        border: round #d8d3c8;
-        background: #171717;
+    .modal-card Input > .input--cursor {
+        background: transparent;
+        color: __COLOR_BRAND__;
+        text-style: underline;
+    }
+
+    .modal-card Input > .input--selection {
+        background: #3a2c18;
+    }
+
+    .modal-card Input > .input--placeholder {
+        color: #6f6f6f;
+    }
+
+    .modal-sentence {
+        height: 3;
+        align: left middle;
+        margin-bottom: 1;
+    }
+
+    .modal-sentence Static, .modal-sentence Label {
+        width: auto;
+        height: 3;
+        content-align: center middle;
+        margin-right: 1;
         color: #d8d3c8;
     }
 
+    .field-label {
+        color: #8f8f8f;
+        margin-top: 1;
+    }
+
+    .modal-sentence .sentence-dim {
+        color: #6f6f6f;
+    }
+
+    .modal-sentence Input {
+        width: 8;
+        margin-top: 1;
+        margin-right: 1;
+    }
+
+    .modal-sentence #spend-cap-input {
+        width: 20;
+    }
+
+    .modal-card Select > SelectCurrent {
+        border: none;
+        background: #101010;
+        color: #d8d3c8;
+        padding: 0 1;
+    }
+
     .modal-card Select:focus > SelectCurrent {
-        border: round __COLOR_BRAND__;
-        background: #171717;
+        border: none;
+        background: #241c12;
         background-tint: transparent;
     }
 
     .modal-card Select > SelectOverlay {
-        border: round #d8d3c8;
+        border: round #3a3a3a;
         background: #171717;
         color: #d8d3c8;
     }
 
     .modal-card Select > SelectOverlay > .option-list--option-highlighted {
-        background: #f2efe7;
-        color: #101010;
-    }
-
-    .modal-card Switch {
-        border: round #d8d3c8;
-        background: #171717;
-        padding: 0 2;
-    }
-
-    .modal-card Switch:focus,
-    .modal-card Switch:hover {
-        border: round __COLOR_BRAND__;
-        background: #171717;
-        background-tint: transparent;
-    }
-
-    .modal-card Switch .switch--slider {
-        background: #171717;
-        color: #777777;
-    }
-
-    .modal-card Switch.-on .switch--slider {
+        background: #33230f;
         color: __COLOR_BRAND__;
     }
+
     """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_ERROR__", COLOR_ERROR)

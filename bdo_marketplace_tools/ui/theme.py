@@ -11,9 +11,11 @@ STATUS_STYLES = {
     "gold": f"bold {COLOR_GOLD}",
     "info": f"bold {COLOR_INFO}",
     "steam": f"bold {COLOR_STEAM}",
+    "idle": "#8f8f8f",
 }
 
 STATUS_DOT = "●"
+IDLE_DOT = "○"
 
 BANNER_ART = r"""
 ██████╗ ██████╗  ██████╗                                             ███████████

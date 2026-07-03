@@ -9,7 +9,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, Label, RichLog, Select, Static, Switch
+from textual.widgets import Button, Input, Label, RichLog, Select, Static
 
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
@@ -23,6 +23,7 @@ from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, SETTINGS_SCH
 from bdo_marketplace_tools.ui.display import (
     APP_TITLE,
     COLOR_BRAND,
+    COLOR_ERROR,
     COLOR_INFO,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
@@ -47,6 +48,7 @@ from bdo_marketplace_tools.ui.styles import APP_CSS
 from bdo_marketplace_tools.ui.theme import (
     BANNER_ART,
     DEFAULT_THEME,
+    IDLE_DOT,
     STATUS_DOT,
     STATUS_STYLES,
     TEST_LOG_MESSAGES,
@@ -56,6 +58,8 @@ from bdo_marketplace_tools.ui.widgets import (
     DashboardTile,
     LogFilterOption,
     ModalAction,
+    MonitorModeTile,
+    MonitorToggleTile,
     NavTab,
     PollingPresetTile,
     SteamSetupTile,
@@ -162,13 +166,6 @@ class MarketplaceToolsApp(App[None]):
         return bool(getattr(self.task_manager, "simulated_session_enabled", False))
 
     async def on_mount(self) -> None:
-        keys = Text()
-        for cap, label in (("space", "Start/Stop"), ("esc", "Dashboard"), ("1-3", "Tabs"), ("q", "Quit")):
-            if len(keys):
-                keys.append("  ", style="#555555")
-            keys.append(f" {cap} ", style="#161616 on #c8b99f")
-            keys.append(f" {label}", style="#8f8f8f")
-        self.query_one("#status-keys", Static).update(keys)
         await self.show_view("dashboard")
         self.set_interval(1, self.refresh_live_widgets)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
@@ -193,6 +190,10 @@ class MarketplaceToolsApp(App[None]):
     async def on_nav_tab_pressed(self, event: NavTab.Pressed) -> None:
         event.stop()
         await self.handle_nav(event.tab.key)
+
+    async def on_monitor_toggle_tile_pressed(self, event: MonitorToggleTile.Pressed) -> None:
+        event.stop()
+        await self.toggle_monitor_from_dashboard()
 
     async def handle_nav(self, target: str) -> None:
         if target == "login":
@@ -245,26 +246,26 @@ class MarketplaceToolsApp(App[None]):
         self.update_chrome_visibility()
 
         if view_name == "dashboard":
-            dashboard_tiles = Vertical(
-                Horizontal(
-                    DashboardTile("session", "Session"),
-                    DashboardTile("spent", "Spent"),
-                    DashboardTile("buy-delay", "Buy Delay"),
-                    Static("", classes="dashboard-tile-gap"),
-                    DashboardTile("success", "Success Rate", interactive=False),
-                    id="dashboard-primary-tiles",
-                    classes="dashboard-tile-row",
+            dashboard_tiles = Horizontal(
+                Vertical(
+                    Horizontal(
+                        DashboardTile("session", "Session"),
+                        DashboardTile("spent", "Spent"),
+                        DashboardTile("buy-delay", "Buy Delay"),
+                        id="dashboard-primary-tiles",
+                        classes="dashboard-tile-row",
+                    ),
+                    Horizontal(
+                        DashboardTile("monitor", "Mode"),
+                        DashboardTile("polling", "Polling"),
+                        DashboardTile("credentials", "Credentials"),
+                        id="dashboard-secondary-tiles",
+                        classes="dashboard-tile-row",
+                    ),
+                    id="dashboard-tiles",
                 ),
-                Horizontal(
-                    DashboardTile("monitor", "Monitor"),
-                    DashboardTile("polling", "Polling"),
-                    DashboardTile("credentials", "Credentials"),
-                    Static("", classes="dashboard-tile-gap"),
-                    DashboardTile("runtime", "Runtime", interactive=False),
-                    id="dashboard-secondary-tiles",
-                    classes="dashboard-tile-row",
-                ),
-                id="dashboard-tiles",
+                MonitorToggleTile(),
+                id="dashboard-deck",
             )
             dashboard_panel = Vertical(id="dashboard-panel")
             event_log = RichLog(id="event-log", markup=True, highlight=False, wrap=True)
@@ -368,13 +369,11 @@ class MarketplaceToolsApp(App[None]):
     def session_status_state(self) -> tuple[str, str, str]:
         if self.is_simulated_session:
             return "TEST", "Simulated auth", "warning"
-        if self.task_manager.uses_steam_browser_session():
-            if self.api_handler.login_status:
-                return "ONLINE", "Authenticated", "success"
-            return "OFFLINE", "Refresh required", "error"
         if self.api_handler.login_status:
             return "ONLINE", "Authenticated", "success"
-        return "OFFLINE", "Refresh required", "error"
+        # Offline while the monitor runs is a real fault; offline at rest is just "not started yet".
+        level = "error" if self.task_manager.monitor_running() else "idle"
+        return "OFFLINE", "Refresh required", level
 
     def session_account_label(self) -> str:
         if self.is_simulated_session:
@@ -425,8 +424,9 @@ class MarketplaceToolsApp(App[None]):
 
     def status_text(self, value: str, level: str, show_dot: bool = True) -> Text:
         text = Text()
+        dot = IDLE_DOT if level == "idle" else STATUS_DOT
         if show_dot:
-            text.append(f"{STATUS_DOT} ", style=STATUS_STYLES[level])
+            text.append(f"{dot} ", style=STATUS_STYLES[level])
         text.append(value, style=STATUS_STYLES[level])
         return text
 
@@ -441,21 +441,26 @@ class MarketplaceToolsApp(App[None]):
             delay_label,
             delay_range,
             purchase_delay_range,
-            purchase_rate,
-            purchase_detail,
+            _purchase_rate,
+            _purchase_detail,
             silver_spent,
             spend_detail,
-            runtime,
+            _runtime,
         ) = snapshot
 
-        purchase_tile_detail = purchase_detail.replace(" this session", "")
         spend_tile_detail = spend_detail.replace(" this session", "")
         credential_tile_detail = "No account" if credential_detail == "No account configured" else credential_detail
-        monitor_level = "success" if self.task_manager.monitor_running() else "error"
+        # The chip shows the selected mode (run state lives on the toggle/strip/info bar);
+        # green when the mode can spend silver, neutral when it only watches.
+        buying = (
+            self.task_manager.purchase_submission_enabled
+            or self.task_manager.single_item_test_purchase_enabled
+        )
+        mode_level = "success" if buying else "idle"
         _session_label, session_detail, session_level = self.session_status_state()
 
         return [
-            ("monitor", monitor_status, mode, monitor_level, True),
+            ("monitor", mode, monitor_status, mode_level, True),
             ("spent", silver_spent, spend_tile_detail, "info", False),
             ("polling", delay_label, delay_range, "info", False),
             ("buy-delay", purchase_delay_range, "Between buys", "info", False),
@@ -467,8 +472,6 @@ class MarketplaceToolsApp(App[None]):
                 session_level,
                 True,
             ),
-            ("success", purchase_rate, purchase_tile_detail, self.purchase_rate_level(), False),
-            ("runtime", runtime, "Active session", "muted", False),
         ]
 
     def tile_renderable(
@@ -513,17 +516,31 @@ class MarketplaceToolsApp(App[None]):
                     spent_text = "0B"
                 value_text = Text(spent_text, style=STATUS_STYLES["info"])
                 value_text.append(f" / {cap_text}", style="#777777")
-            elif tile_key == "success":
-                value_text = Text(
-                    f"{tm.session_successful_purchases} / {tm.session_detected_outfits}", style=COLOR_INFO
-                )
-                value_text.append(" · ", style="#777777")
-                value_text.append(value, style=STATUS_STYLES.get(level, f"bold {COLOR_INFO}"))
             elif level == "muted":
                 value_text = Text(value, style="dim #aaaaaa")
             else:
                 value_text = self.status_text(value, level, show_dot=show_dot)
             tile.update(self.dashboard_chip(str(tile.border_title), value_text, muted))
+        self.refresh_monitor_toggle()
+
+    def refresh_monitor_toggle(self) -> None:
+        try:
+            toggle = self.query_one("#monitor-toggle", MonitorToggleTile)
+        except Exception:
+            return
+
+        running = self.task_manager.monitor_running()
+        toggle.set_class(running, "toggle-stop")
+        toggle.set_class(not running, "toggle-start")
+        body = Table.grid(expand=True)
+        body.add_column(justify="center")
+        if running:
+            body.add_row(Text("■ STOP", style=f"bold {COLOR_ERROR}"))
+            body.add_row(Text(self.short_runtime_label(), style="#8f5555"))
+        else:
+            body.add_row(Text("▶ START", style=f"bold {COLOR_BRAND}"))
+            body.add_row(Text("space", style="#a06a35"))
+        toggle.update(Align.center(body, vertical="middle"))
 
     def dashboard_chip(self, title: str, value_text: Text, muted: bool) -> RenderableType:
         label_text = Text(title, style="#6f6f6f" if muted else "bold #8f8f8f")
@@ -608,39 +625,85 @@ class MarketplaceToolsApp(App[None]):
         elif self.current_view == "stats":
             self.refresh_stats()
 
+    def short_runtime_label(self) -> str:
+        label = self.task_manager.runtime_label()
+        if label.startswith("00:") and len(label) == 8:
+            return label[3:]
+        return label
+
     def refresh_chrome_status(self) -> None:
         tm = self.task_manager
+        running = tm.monitor_running()
         try:
             session_label, _detail, session_level = self.session_status_state()
             session_text = Text()
             session_style = STATUS_STYLES.get(session_level, f"bold {COLOR_TEXT_MUTED}")
-            session_text.append(f"{STATUS_DOT} ", style=session_style)
+            session_dot = IDLE_DOT if session_level == "idle" else STATUS_DOT
+            session_text.append(f"{session_dot} ", style=session_style)
             session_text.append(session_label, style=session_style)
             self.query_one("#header-session", Static).update(session_text)
         except Exception:
             pass
 
-        running = tm.monitor_running()
         try:
-            state = Text()
-            state.append(f"{STATUS_DOT} ", style=STATUS_STYLES["success"] if tm.purchase_submission_enabled else "#777777")
-            state.append("Buy mode" if tm.purchase_submission_enabled else "Watch only", style="#8f8f8f")
-            state.append("  ·  cap ", style="#5f5f5f")
-            state.append(self.spend_cap_short_label(), style="#8f8f8f")
-            self.query_one("#status-state", Static).update(state)
+            bar = Text()
+            separator = "  ·  "
+            buying = tm.purchase_submission_enabled
+            bar.append(
+                f"{STATUS_DOT} " if buying else f"{IDLE_DOT} ",
+                style=STATUS_STYLES["success"] if buying else "#777777",
+            )
+            bar.append(tm.monitor_mode_label(), style="#8f8f8f")
+            bar.append(separator, style="#3a3a3a")
+            bar.append("cap ", style="#6f6f6f")
+            bar.append(self.spend_cap_short_label(), style="#d8d3c8")
+            if running:
+                detected = tm.session_detected_outfits
+                bought = tm.session_successful_purchases
+                bar.append(separator, style="#3a3a3a")
+                bar.append("bought ", style="#6f6f6f")
+                bar.append(f"{bought}/{detected}", style="#d8d3c8" if detected else "#6f6f6f")
+                # The rate joins only after the first detection: 0% of nothing is noise.
+                if detected > 0:
+                    bar.append(" ")
+                    bar.append(
+                        format_percent(bought, detected),
+                        style=STATUS_STYLES[self.purchase_rate_level()],
+                    )
+                bar.append(separator, style="#3a3a3a")
+                bar.append("spent ", style="#6f6f6f")
+                bar.append(
+                    format_compact_number(tm.session_silver_spent),
+                    style="#d8d3c8" if tm.session_silver_spent else "#6f6f6f",
+                )
+                bar.append(separator, style="#3a3a3a")
+                bar.append("run ", style="#6f6f6f")
+                bar.append(self.short_runtime_label(), style="#d8d3c8")
+            self.query_one("#status-keys", Static).update(bar)
         except Exception:
             pass
 
         try:
+            quit_hint = Text()
+            quit_hint.append("q ", style="#6f6f6f")
+            quit_hint.append("quit", style="#8f8f8f")
+            self.query_one("#status-state", Static).update(quit_hint)
+        except Exception:
+            pass
+
+        try:
+            card = self.query_one("#welcome-card", Vertical)
+            card.display = self.current_view == "dashboard"
+            card.set_class(not self.should_show_banner(), "-compact")
+            self.query_one("#banner", Static).display = self.should_show_banner()
             footer = Text()
-            footer.append("Welcome back", style=COLOR_TEXT_MUTED)
-            footer.append("   ·   ", style=COLOR_TEXT_MUTED)
             if running:
-                footer.append(f"{STATUS_DOT} Running", style=STATUS_STYLES["success"])
+                footer.append("◉ ", style=COLOR_BRAND)
+                footer.append("Running", style=STATUS_STYLES["success"])
                 footer.append("  ·  watching the marketplace", style=COLOR_TEXT_MUTED)
             else:
-                footer.append(f"{STATUS_DOT} Idle", style="#777777")
-                footer.append("  ·  press space to start the monitor", style=COLOR_TEXT_MUTED)
+                footer.append(f"{IDLE_DOT} Idle", style="#777777")
+                footer.append("  ·  ready when you are", style=COLOR_TEXT_MUTED)
             self.query_one("#welcome-footer", Static).update(footer)
         except Exception:
             pass
@@ -651,7 +714,7 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_layout_density(self) -> None:
         try:
-            self.query_one("#welcome-card", Vertical).display = self.should_show_banner()
+            self.refresh_chrome_status()
             self.update_chrome_visibility()
         except Exception:
             pass
@@ -734,16 +797,24 @@ class MarketplaceToolsApp(App[None]):
         except Exception:
             return
 
+        # border_title is no longer rendered (flat chips) but tests and callers rely on it.
         tile.border_title = title
-        tile.update(
-            self.tile_renderable(
-                value,
-                detail,
-                level,
-                show_dot=show_dot,
-                subdued="modal-info-muted" in tile.classes,
-            )
-        )
+        clickable = "modal-info-clickable" in tile.classes
+        label_text = Text(title, style="bold #8f8f8f")
+        value_text = self.status_text(value, level, show_dot=show_dot)
+        body = Table.grid(expand=True)
+        if clickable:
+            body.add_column(justify="left", ratio=1)
+            body.add_column(justify="right")
+            body.add_row(label_text, Text("›", style="#7a7a7a"))
+            body.add_row(value_text, Text(""))
+            body.add_row(Text(detail, style="#6f6f6f"), Text(""))
+        else:
+            body.add_column(justify="left")
+            body.add_row(label_text)
+            body.add_row(value_text)
+            body.add_row(Text(detail, style="#6f6f6f"))
+        tile.update(body)
 
     def modal_custom_delay_bounds(self) -> tuple[int, int] | None:
         try:
@@ -783,7 +854,12 @@ class MarketplaceToolsApp(App[None]):
             else:
                 tile.remove_class("preset-selected")
             detail = "Recommended" if key == "2" else ""
-            tile.update(self.tile_renderable(f"{low}-{high}s", detail, "orange" if selected else "info", False))
+            body = Table.grid(expand=True)
+            body.add_column(justify="center")
+            body.add_row(Text(str(tile.border_title), style=f"bold {COLOR_BRAND}" if selected else "bold #8f8f8f"))
+            body.add_row(Text(f"{low}-{high}s", style="#c98a50" if selected else "#d8d3c8"))
+            body.add_row(Text(detail, style="#a06a35" if selected else "#6f6f6f"))
+            tile.update(body)
 
     def refresh_credentials_summary(self) -> None:
         try:
@@ -925,6 +1001,7 @@ class MarketplaceToolsApp(App[None]):
                         value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
                         type="integer",
                         id="settings-cache-threshold-input",
+                        select_on_focus=False,
                     ),
                     Label("MiB", classes="cache-inline-label"),
                     Static(classes="action-card-spacer"),
@@ -1088,37 +1165,31 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_monitor_summary(self) -> None:
         try:
-            self.query_visible_one("#monitor-summary")
+            self.query_visible_one("#monitor-mode-options")
         except Exception:
             return
 
-        self.refresh_modal_tile(
-            "monitor-status-tile",
-            "Status",
-            self.task_manager.monitor_status_label(),
-            "Monitor",
-            "success" if self.task_manager.monitor_running() else "error",
-            True,
+        buying = self.task_manager.purchase_submission_enabled
+        mode_tiles = (
+            ("watch", "Detect and log only", not buying),
+            ("buy", "Auto-buys detections", buying),
         )
-        self.refresh_modal_tile(
-            "monitor-mode-tile",
-            "Mode",
-            self.task_manager.monitor_mode_label(),
-            "Purchase behavior",
-        )
-        self.refresh_modal_tile(
-            "monitor-session-tile",
-            "Session",
-            self.session_status_state()[0].title(),
-            self.session_status_state()[1],
-            self.session_status_state()[2],
-            True,
-        )
-        try:
-            self.query_visible_one("#modal-start-monitor", Button).disabled = self.task_manager.monitor_running()
-            self.query_visible_one("#modal-stop-monitor", Button).disabled = not self.task_manager.monitor_running()
-        except Exception:
-            pass
+        for key, detail, selected in mode_tiles:
+            try:
+                tile = self.query_visible_one(f"#monitor-mode-{key}", MonitorModeTile)
+            except Exception:
+                continue
+            tile.set_class(selected, "preset-selected")
+            body = Table.grid(expand=True)
+            body.add_column(justify="left")
+            body.add_row(
+                Text(str(tile.border_title), style=f"bold {COLOR_BRAND}" if selected else "bold #8f8f8f")
+            )
+            body.add_row(Text(detail, style="#a06a35" if selected else "#6f6f6f"))
+            body.add_row(
+                Text(f"{STATUS_DOT} Active", style=STATUS_STYLES["success"]) if selected else Text("")
+            )
+            tile.update(body)
 
     def refresh_session_summary(self) -> None:
         try:
@@ -1347,11 +1418,6 @@ class MarketplaceToolsApp(App[None]):
             if self.save_buy_delay_settings():
                 self.refresh_modal_summaries()
                 self.close_active_dashboard_modal()
-        elif button_id == "modal-start-monitor":
-            await self.start_monitor()
-            self.refresh_modal_summaries()
-        elif button_id == "modal-stop-monitor":
-            await self.stop_monitor(close_modal=True)
         elif button_id == "refresh-session":
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
@@ -1487,10 +1553,9 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
-    async def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id != "buy-mode-switch":
-            return
-        await self.apply_purchase_mode(bool(event.value), source_switch_id=event.switch.id)
+    async def on_monitor_mode_tile_pressed(self, event: MonitorModeTile.Pressed) -> None:
+        event.stop()
+        await self.apply_purchase_mode(event.tile.mode_key == "buy")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id in {
@@ -1648,17 +1713,8 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     def sync_mode_switches(self, value: bool, except_id: str | None = None) -> None:
-        self._syncing_controls = True
-        try:
-            for switch_id in ("buy-mode-switch",):
-                if switch_id == except_id:
-                    continue
-                try:
-                    self.query_visible_one(f"#{switch_id}", Switch).value = value
-                except Exception:
-                    pass
-        finally:
-            self._syncing_controls = False
+        # The buy/watch mode controls derive their state from the task manager; re-render them.
+        self.refresh_monitor_summary()
 
     def apply_spend_cap_from_input(self, input_id: str) -> bool:
         try:
