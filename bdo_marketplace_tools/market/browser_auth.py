@@ -183,6 +183,7 @@ async def acquire_market_cookies(
     handle_pa_cookie_consent=False,
     pa_cookie_consent_callback=None,
     account_label="Steam Account",
+    announce_opening=True,
 ):
     async_playwright = _import_async_playwright(
         "Patchright is not installed. Install requirements, then run `patchright install chromium`."
@@ -190,12 +191,15 @@ async def acquire_market_cookies(
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    opening_message = f"Opening {account_label} browser in Chrome. Complete login manually."
-    if auto_steam_login:
-        opening_message = f"Opening {account_label} browser in Chrome for automatic re-authentication."
-    elif auto_pa_login:
-        opening_message = f"Opening {account_label} browser in Chrome. Saved credentials will be submitted."
-    await _emit_status(status_callback, opening_message, "info")
+    # Callers that already announced the refresh (the PA flow) pass announce_opening=False
+    # so one refresh doesn't produce two near-identical "opening browser" lines.
+    if announce_opening:
+        opening_message = f"Opening {account_label} browser in Chrome. Complete login manually."
+        if auto_steam_login:
+            opening_message = f"Opening {account_label} browser in Chrome for automatic re-authentication."
+        elif auto_pa_login:
+            opening_message = f"Opening {account_label} browser in Chrome. Saved credentials will be submitted."
+        await _emit_status(status_callback, opening_message, "info")
 
     context = None
     try:
@@ -257,7 +261,7 @@ async def prepare_steam_browser_profile(
     profile_path.mkdir(parents=True, exist_ok=True)
     await _emit_status(
         status_callback,
-        "Opening initial Steam browser setup in Chrome. The window will close automatically when setup is saved.",
+        "Starting initial Steam browser setup in Chrome.",
         "info",
     )
 
@@ -281,7 +285,7 @@ async def prepare_steam_browser_profile(
 
             await _emit_status(
                 status_callback,
-                "Opening Steam login. Complete Steam login in the browser; the window will close once detected.",
+                "Complete the Steam login in the browser; the window closes by itself once login is detected.",
                 "info",
             )
             try:
@@ -562,7 +566,7 @@ async def _wait_for_market_cookies(
                 pass
         await _emit_status(
             status_callback,
-            "Marketplace session cookies captured; validating session.",
+            "Session cookies captured; validating.",
             "info",
         )
         return captured_at_callback[0]

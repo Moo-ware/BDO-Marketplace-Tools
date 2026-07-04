@@ -109,6 +109,7 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
 )
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui import charts as charts_module
+from bdo_marketplace_tools.ui.display import COLOR_EVENT_ROUTINE
 from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
     BANNER_BLINK_ART,
@@ -2906,7 +2907,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(saved_settings["ui"]["buy_delay"]["range"], [1.0, 2.5])
             self.assertIsNone(saved_settings["ui"]["spend_cap"])
             self.assertFalse(saved_settings["ui"]["buy_mode"])
-            self.assertEqual(saved_settings["ui"]["event_log_view"], "core")
+            self.assertNotIn("event_log_view", saved_settings["ui"])
 
     def test_app_settings_persist_ui_preferences(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2918,7 +2919,6 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(123456789)
                 account_mode_module.save_buy_mode(True)
-                account_mode_module.save_event_log_view("ui")
                 account_mode_module.save_saved_session_last_known_valid(True)
                 account_mode_module.save_browser_cache_cleanup_threshold_mb(0)
                 settings = account_mode_module.read_app_settings()
@@ -2928,13 +2928,11 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(settings["ui"]["buy_delay"]["range"], [4.5, 8.0])
             self.assertEqual(settings["ui"]["spend_cap"], 123456789)
             self.assertTrue(settings["ui"]["buy_mode"])
-            self.assertEqual(settings["ui"]["event_log_view"], "ui")
             self.assertTrue(settings["session"]["saved_session_last_known_valid"])
             self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 0)
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertFalse(account_mode_module.save_saved_session_last_known_valid(False))
                 self.assertFalse(account_mode_module.load_saved_session_last_known_valid())
-                self.assertEqual(account_mode_module.save_event_log_view("bad-view"), "core")
                 self.assertEqual(account_mode_module.save_browser_cache_cleanup_threshold_mb("512"), 512)
                 with self.assertRaises(ValueError):
                     account_mode_module.save_browser_cache_cleanup_threshold_mb("-1")
@@ -2949,7 +2947,6 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(250)
                 account_mode_module.save_buy_mode(True)
-                account_mode_module.save_event_log_view("ui")
                 account_mode_module.save_browser_cache_cleanup_threshold_mb(512)
 
                 with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
@@ -2960,14 +2957,12 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertEqual(manager.purchase_delay_bounds, (4.5, 8.0))
                 self.assertEqual(manager.max_spend, 250)
                 self.assertTrue(manager.purchase_submission_enabled)
-                self.assertEqual(manager.event_log_view, "ui")
                 self.assertEqual(manager.browser_cache_cleanup_threshold_mb, 512)
 
                 manager.set_delay_choice("2")
                 manager.set_purchase_delay_range("1.25", "3.5")
                 manager.set_spend_cap(0)
                 manager.set_purchase_submission_enabled(False)
-                manager.set_event_log_view("core")
                 manager.set_browser_cache_cleanup_threshold_mb(64)
 
                 with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
@@ -2978,7 +2973,6 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(restored.purchase_delay_bounds, (1.25, 3.5))
             self.assertIsNone(restored.max_spend)
             self.assertFalse(restored.purchase_submission_enabled)
-            self.assertEqual(restored.event_log_view, "core")
             self.assertEqual(restored.browser_cache_cleanup_threshold_mb, 64)
 
     def test_old_resource_settings_are_ignored_for_fresh_start(self):
@@ -3979,8 +3973,9 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
             summary["purchase_records"],
             [{"item_id": "10007", "price": 79000, "submitted_price": 82500, "count": 1, "result_code": 0}],
         )
-        self.assertIn("79000 silver", summary["events"][0]["message"])
-        self.assertIn("submitted up to 82500", summary["events"][0]["message"])
+        self.assertIn("79,000", summary["events"][0]["message"])
+        self.assertIn("silver", summary["events"][0]["message"])
+        self.assertIn("submitted up to 82,500", summary["events"][0]["message"])
 
     async def test_buy_item_result_code_zero_preorder_does_not_count_as_purchase(self):
         handler = object.__new__(APIHandler)
@@ -4426,35 +4421,48 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(test_manager._pending_scan_count_total, 1)
             self.assertFalse(test_db_path.exists())
 
-    async def test_event_logs_split_core_and_ui_streams_while_preserving_combined_events(self):
+    async def test_unified_event_stream_filters_by_notability_and_severity(self):
         manager = self.make_task_manager()
 
-        manager.add_event("Core monitor detail.", "success")
-        manager.add_event("UI setting saved.", "info", channel="ui")
+        manager.add_event("Routine scan detail.", "info")
+        manager.add_event("Outfit detected: 2 available.", "success", notable=True)
+        manager.add_event("Purchase failed: price mismatch.", "warning", notable=True)
+        manager.add_event("Monitor cycle failed: timeout", "error")  # errors are auto-notable
 
-        self.assertTrue(any("Core monitor detail." in event for event in manager.events))
-        self.assertTrue(any("UI setting saved." in event for event in manager.events))
-        self.assertTrue(any("Core monitor detail." in event for event in manager.events_for_channel("core")))
-        self.assertFalse(any("UI setting saved." in event for event in manager.events_for_channel("core")))
-        self.assertTrue(any("UI setting saved." in event for event in manager.events_for_channel("ui")))
-        self.assertFalse(any("Core monitor detail." in event for event in manager.events_for_channel("ui")))
+        self.assertEqual(len(manager.events), 4)
+        self.assertTrue(any("Routine scan detail." in event for event in manager.events))
 
-    async def test_unseen_event_channels_flag_inactive_channel_only(self):
-        manager = self.make_task_manager()  # default event log view is "core"
-        self.assertFalse(manager.has_unseen_events("core"))
-        self.assertFalse(manager.has_unseen_events("ui"))
+        notable = manager.events_for_filter("notable")
+        self.assertEqual(len(notable), 3)
+        self.assertFalse(any("Routine scan detail." in event for event in notable))
 
-        manager.add_event("Core monitor detail.", "success")  # active channel -> already seen
-        self.assertFalse(manager.has_unseen_events("core"))
+        alerts = manager.events_for_filter("alerts")
+        self.assertEqual(len(alerts), 2)
+        self.assertTrue(any("price mismatch" in event for event in alerts))
+        self.assertTrue(any("Monitor cycle failed" in event for event in alerts))
+        self.assertFalse(any("Outfit detected" in event for event in alerts))
 
-        manager.add_event("UI setting saved.", "info", channel="ui")  # inactive -> unseen
-        self.assertTrue(manager.has_unseen_events("ui"))
+        self.assertEqual(len(manager.events_for_filter("all")), 4)
 
-        manager.set_event_log_view("ui")  # viewing the UI stream clears its unseen flag
-        self.assertFalse(manager.has_unseen_events("ui"))
+    async def test_event_rendering_dims_routine_info_and_keeps_notable_bright(self):
+        manager = self.make_task_manager()
 
-        manager.add_event("Another core event.", "warning")  # core now inactive -> unseen
-        self.assertTrue(manager.has_unseen_events("core"))
+        manager.add_event("Routine scan detail.", "info")
+        manager.add_event("Monitor started.", "info", notable=True)
+        # Routine success dims too — green is earned by notability, not level.
+        manager.add_event("Settings saved: Steam Account.", "success")
+        manager.add_event("Purchase succeeded.", "success", notable=True)
+        # Warnings keep their color even when routine.
+        manager.add_event("Fallback pricing applied.", "warning")
+
+        routine_info, notable_info, routine_success, notable_success, warning = manager.events_for_filter("all")
+        self.assertIn(COLOR_EVENT_ROUTINE, routine_info)
+        self.assertNotIn(COLOR_EVENT_ROUTINE, notable_info)
+        self.assertIn(COLOR_EVENT_ROUTINE, routine_success)
+        self.assertNotIn(COLOR_EVENT_ROUTINE, notable_success)
+        self.assertNotIn(COLOR_EVENT_ROUTINE, warning)
+        # Plain accessor strips markup for programmatic use.
+        self.assertNotIn("[", manager.events[0])
 
     async def test_identical_consecutive_events_coalesce_with_repeat_counter(self):
         manager = self.make_task_manager()
@@ -4463,23 +4471,42 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.add_event("Monitor cycle failed: timeout", "error")
         manager.add_event("Monitor cycle failed: timeout", "error")
 
-        core = manager.events_for_channel("core")
-        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 1)
-        self.assertIn("×3", core[-1])
-        self.assertEqual(len([event for event in manager.events if "Monitor cycle failed" in event]), 1)
+        events = manager.events
+        self.assertEqual(len([event for event in events if "Monitor cycle failed" in event]), 1)
+        self.assertIn("×3", events[-1])
 
         # A different message breaks the run; a later repeat starts a fresh count.
         manager.add_event("Re-authentication succeeded.", "success")
         manager.add_event("Monitor cycle failed: timeout", "error")
 
-        core = manager.events_for_channel("core")
-        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 2)
-        self.assertNotIn("×", core[-1])
+        events = manager.events
+        self.assertEqual(len([event for event in events if "Monitor cycle failed" in event]), 2)
+        self.assertNotIn("×", events[-1])
 
         # Same message at a different level stays a separate line.
         manager.add_event("Monitor cycle failed: timeout", "warning")
-        core = manager.events_for_channel("core")
-        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 3)
+        events = manager.events
+        self.assertEqual(len([event for event in events if "Monitor cycle failed" in event]), 3)
+
+    async def test_divider_events_render_as_rules_only_when_requested(self):
+        manager = self.make_task_manager()
+
+        manager.add_event("Monitor started — Buy mode.", "info", notable=True, divider="monitor started · buy mode")
+        manager.add_event("Routine scan detail.", "info")
+
+        # The Logs view asks for dividers: the monitor event becomes a dim rule.
+        with_dividers = manager.events_for_filter("all", dividers=True)
+        self.assertIn("── monitor started · buy mode ·", with_dividers[0])
+        self.assertIn("──────", with_dividers[0])
+        self.assertNotIn("Monitor started — Buy mode.", with_dividers[0])
+
+        # The Activity tail renders the same record as a normal line.
+        without_dividers = manager.events_for_filter("notable")
+        self.assertIn("Monitor started — Buy mode.", without_dividers[0])
+        self.assertNotIn("──", without_dividers[0])
+
+        # Plain accessor stays prose for tests/logic.
+        self.assertIn("Monitor started — Buy mode.", manager.events[0])
 
     async def test_warning_and_error_events_flag_unseen_alerts(self):
         manager = self.make_task_manager()
@@ -5099,7 +5126,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.api_handler.login_status)
         self.assertTrue(manager.saved_session_last_known_valid)
         self.assertFalse(manager.steam_auto_reauth_enabled)
-        self.assertTrue(any("Pearl Abyss Account browser session validated and saved" in event for event in manager.events))
+        self.assertTrue(any("Pearl Abyss Account session validated and saved" in event for event in manager.events))
         await manager.stop_login_status_checker()
 
     async def test_pa_browser_refresh_bootstraps_fresh_profile_once_then_marks_prepared(self):
@@ -5307,6 +5334,16 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.is_session_expired.assert_not_called()
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(any("No previously validated marketplace session" in event for event in manager.events))
+        # A fresh logged-out start is routine: dim info, off the tail, no alert dot.
+        self.assertFalse(manager.has_unseen_alerts())
+        self.assertFalse(
+            any("No previously validated marketplace session" in event for event in manager.events_for_filter("notable"))
+        )
+        self.assertFalse(
+            any("No previously validated marketplace session" in event for event in manager.events_for_filter("alerts"))
+        )
+        rendered = manager.events_for_filter("all")[-1]
+        self.assertIn(COLOR_EVENT_ROUTINE, rendered)
 
     async def test_initial_login_check_clears_last_known_valid_when_cookies_are_missing(self):
         manager = self.make_task_manager()
@@ -6403,6 +6440,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.query("#tabs .nav-tab"))), 4)
                 self.assertEqual(app.query_one("#tab-settings", Static).content, "Settings")
                 self.assertNotIn("Settings", [str(tab.content) for tab in app.query("#tabs .nav-tab")])
+                self.assertEqual(len(list(app.query("#topbar-brand-divider"))), 1)
+                self.assertEqual(app.query_one("#topbar-brand-divider", Static).content, "│")
                 self.assertEqual(len(list(app.query("#topbar-settings-divider"))), 1)
                 self.assertEqual(app.query_one("#brand", Static).content, "Marketplace Tools")
                 self.assertEqual(app.query_one("#build-info", Static).content, f"v{APP_VERSION}")
@@ -6559,7 +6598,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 app.refresh_stats_trends()
                 chart_errors = [
-                    event for event in app.task_manager.ui_events if "Stats charts failed to load" in event
+                    event for event in app.task_manager.events if "Stats charts failed to load" in event
                 ]
                 self.assertEqual(len(chart_errors), 1)
                 self.assertIn("database is locked", chart_errors[0])
@@ -6648,7 +6687,13 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("4")
                 self.assertEqual(app.current_view, "logs")
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
-                self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
+                # Flat full-bleed: no bordered box, header row + thin rule instead.
+                self.assertEqual(str(app.query_one("#event-log").styles.border_top[0]), "")
+                self.assertEqual(len(list(app.query("#event-log-rule"))), 1)
+                self.assertEqual(app.query_one("#event-log-rule").region.height, 1)
+                title_text = str(app.query_one("#event-log-title", Static).render())
+                self.assertIn("Event Log", title_text)
+                self.assertIn("event", title_text)
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_color, Color(52, 52, 52))
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_size_vertical, 1)
 
@@ -6805,8 +6850,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await app.login_refresh()
 
         app.task_manager.login.assert_awaited_once()
-        self.assertEqual(len(app.task_manager.events), 1)
-        self.assertIn("Fetching session status", app.task_manager.events[0])
+        # "Fetching session status" is status-bar-only now; the log stays clean.
+        self.assertEqual(len(app.task_manager.events), 0)
         self.assertEqual(app.status_message, "Login check complete.")
 
     async def test_app_settings_clear_saved_session_button_resets_marketplace_session(self):
@@ -6862,7 +6907,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         latest_events = [
-            event for event in app.task_manager.events_for_channel("ui") if "latest version" in event
+            event for event in app.task_manager.events if "latest version" in event
         ]
         self.assertEqual(len(latest_events), 1)
         self.assertEqual(app.status_message, f"You are on the latest version (v{APP_VERSION}).")
@@ -7232,7 +7277,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#save-buy-delay")
                 await pilot.pause()
                 self.assertEqual(app.task_manager.purchase_delay_bounds, (4.5, 8.0))
-                self.assertIn("Buy delay saved: 4.5-8s", app.status_message)
+                self.assertIn("Buy delay saved", app.status_message)
+                self.assertIn("4.5-8s", app.status_message)
                 self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
 
                 await pilot.click("#tile-buy-delay")
@@ -7384,7 +7430,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_event_log_rehydrates_after_navigation(self):
         app = self.make_app()
-        app.task_manager.add_event("Persistent event before navigation.", "success")
+        app.task_manager.add_event("Persistent event before navigation.", "success", notable=True)
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 tail_text = str(app.query_one("#activity-tail", Static).render())
@@ -7404,39 +7450,68 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
 
-    async def test_event_log_switches_between_core_and_ui_streams(self):
+    async def test_event_log_filters_switch_between_all_notable_and_alerts(self):
         app = self.make_app()
-        app.task_manager.add_event("Core monitor detail.", "success")
+        app.task_manager.add_event("Routine polling detail.", "info")
+        app.task_manager.add_event("Outfit detected: 2 available.", "success", notable=True)
+        app.task_manager.add_event("Purchase failed: price mismatch.", "warning", notable=True)
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("4")
                 self.assertEqual(app.current_view, "logs")
-                app.set_status("UI setting saved.", "info")
-                app.refresh_live_widgets()
-                await pilot.pause()
 
-                self.assertEqual(len(list(app.query("#event-log-toolbar-title"))), 0)
                 self.assertEqual(app.query_one("#event-log-toolbar").styles.height.value, 1)
-                self.assertIn("log-filter-selected", app.query_one("#log-filter-core").classes)
-                self.assertEqual(app.query_one("#log-filter-core", Static).content, "Core logs")
-                # A UI event arrived while viewing Core, so the inactive UI tab shows an unread dot.
-                self.assertIn("●", str(app.query_one("#log-filter-ui", Static).content))
-                self.assertNotIn("●", str(app.query_one("#log-filter-core", Static).content))
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-all").classes)
+                self.assertEqual(app.query_one("#log-filter-all", Static).content, "All")
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
-                self.assertIn("Core monitor detail.", event_text)
-                self.assertNotIn("UI setting saved.", event_text)
+                self.assertIn("Routine polling detail.", event_text)
+                self.assertIn("Outfit detected", event_text)
+                self.assertIn("price mismatch", event_text)
 
-                await pilot.click("#log-filter-ui")
+                await pilot.click("#log-filter-notable")
                 await pilot.pause()
-
-                self.assertEqual(app.event_log_mode, "ui")
-                self.assertEqual(app.task_manager.event_log_view, "ui")
-                self.assertIn("log-filter-selected", app.query_one("#log-filter-ui").classes)
-                # Viewing the UI stream clears its unread dot.
-                self.assertNotIn("●", str(app.query_one("#log-filter-ui", Static).content))
+                self.assertEqual(app.log_filter, "notable")
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-notable").classes)
+                self.assertNotIn("log-filter-selected", app.query_one("#log-filter-all").classes)
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
-                self.assertIn("UI setting saved.", event_text)
-                self.assertNotIn("Core monitor detail.", event_text)
+                self.assertNotIn("Routine polling detail.", event_text)
+                self.assertIn("Outfit detected", event_text)
+
+                await pilot.click("#log-filter-alerts")
+                await pilot.pause()
+                self.assertEqual(app.log_filter, "alerts")
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertNotIn("Outfit detected", event_text)
+                self.assertIn("price mismatch", event_text)
+
+    async def test_event_log_appends_new_events_and_shows_run_dividers(self):
+        app = self.make_app()
+        app.task_manager.add_event("First event.", "info")
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
+                log = app.query_one("#event-log")
+
+                with patch.object(log, "clear", wraps=log.clear) as clear_spy:
+                    app.task_manager.add_event(
+                        "Monitor started — Buy mode.", "info", notable=True,
+                        divider="monitor started · buy mode",
+                    )
+                    app.task_manager.add_event("Second event.", "success", notable=True)
+                    app.refresh_live_widgets()
+                    await pilot.pause()
+
+                    # New events append without redrawing, preserving scroll position.
+                    clear_spy.assert_not_called()
+
+                event_text = "\n".join(line.text for line in log.lines)
+                self.assertIn("First event.", event_text)
+                self.assertIn("── monitor started · buy mode ·", event_text)
+                self.assertIn("Second event.", event_text)
+
+                title_text = str(app.query_one("#event-log-title", Static).render())
+                self.assertIn("3 events", title_text)
 
     async def test_dashboard_tail_shows_recent_events_and_logs_tab_flags_alerts(self):
         app = self.make_app()
@@ -7446,13 +7521,16 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(str(app.query_one("#activity-title", Static).content), "Activity")
 
                 for index in range(7):
-                    app.task_manager.add_event(f"Tail event {index}.", "info")
+                    app.task_manager.add_event(f"Tail event {index}.", "success", notable=True)
+                # Routine info never reaches the tail, however recent.
+                app.task_manager.add_event("Routine polling detail.", "info")
                 app.refresh_live_widgets()
                 await pilot.pause()
 
                 tail_text = str(app.query_one("#activity-tail", Static).render())
                 self.assertIn("Tail event 6.", tail_text)
                 self.assertNotIn("Tail event 2.", tail_text)  # only the last 4 fit
+                self.assertNotIn("Routine polling detail.", tail_text)
                 self.assertNotIn("●", str(app.query_one("#tab-logs", Static).content))
 
                 app.task_manager.add_event("Purchase failed: price mismatch.", "warning")
@@ -7765,10 +7843,6 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         event_text = app.task_manager.events[0]
         self.assertIn("Login required before starting buy mode", event_text)
         self.assertIn("Login or refresh the marketplace session", event_text)
-        core_text = "\n".join(app.task_manager.events_for_channel("core"))
-        ui_text = "\n".join(app.task_manager.events_for_channel("ui"))
-        self.assertIn("Login required before starting buy mode", core_text)
-        self.assertNotIn("Login required before starting buy mode", ui_text)
 
     async def test_login_refresh_uses_browser_refresh_without_direct_pa_login(self):
         app = self.make_app()
@@ -7785,8 +7859,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         event_text = "\n".join(app.task_manager.events)
         app.api_handler.login.assert_not_called()
         app.task_manager.refresh_pa_browser_session.assert_awaited_once()
-        self.assertEqual(len(app.task_manager.events), 1)
-        self.assertIn("Fetching session status", event_text)
+        # "Fetching session status" is status-bar-only now; the log stays clean.
+        self.assertEqual(len(app.task_manager.events), 0)
         self.assertNotIn("Checking marketplace session", event_text)
         self.assertNotIn("Login check complete", event_text)
 
@@ -7943,13 +8017,13 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.task_manager.purchase_submission_enabled)
                 self.assertTrue(app.query_visible_one("#monitor-mode-buy").has_class("preset-selected"))
                 self.assertFalse(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
-                self.assertIn("buy mode", app.status_message)
+                self.assertIn("Buy mode", app.status_message)
 
                 await pilot.click("#monitor-mode-watch")
                 await pilot.pause(0.1)
                 self.assertFalse(app.task_manager.purchase_submission_enabled)
                 self.assertTrue(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
-                self.assertIn("watch only", app.status_message)
+                self.assertIn("Watch only", app.status_message)
 
     async def test_buy_mode_start_confirmation_closes_monitor_modal_stack(self):
         app = self.make_app()
@@ -8017,7 +8091,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.1)
                 self.assertTrue(app.task_manager.purchase_submission_enabled)
                 self.assertIs(app.task_manager.checker_task, first_task)
-                self.assertIn("Buy mode enabled", app.status_message)
+                self.assertIn("Buy mode", app.status_message)
+                self.assertIn("enabled for the running monitor", app.status_message)
 
                 await app.stop_monitor()
 
@@ -8138,16 +8213,18 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.update_available)
         self.assertEqual(manager.available_update_version, "9.9.9")
         self.assertEqual(manager.last_seen_update_version, "9.9.9")
-        # Announced on the core stream exactly once across two startup checks.
-        core_notices = [event for event in manager.core_events if "9.9.9" in event]
-        self.assertEqual(len(core_notices), 1)
-        # The available-update notice is yellow (warning level), not plain info.
+        # Announced exactly once across two startup checks.
+        notices = [event for event in manager.events if "9.9.9" in event]
+        self.assertEqual(len(notices), 1)
+        # The available-update notice is yellow (warning level) and notable.
         from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS
 
-        self.assertIn(EVENT_LEVEL_COLORS["warning"], core_notices[0])
-        self.assertNotIn(EVENT_LEVEL_COLORS["info"], core_notices[0])
+        rendered_notices = [event for event in manager.events_for_filter("notable") if "9.9.9" in event]
+        self.assertEqual(len(rendered_notices), 1)
+        # The line is wrapped in warning yellow (the version highlight inside is bold white).
+        self.assertIn(f"[{EVENT_LEVEL_COLORS['warning']}]Update available", rendered_notices[0])
         # Every startup also prints the running version to the log.
-        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.events))
         self.assertTrue(second.update_available)
 
     async def test_startup_check_skipped_in_test_mode(self):
@@ -8157,7 +8234,7 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         fetch.assert_not_called()
         # The running version is still printed even though the remote lookup is skipped.
-        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.events))
 
     async def test_startup_check_skipped_when_disabled(self):
         manager = self._make_manager()
@@ -8167,7 +8244,7 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         fetch.assert_not_called()
         # The running version is still printed even though the remote lookup is skipped.
-        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.events))
 
     async def test_manual_check_runs_even_in_test_mode(self):
         manager = self._make_manager(test_mode_enabled=True)
@@ -8177,14 +8254,14 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, "up-to-date")
         self.assertIsNone(manager.available_update_version)
         self.assertTrue(manager.update_check_completed)
-        self.assertTrue(any("latest version" in event for event in manager.ui_events))
+        self.assertTrue(any("latest version" in event for event in manager.events))
 
     async def test_manual_check_error_warns_only_on_manual(self):
         manager = self._make_manager()
         result = update_checker_module.UpdateCheckResult("error", APP_VERSION, error="boom")
         with patch("bdo_marketplace_tools.services.task_manager.run_update_check", return_value=result):
             await manager.check_for_update(manual=True)
-        self.assertTrue(any("Could not check for updates" in event for event in manager.ui_events))
+        self.assertTrue(any("Could not check for updates" in event for event in manager.events))
         self.assertFalse(manager.update_check_completed)
 
 

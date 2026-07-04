@@ -33,6 +33,8 @@ from bdo_marketplace_tools.ui.display import (
     format_compact_number,
     format_compact_silver,
     format_percent,
+    highlight,
+    highlight_silver,
     mask_email,
 )
 from bdo_marketplace_tools.ui.modals import (
@@ -126,11 +128,11 @@ class MarketplaceToolsApp(App[None]):
         self.task_manager.set_test_mode_enabled(self.is_test_mode)
         self.current_view = "dashboard"
         self.status_message = ""
-        self.event_log_mode = self.task_manager.event_log_view
+        self.log_filter = "all"
         self._stats_trends_key: tuple[int, int] | None = None
         self._stats_trends_error_key: tuple[int, int] | None = None
-        self._rendered_events: tuple[str, ...] | None = None
-        self._rendered_tail: tuple[str, ...] | None = None
+        self._rendered_events: tuple | None = None
+        self._rendered_tail: tuple | None = None
         self._dashboard_snapshot: tuple[str, ...] | None = None
         self._syncing_controls = False
         # Cosmetic animations (pulse/blink/quips); tests turn this off for determinism.
@@ -141,6 +143,7 @@ class MarketplaceToolsApp(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
             yield Static(APP_TITLE, id="brand")
+            yield Static("│", id="topbar-brand-divider")
             with Horizontal(id="tabs"):
                 for key, label in self.TAB_ITEMS:
                     yield NavTab(key, label)
@@ -257,7 +260,8 @@ class MarketplaceToolsApp(App[None]):
 
         was_running = await self.task_manager.stop_checker()
         if was_running:
-            self.set_status("Monitor stopped.", "info")
+            # stop_checker logs the notable "Monitor stopped" event; status bar only here.
+            self.set_status("Monitor stopped.")
         else:
             self.set_status("Monitor already stopped.", "info")
         self.refresh_live_widgets()
@@ -308,14 +312,17 @@ class MarketplaceToolsApp(App[None]):
             self._rendered_tail = None
         elif view_name == "logs":
             event_log = RichLog(id="event-log", markup=True, highlight=False, wrap=True)
-            event_log.border_title = "Event Log"
             event_toolbar = Horizontal(
-                LogFilterOption("core", "Core logs"),
-                Static("/", id="log-filter-separator"),
-                LogFilterOption("ui", "UI logs"),
+                Static("Event Log", id="event-log-title"),
+                LogFilterOption("all", "All"),
+                Static("·", classes="log-filter-separator"),
+                LogFilterOption("notable", "Notable"),
+                Static("·", classes="log-filter-separator"),
+                LogFilterOption("alerts", "Alerts"),
                 id="event-log-toolbar",
             )
             await content.mount(event_toolbar)
+            await content.mount(Static("", id="event-log-rule"))
             await content.mount(event_log)
             self._rendered_events = None
             self.task_manager.mark_alerts_seen()
@@ -342,7 +349,7 @@ class MarketplaceToolsApp(App[None]):
     def set_status(self, message: str, level: str | None = None) -> None:
         self.status_message = message
         if message and level:
-            self.task_manager.add_event(message, level, channel="ui")
+            self.task_manager.add_event(message, level)
         self.refresh_live_widgets()
 
     def on_click(self, event) -> None:
@@ -841,7 +848,7 @@ class MarketplaceToolsApp(App[None]):
 
     def sync_activity_tail(self) -> None:
         lines = self.activity_tail_lines()
-        events = tuple(self.task_manager.events_for_channel("core"))[-lines:]
+        events = tuple(self.task_manager.events_for_filter("notable"))[-lines:]
         # The line count is part of the signature so a resize re-slices even when the
         # event stream itself hasn't changed.
         signature = (lines, events)
@@ -877,45 +884,61 @@ class MarketplaceToolsApp(App[None]):
         else:
             tab.update("Logs")
 
+    LOG_FILTER_LABELS = {"all": "All", "notable": "Notable", "alerts": "Alerts"}
+    LOG_FILTER_EMPTY = {
+        "all": "No events yet.",
+        "notable": "No notable events yet.",
+        "alerts": "No warnings or errors yet.",
+    }
+
     def sync_event_log(self) -> None:
         self.refresh_event_log_filter_controls()
-        events = tuple(self.task_manager.events_for_channel(self.event_log_mode))
-        if events == self._rendered_events:
+        events = tuple(self.task_manager.events_for_filter(self.log_filter, dividers=True))
+        # The active filter is part of the signature so switching chips re-renders even
+        # when the underlying stream hasn't changed.
+        signature = (self.log_filter, events)
+        if signature == self._rendered_events:
             return
 
+        self.refresh_event_log_title(len(events))
         log = self.query_one("#event-log", RichLog)
-        log.border_title = f"Event Log - {self.event_log_label()}"
-        log.clear()
-        if events:
-            for event in events:
+        previous_filter, previous_events = self._rendered_events or (None, ())
+        if (
+            previous_filter == self.log_filter
+            and previous_events
+            and len(events) > len(previous_events)
+            and events[: len(previous_events)] == previous_events
+        ):
+            # Pure additions: append so the reader's scroll position isn't yanked to the
+            # bottom every time the monitor logs. Anything else (filter switch, a coalesce
+            # counter mutating the last line, buffer eviction) falls back to a full redraw.
+            for event in events[len(previous_events):]:
                 log.write(event)
         else:
-            log.write(f"No {self.event_log_label().lower()} events yet.")
-        self._rendered_events = events
+            log.clear()
+            if events:
+                for event in events:
+                    log.write(event)
+            else:
+                log.write(self.LOG_FILTER_EMPTY[self.log_filter])
+        self._rendered_events = signature
 
-    def event_log_label(self) -> str:
-        return "UI" if self.event_log_mode == "ui" else "Core"
+    def refresh_event_log_title(self, count: int) -> None:
+        try:
+            title = self.query_one("#event-log-title", Static)
+        except Exception:
+            return
+        text = Text("Event Log", style="bold #8f8f8f")
+        text.append(f"  ·  {count} {'event' if count == 1 else 'events'}", style="#5a5a5a")
+        title.update(text)
 
     def refresh_event_log_filter_controls(self) -> None:
-        labels = {"core": "Core logs", "ui": "UI logs"}
-        for mode, label in labels.items():
+        for mode in self.LOG_FILTER_LABELS:
             try:
                 option = self.query_one(f"#log-filter-{mode}", LogFilterOption)
             except Exception:
                 continue
-            is_active = mode == self.event_log_mode
-            option.set_class(is_active, "log-filter-selected")
-            # Show an unread dot on the tab you are NOT viewing when a log lands there.
-            has_dot = (not is_active) and self.task_manager.has_unseen_events(mode)
-            if getattr(option, "_unread_dot", False) == has_dot:
-                continue
-            option._unread_dot = has_dot
-            if has_dot:
-                text = Text(label)
-                text.append(" ●", style=COLOR_BRAND)
-                option.update(text)
-            else:
-                option.update(label)
+            option.set_class(mode == self.log_filter, "log-filter-selected")
 
     async def mount_credentials(self, content: Container) -> None:
         _, _, _, email, _ = self.credential_state()
@@ -1518,7 +1541,7 @@ class MarketplaceToolsApp(App[None]):
         if self._stats_trends_error_key == key:
             return
         detail = str(exc).strip() or exc.__class__.__name__
-        self.task_manager.add_event(f"Stats charts failed to load: {detail}", "warning", channel="ui")
+        self.task_manager.add_event(f"Stats charts failed to load: {detail}", "warning")
         self._stats_trends_error_key = key
 
     def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
@@ -1576,14 +1599,9 @@ class MarketplaceToolsApp(App[None]):
     def on_log_filter_option_pressed(self, event: LogFilterOption.Pressed) -> None:
         event.stop()
         event.option.blur()
-        if event.option.mode == self.event_log_mode:
+        if event.option.mode == self.log_filter or event.option.mode not in self.LOG_FILTER_LABELS:
             return
-        try:
-            self.event_log_mode = self.task_manager.set_event_log_view(event.option.mode)
-        except ValueError:
-            return
-        self._rendered_events = None
-        self.refresh_event_log_filter_controls()
+        self.log_filter = event.option.mode
         self.sync_event_log()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1817,7 +1835,7 @@ class MarketplaceToolsApp(App[None]):
         if not self.apply_custom_delay_from_inputs(log_status=False):
             return False
 
-        self.set_status(f"Polling settings saved: {self.polling_status_detail()}.", "success")
+        self.set_status(f"Polling settings saved: {highlight(self.polling_status_detail())}.", "success")
         return True
 
     def apply_purchase_delay_from_inputs(self, log_status: bool = True) -> bool:
@@ -1845,7 +1863,7 @@ class MarketplaceToolsApp(App[None]):
         if not self.apply_purchase_delay_from_inputs(log_status=False):
             return False
 
-        self.set_status(f"Buy delay saved: {self.task_manager.purchase_delay_range()}.", "success")
+        self.set_status(f"Buy delay saved: {highlight(self.task_manager.purchase_delay_range())}.", "success")
         return True
 
     async def apply_purchase_mode(self, enabled: bool, source_switch_id: str | None = None) -> None:
@@ -1857,7 +1875,7 @@ class MarketplaceToolsApp(App[None]):
 
         if not enabled:
             self.task_manager.set_purchase_submission_enabled(False)
-            self.set_status("Mode set to watch only.", "info")
+            self.set_status(f"Mode set to {highlight('Watch only')}.", "info")
             self.sync_mode_switches(False, except_id=source_switch_id)
             self.refresh_settings_summary()
             self.refresh_live_widgets()
@@ -1891,7 +1909,9 @@ class MarketplaceToolsApp(App[None]):
             return
 
         self.task_manager.set_purchase_submission_enabled(True)
-        self.set_status("Mode set to buy mode. Starting the monitor will ask for confirmation.", "warning")
+        # Arming buy mode is a deliberate choice, not a fault — the orange mode name carries
+        # the caution; the sentence itself stays on the dim noise floor.
+        self.set_status(f"Mode set to {highlight_silver('Buy mode')}. Starting the monitor will ask for confirmation.", "info")
         self.sync_mode_switches(True, except_id=source_switch_id)
         self.refresh_settings_summary()
         self.refresh_live_widgets()
@@ -1899,7 +1919,7 @@ class MarketplaceToolsApp(App[None]):
     def _handle_running_buy_mode_confirmation(self, confirmed: bool) -> None:
         self.task_manager.set_purchase_submission_enabled(bool(confirmed))
         if confirmed:
-            self.set_status("Buy mode enabled for the running monitor.", "warning")
+            self.set_status(f"{highlight_silver('Buy mode')} enabled for the running monitor.", "info")
         else:
             self.set_status("Buy mode canceled. Monitor remains watch only.", "info")
         self.sync_mode_switches(self.task_manager.purchase_submission_enabled)
@@ -2273,7 +2293,7 @@ class MarketplaceToolsApp(App[None]):
             await self.task_manager.reset_authentication_context("Credentials changed")
         self.sync_mode_switches(False)
         self.query_visible_one("#password-input", Input).value = ""
-        self.set_status(f"Credentials saved: {self.task_manager.account_mode_label()}.", "success")
+        self.set_status(f"Credentials saved: {highlight(self.task_manager.account_mode_label())}.", "success")
         self.refresh_credentials_summary()
         self.refresh_settings_summary()
         self.refresh_live_widgets()
@@ -2392,7 +2412,7 @@ class MarketplaceToolsApp(App[None]):
             cache_input.value = str(threshold)
         except Exception:
             pass
-        message = f"Browser cache cleanup limit saved: {label}."
+        message = f"Browser cache cleanup limit saved: {highlight(label)}."
         self.set_settings_maintenance_status(message)
         self.set_status(message, "success")
         self.refresh_settings_summary()
@@ -2445,12 +2465,11 @@ class MarketplaceToolsApp(App[None]):
             self.task_manager.set_purchase_submission_enabled(False)
             self.sync_mode_switches(False)
 
-        self.set_status(f"Settings saved: {self.task_manager.account_mode_label()}.", "success")
+        self.set_status(f"Settings saved: {highlight(self.task_manager.account_mode_label())}.", "success")
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
     async def login_refresh(self) -> None:
-        self.task_manager.add_event("Fetching session status...", "info")
         self.set_status("Fetching session status...")
         await self.task_manager.login()
         self.set_status("Login check complete.")
@@ -2509,7 +2528,8 @@ class MarketplaceToolsApp(App[None]):
         mode = "buy mode" if self.task_manager.purchase_submission_enabled else "watch-only mode"
         started = await self.task_manager.start_checker()
         if started:
-            self.set_status(f"Monitor started in {mode}.", "success")
+            # start_checker logs the notable "Monitor started" event; status bar only here.
+            self.set_status(f"Monitor started in {mode}.")
             self.close_dashboard_modals()
         elif self.task_manager.single_item_test_checker_enabled:
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
@@ -2543,7 +2563,7 @@ class MarketplaceToolsApp(App[None]):
 
         self.query_one("#wallet-output", Static).update(Group(summary, JSON.from_data(response)))
         if silver_balance is not None:
-            self.set_status(f"Inventory loaded: {format_compact_silver(silver_balance)}.", "success")
+            self.set_status(f"Inventory loaded: {highlight_silver(format_compact_silver(silver_balance))}.", "success")
         else:
             self.set_status("Inventory loaded.", "success")
 

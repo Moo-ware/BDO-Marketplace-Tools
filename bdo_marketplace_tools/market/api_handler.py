@@ -6,6 +6,7 @@ import stat
 import requests
 
 from bdo_marketplace_tools.market.decoder import unpack
+from bdo_marketplace_tools.ui.display import highlight, highlight_silver
 from bdo_marketplace_tools.storage.app_settings import (
     PA_CREDENTIALS_MODE,
     STEAM_BROWSER_MODE,
@@ -59,27 +60,38 @@ PURCHASE_RESULT_REASONS = {
 }
 
 
+def _format_silver_amount(price):
+    try:
+        return f"{int(price):,}"
+    except (TypeError, ValueError):
+        return str(price)
+
+
+def _item_and_price(item_id, price):
+    return f"{highlight(item_id)} at {highlight_silver(_format_silver_amount(price))} silver"
+
+
 def purchase_result_message(result_code, item_id, price):
     if result_code == 0:
-        return f"Purchase request succeeded for {item_id} at {price} silver."
+        return f"Purchase request succeeded for {_item_and_price(item_id, price)}."
 
     reason = PURCHASE_RESULT_REASONS.get(result_code)
     if reason:
-        return f"Purchase failed for {item_id} at {price} silver: {reason}."
-    return f"Purchase failed for {item_id} at {price} silver: resultCode {result_code}."
+        return f"Purchase failed for {_item_and_price(item_id, price)}: {reason}."
+    return f"Purchase failed for {_item_and_price(item_id, price)}: resultCode {result_code}."
 
 
 def purchase_success_message(item_id, actual_price, submitted_price=None):
     if submitted_price is not None and int(submitted_price) != int(actual_price):
         return (
-            f"Purchase request succeeded for {item_id} at {actual_price} silver "
-            f"(submitted up to {submitted_price})."
+            f"Purchase request succeeded for {_item_and_price(item_id, actual_price)} "
+            f"(submitted up to {_format_silver_amount(submitted_price)})."
         )
     return purchase_result_message(0, item_id, actual_price)
 
 
 def purchase_preorder_message(item_id, price):
-    return f"Purchase request placed a pre-order for {item_id} at {price} silver; no stock was bought."
+    return f"Purchase request placed a pre-order for {_item_and_price(item_id, price)}; no stock was bought."
 
 
 def marketplace_silver_balance(wallet_response):

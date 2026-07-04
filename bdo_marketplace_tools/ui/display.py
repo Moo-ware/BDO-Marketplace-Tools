@@ -17,6 +17,20 @@ EVENT_LEVEL_COLORS = {
     "error": COLOR_ERROR,
 }
 
+# Routine (non-notable) info lines form the log's dim noise floor so notable
+# lines stand out without hiding anything.
+COLOR_EVENT_ROUTINE = "rgb(111,111,111)"
+
+
+def highlight(value):
+    """Bold-white emphasis for key values (counts, item ids) inside an event line."""
+    return f"[bold {COLOR_INFO}]{value}[/bold {COLOR_INFO}]"
+
+
+def highlight_silver(value):
+    """Brand-orange emphasis, reserved for silver amounts and buy mode."""
+    return f"[bold {COLOR_BRAND}]{value}[/bold {COLOR_BRAND}]"
+
 
 def mask_email(email):
     if not email or "@" not in email:

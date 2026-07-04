@@ -5,6 +5,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+from rich.text import Text
+
 from bdo_marketplace_tools.market.api_handler import (
     MarketplaceAPIError,
 )
@@ -43,7 +45,6 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
-    save_event_log_view,
     save_last_seen_update_version,
     save_pa_browser_profile_prepared,
     save_polling_settings,
@@ -70,7 +71,14 @@ from bdo_marketplace_tools.storage.paths import (
     STEAM_MARKET_PROFILE_PATH,
     TEST_STATS_DB_PATH,
 )
-from bdo_marketplace_tools.ui.display import APP_TITLE, EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.ui.display import (
+    APP_TITLE,
+    COLOR_EVENT_ROUTINE,
+    EVENT_LEVEL_COLORS,
+    format_duration,
+    highlight,
+    highlight_silver,
+)
 from bdo_marketplace_tools.version import APP_VERSION
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
@@ -79,7 +87,7 @@ _DEFAULT_STATS_PATH = object()
 _DEFAULT_LEGACY_STATS_PATH = object()
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
-EVENT_LOG_LIMIT = 20
+EVENT_LOG_LIMIT = 100
 # Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
 SCAN_COVERAGE_FLUSH_THRESHOLD = 12
 STATS_WRITE_RETRY_LIMIT = 2
@@ -165,12 +173,7 @@ class BackgroundTasks:
             if self.persist_ui_settings
             else default_app_settings()["maintenance"]["browser_cache_cleanup_threshold_mb"]
         )
-        self.events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.core_events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.event_log_view = ui_settings.get("event_log_view", "core")
-        self.unseen_event_channels = set()
-        self._last_event_state = {}
+        self.event_records = deque(maxlen=EVENT_LOG_LIMIT)
         self.unseen_alerts = False
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
@@ -474,7 +477,7 @@ class BackgroundTasks:
         self.invalidate_browser_storage_summary()
         if result.removed_anything:
             self.add_event(
-                f"Cleaned {format_storage_size(result.removed_bytes)} of disposable "
+                f"Cleaned {highlight(format_storage_size(result.removed_bytes))} of disposable "
                 f"{account_label} browser cache before opening Chrome.",
                 "info",
             )
@@ -502,7 +505,7 @@ class BackgroundTasks:
         failed_paths = sum(len(result.failed_paths) for result in results)
         if removed_bytes:
             self.add_event(
-                f"Cleaned {format_storage_size(removed_bytes)} of disposable browser cache.",
+                f"Cleaned {highlight(format_storage_size(removed_bytes))} of disposable browser cache.",
                 "info",
             )
         elif not failed_paths:
@@ -518,59 +521,91 @@ class BackgroundTasks:
             "results": results,
         }
 
-    def add_event(self, message, level="info", channel="core"):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        style = EVENT_LEVEL_COLORS.get(level, EVENT_LEVEL_COLORS["info"])
-        event = f"[dim]{timestamp}[/dim] [{style}]{message}[/{style}]"
-        normalized_channel = str(channel or "core").strip().lower()
-        if normalized_channel not in {"core", "ui"}:
-            normalized_channel = "core"
-        target = self.ui_events if normalized_channel == "ui" else self.core_events
+    def add_event(self, message, level="info", notable=False, divider=None):
+        # Errors are always notable; everything else opts in at the call site.
+        notable = bool(notable) or level == "error"
 
         # Identical consecutive events (error/retry storms) fold into one line with a
         # repeat counter carrying the latest timestamp, instead of flooding the log.
-        key = (str(message), style)
-        state = self._last_event_state.get(normalized_channel)
-        if state is not None and state["key"] == key and target and target[-1] == state["rendered"]:
-            state["count"] += 1
-            updated = f"{event} [dim]×{state['count']}[/dim]"
-            target[-1] = updated
-            if self.events and self.events[-1] == state["rendered"]:
-                self.events[-1] = updated
-            state["rendered"] = updated
+        message = str(message)
+        last = self.event_records[-1] if self.event_records else None
+        if last is not None and last["message"] == message and last["level"] == level:
+            last["count"] += 1
+            last["timestamp"] = datetime.now().strftime("%H:%M:%S")
+            last["notable"] = last["notable"] or notable
         else:
-            self._last_event_state[normalized_channel] = {"key": key, "count": 1, "rendered": event}
-            self.events.append(event)
-            target.append(event)
+            self.event_records.append(
+                {
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "message": message,
+                    "level": level,
+                    "notable": notable,
+                    "count": 1,
+                    # Optional short label; the Logs view renders the record as a dim
+                    # rule ("── monitor started · 03:40:01 ──") while the Activity
+                    # tail still shows the normal colored line.
+                    "divider": divider,
+                }
+            )
 
-        if normalized_channel != self.event_log_view:
-            self.unseen_event_channels.add(normalized_channel)
         if level in {"warning", "error"}:
             self.unseen_alerts = True
 
-    def events_for_channel(self, channel):
-        if str(channel or "").strip().lower() == "ui":
-            return tuple(self.ui_events)
-        return tuple(self.core_events)
+    @staticmethod
+    def render_event(record):
+        style = EVENT_LEVEL_COLORS.get(record["level"], EVENT_LEVEL_COLORS["info"])
+        # Routine info AND routine success form the dim noise floor — green is earned by
+        # notability, not by level. Warnings/errors always keep their color.
+        if not record["notable"] and record["level"] in {"info", "success"}:
+            style = COLOR_EVENT_ROUTINE
+        line = f"[dim]{record['timestamp']}[/dim] [{style}]{record['message']}[/{style}]"
+        if record["count"] > 1:
+            line = f"{line} [dim]×{record['count']}[/dim]"
+        return line
 
-    def has_unseen_events(self, channel):
-        return str(channel or "").strip().lower() in self.unseen_event_channels
+    @staticmethod
+    def event_plain_text(record):
+        # Messages may carry Rich markup for the UI; strip it for programmatic use.
+        try:
+            message = Text.from_markup(record["message"]).plain
+        except Exception:
+            message = record["message"]
+        line = f"{record['timestamp']} {message}"
+        if record["count"] > 1:
+            line = f"{line} ×{record['count']}"
+        return line
+
+    @property
+    def events(self):
+        return tuple(self.event_plain_text(record) for record in self.event_records)
+
+    DIVIDER_RULE_WIDTH = 64
+    DIVIDER_RULE_STYLE = "#3a3a3a"
+
+    @classmethod
+    def render_divider(cls, record):
+        label = f"── {record['divider']} · {record['timestamp']} "
+        rule = label + "─" * max(0, cls.DIVIDER_RULE_WIDTH - len(label))
+        return f"[{cls.DIVIDER_RULE_STYLE}]{rule}[/{cls.DIVIDER_RULE_STYLE}]"
+
+    def events_for_filter(self, log_filter="all", dividers=False):
+        log_filter = str(log_filter or "all").strip().lower()
+        if log_filter == "notable":
+            records = [record for record in self.event_records if record["notable"]]
+        elif log_filter == "alerts":
+            records = [record for record in self.event_records if record["level"] in {"warning", "error"}]
+        else:
+            records = list(self.event_records)
+        return tuple(
+            self.render_divider(record) if dividers and record.get("divider") else self.render_event(record)
+            for record in records
+        )
 
     def has_unseen_alerts(self):
         return self.unseen_alerts
 
     def mark_alerts_seen(self):
         self.unseen_alerts = False
-
-    def set_event_log_view(self, view):
-        normalized = str(view or "core").strip().lower()
-        if normalized not in {"core", "ui"}:
-            raise ValueError("Unknown event log view.")
-        self.event_log_view = normalized
-        if self.persist_ui_settings:
-            self.event_log_view = save_event_log_view(normalized)
-        self.unseen_event_channels.discard(self.event_log_view)
-        return self.event_log_view
 
     def set_update_check_on_startup(self, enabled):
         self.update_check_on_startup = bool(enabled)
@@ -590,7 +625,7 @@ class BackgroundTasks:
         if not manual:
             # Always record the running version at startup so the log shows the check ran,
             # even when the remote lookup is skipped (test mode or disabled).
-            self.add_event(f"{APP_TITLE} v{APP_VERSION}.", "info")
+            self.add_event(f"{APP_TITLE} {highlight(f'v{APP_VERSION}')}.", "info", notable=True)
         if not manual and (self.test_mode_enabled or not self.update_check_on_startup):
             return None
         if self.update_check_in_progress:
@@ -613,27 +648,26 @@ class BackgroundTasks:
                 self.add_event(
                     f"You are on the latest version ({result.current_version}).",
                     "info",
-                    channel="ui",
+                    notable=True,
                 )
         elif manual:  # error, surfaced only for an explicit user-initiated check
             self.add_event(
                 "Could not check for updates. Check your connection and try again.",
                 "warning",
-                channel="ui",
             )
         return result
 
     def _announce_available_update(self, latest_version, manual=False):
         message = (
-            f"Update available: version {latest_version} (you have {APP_VERSION}). "
+            f"Update available: version {highlight(latest_version)} (you have {APP_VERSION}). "
             f"Download it from {RELEASES_URL}"
         )
         if manual:
-            self.add_event(message, "warning", channel="ui")
+            self.add_event(message, "warning", notable=True)
             return
         # Startup nudge: announce a given version once so launches are not spammed.
         if latest_version != self.last_seen_update_version:
-            self.add_event(message, "warning")
+            self.add_event(message, "warning", notable=True)
             self._remember_seen_update_version(latest_version)
 
     def _remember_seen_update_version(self, version):
@@ -731,6 +765,7 @@ class BackgroundTasks:
         self.add_event(
             f"{reason} Buy mode paused; it will resume automatically once the session is refreshed.",
             "warning",
+            notable=True,
         )
         return True
 
@@ -739,7 +774,7 @@ class BackgroundTasks:
             return False
         # set_purchase_submission_enabled(True) clears buy_mode_resume_pending.
         self.set_purchase_submission_enabled(True)
-        self.add_event("Marketplace session refreshed; buy mode resumed.", "success")
+        self.add_event("Marketplace session refreshed; buy mode resumed.", "success", notable=True)
         return True
 
     def _persist_polling_settings(self):
@@ -885,7 +920,11 @@ class BackgroundTasks:
         else:
             self.api_handler.login_status = False
         self._set_saved_session_last_known_valid(False)
-        self.add_event(f"{reason}. Marketplace session cleared. Refresh Session before buying.", "warning")
+        self.add_event(
+            f"{reason}. Marketplace session cleared. Refresh Session before buying.",
+            "warning",
+            notable=True,
+        )
 
     def monitor_status_label(self):
         if self.single_item_test_checker_enabled:
@@ -916,6 +955,14 @@ class BackgroundTasks:
         self.checker_task = asyncio.create_task(self.checker())
         self.checker_task.add_done_callback(self._handle_checker_done)
         self.checker_enabled = True
+        mode = self.monitor_mode_label()
+        mode_markup = highlight_silver(mode) if self.purchase_submission_enabled else highlight(mode)
+        self.add_event(
+            f"Monitor started — {mode_markup}.",
+            "info",
+            notable=True,
+            divider=f"monitor started · {mode.lower()}",
+        )
         return True
 
     async def start_single_item_test_checker(self, allow_purchase=False):
@@ -991,6 +1038,8 @@ class BackgroundTasks:
         self.checker_task = None
         await self.flush_scan_coverage()
         await self.flush_stats_writes()
+        if was_running:
+            self.add_event("Monitor stopped.", "info", notable=True, divider="monitor stopped")
         return was_running
 
     async def stop_single_item_test_checker(self):
@@ -1112,12 +1161,16 @@ class BackgroundTasks:
             # Buy mode logs every scan because a purchase attempt follows; the
             # "(N new)" suffix keeps the log on the same episode scale as the
             # Detected counter.
-            self.add_event(f"{subject} detected: {detected_label}. Attempting purchase.", "success")
+            self.add_event(
+                f"{subject} detected: {highlight(detected_label)}. Attempting purchase.",
+                "success",
+                notable=True,
+            )
             await self.buy_item(buy_list, adjust_pricing=adjust_pricing)
         elif new_episode_count > 0:
             # Watch-only logs once per episode start; repeat sightings of the same
             # lingering listings would otherwise fill the event log every poll.
-            self.add_event(f"{subject} detected: {detected_label}.", "success")
+            self.add_event(f"{subject} detected: {highlight(detected_label)}.", "success", notable=True)
 
     def _detected_outfit_count(self, buy_list):
         return sum(int(item[1]) for item in buy_list)
@@ -1143,7 +1196,11 @@ class BackgroundTasks:
         new_episode_count = await self._record_detection_history(DEBUG_OUTFIT_LISTING)
         detected_count = self._detected_outfit_count(DEBUG_OUTFIT_LISTING)
         self.session_detected_outfits += new_episode_count
-        self.add_event(f"Outfit detected: {detected_count} available outfits. Simulating purchase.", "success")
+        self.add_event(
+            f"Outfit detected: {highlight(detected_count)} available outfits. Simulating purchase.",
+            "success",
+            notable=True,
+        )
 
         adjusted_buy_list = await self.adjust_prices(DEBUG_OUTFIT_LISTING)
         await self.record_purchase_summary(
@@ -1301,7 +1358,8 @@ class BackgroundTasks:
             self._set_pa_browser_profile_prepared(False)
         self.invalidate_browser_storage_summary()
         self.add_event(
-            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile ({cleared_count} cookies).",
+            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile "
+            f"({highlight(cleared_count)} cookies).",
             "warning",
         )
         return True
@@ -1343,16 +1401,20 @@ class BackgroundTasks:
 
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(True)
         self.steam_auto_reauth_enabled = True
-        self.add_event("Initial Steam browser setup saved. Refresh Session can now open the market login.", "success")
+        self.add_event(
+            "Initial Steam browser setup saved. Refresh Session can now open the market login.",
+            "success",
+            notable=True,
+        )
         return True
 
     async def _recover_purchase_session_for_retry(self, *, force_browser_refresh=False):
-        self.add_event("Login session expired. Attempting to re-authenticate.", "warning")
+        self.add_event("Login session expired. Attempting to re-authenticate.", "warning", notable=True)
 
         if self.uses_steam_browser_session():
             refreshed = await self.refresh_browser_session(force_refresh=force_browser_refresh)
             if refreshed:
-                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
                 return True
 
             # Pause and arm auto-resume (PA path does the same just below): otherwise buy mode stays
@@ -1364,7 +1426,7 @@ class BackgroundTasks:
 
         if await self.refresh_pa_browser_session(force_refresh=force_browser_refresh):
             self._set_saved_session_last_known_valid(True)
-            self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+            self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
             return True
 
         self._set_saved_session_last_known_valid(False)
@@ -1419,7 +1481,7 @@ class BackgroundTasks:
             capped_buy_list = self._apply_spend_cap(updated_buy_list)
 
             if not capped_buy_list:
-                self.add_event("Purchase skipped: spend cap would be exceeded.", "warning")
+                self.add_event("Purchase skipped: spend cap would be exceeded.", "warning", notable=True)
                 return
 
             if self.simulated_session_enabled:
@@ -1538,13 +1600,14 @@ class BackgroundTasks:
 
         summary_events = summary.get("events", [])
         for event in summary_events:
+            # Purchase outcomes are always notable: they are the reason the app runs.
             if isinstance(event, dict):
-                self.add_event(event.get("message", ""), event.get("level", "info"))
+                self.add_event(event.get("message", ""), event.get("level", "info"), notable=True)
             else:
-                self.add_event(event, "success" if "succeeded" in event else "warning")
+                self.add_event(event, "success" if "succeeded" in event else "warning", notable=True)
 
         if purchased_count == 0 and not summary_events:
-            self.add_event("Purchase attempt completed without a successful request.", "warning")
+            self.add_event("Purchase attempt completed without a successful request.", "warning", notable=True)
 
     def _apply_spend_cap(self, buy_list):
         if self.max_spend is None:
@@ -1571,7 +1634,7 @@ class BackgroundTasks:
     async def adjust_prices(self, buy_list):
         modified_list, fallback_items = apply_price_rules(buy_list)
         if fallback_items:
-            self.add_event(f"Fallback pricing applied to {len(fallback_items)} outfit listings.", "warning")
+            self.add_event(f"Fallback pricing applied to {highlight(len(fallback_items))} outfit listings.", "warning")
         return modified_list
 
     async def login(self):
@@ -1588,6 +1651,7 @@ class BackgroundTasks:
             self._set_saved_session_last_known_valid(True)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
+            # Routine check outcome (nothing changed) — stays out of the Activity tail.
             self.add_event("Existing marketplace session is valid.", "success")
             self.start_login_status_checker()
             self.resume_buy_mode_after_refresh()
@@ -1666,10 +1730,13 @@ class BackgroundTasks:
             if credential_error:
                 details.append(f"Saved credentials unavailable: {credential_error}.")
             if auto_submit_credentials:
-                details.append("Opening Pearl Abyss Account browser session; saved credentials will be submitted automatically.")
+                details.append("Refreshing session — opening the Pearl Abyss browser; saved credentials will be submitted.")
             else:
-                details.append("Opening Pearl Abyss Account browser session for manual login.")
-            self.add_event(" ".join(details), "warning")
+                details.append("Refreshing session — opening the Pearl Abyss browser for manual login.")
+            # A routine refresh is a notable info line; it only escalates to a warning when
+            # it carries an actual failure detail (session check / login / credential error).
+            opening_level = "warning" if len(details) > 1 else "info"
+            self.add_event(" ".join(details), opening_level, notable=True)
 
             try:
                 bootstrap_url = None
@@ -1688,6 +1755,7 @@ class BackgroundTasks:
                     profile_path=PA_MARKET_PROFILE_PATH,
                     bootstrap_url=bootstrap_url,
                     account_label="Pearl Abyss Account",
+                    announce_opening=False,
                 )
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
@@ -1708,7 +1776,7 @@ class BackgroundTasks:
                 self._set_pa_browser_profile_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.start_login_status_checker()
-                self.add_event("Pearl Abyss Account browser session validated and saved.", "success")
+                self.add_event("Pearl Abyss Account session validated and saved.", "success", notable=True)
                 self.resume_buy_mode_after_refresh()
                 return True
 
@@ -1747,6 +1815,7 @@ class BackgroundTasks:
                 self.add_event(
                     f"Session check failed: {session_check_error}. Opening Steam Account browser session.",
                     "warning",
+                    notable=True,
                 )
 
             try:
@@ -1785,7 +1854,7 @@ class BackgroundTasks:
                     self._set_steam_pa_cookie_consent_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.steam_auto_reauth_enabled = True
-                self.add_event("Steam Account session validated and saved.", "success")
+                self.add_event("Steam Account session validated and saved.", "success", notable=True)
                 self.start_login_status_checker()
                 self.resume_buy_mode_after_refresh()
                 return True
@@ -1801,15 +1870,18 @@ class BackgroundTasks:
     async def initial_login_check(self):
         if not self.saved_session_last_known_valid:
             self.api_handler.login_status = False
+            # A fresh start with no saved session is the normal logged-out state, not a
+            # fault — routine dim info, the negative twin of "session is valid". It stays in
+            # the full log (guidance to refresh) but off the tail and out of the Alerts filter.
             if self.uses_steam_browser_session():
                 self.add_event(
                     "No previously validated Steam Account session is saved. Refresh Session to open the login browser.",
-                    "warning",
+                    "info",
                 )
             else:
                 self.add_event(
                     "No previously validated marketplace session is saved. Refresh Session to open the login browser.",
-                    "warning",
+                    "info",
                 )
             return
 
@@ -1832,6 +1904,7 @@ class BackgroundTasks:
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
+            # Routine startup check outcome (nothing changed) — stays out of the Activity tail.
             self.add_event("Saved marketplace session is valid.", "success")
         else:
             self.api_handler.login_status = False
@@ -1889,7 +1962,7 @@ class BackgroundTasks:
             if self.steam_auto_reauth_available():
                 self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
                 if await self.refresh_browser_session(auto_steam_login=True):
-                    self.add_event("Session expired. Re-authentication successful.", "success")
+                    self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
                     return True
 
             # Mirror the PA path below: pause AND arm auto-resume so buy mode comes back on its own
@@ -1904,7 +1977,7 @@ class BackgroundTasks:
 
         self.add_event("Session expired. Attempting Pearl Abyss Account browser re-authentication.", "warning")
         if await self.refresh_pa_browser_session():
-            self.add_event("Session expired. Re-authentication successful.", "success")
+            self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
             return True
 
         self._set_saved_session_last_known_valid(False)

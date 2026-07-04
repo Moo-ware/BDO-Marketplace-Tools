@@ -18,8 +18,6 @@ DEFAULT_PURCHASE_DELAY_RANGE = [1.0, 2.5]
 DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB = DEFAULT_DISPOSABLE_CACHE_CLEANUP_THRESHOLD_BYTES // MIB
 MAX_BROWSER_CACHE_CLEANUP_THRESHOLD_MB = 10240
 VALID_POLLING_DELAY_KEYS = {"1", "2", "3", "custom"}
-DEFAULT_EVENT_LOG_VIEW = "core"
-VALID_EVENT_LOG_VIEWS = {"core", "ui"}
 DEFAULT_UPDATE_CHECK_ON_STARTUP = True
 
 ACCOUNT_MODE_LABELS = {
@@ -115,9 +113,6 @@ def default_app_settings():
             # Whether buy mode is enabled (vs watch-only). Persisted. Auto-paused on session expiry
             # and auto-resumed on the next successful session refresh.
             "buy_mode": False,
-            # Which dashboard event-log stream is shown: "core" (monitor/session/API/purchase) or
-            # "ui" (interface confirmations).
-            "event_log_view": DEFAULT_EVENT_LOG_VIEW,
         },
         "updates": {
             # Most recent version the user has already been notified about, so a newer
@@ -223,11 +218,6 @@ def _coerce_browser_cache_cleanup_threshold_mb(value):
         return DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB
 
 
-def _normalize_event_log_view(value):
-    normalized = str(value or DEFAULT_EVENT_LOG_VIEW).strip().lower()
-    return normalized if normalized in VALID_EVENT_LOG_VIEWS else DEFAULT_EVENT_LOG_VIEW
-
-
 def _normalize_settings(data):
     settings = default_app_settings()
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
@@ -287,9 +277,6 @@ def _normalize_settings(data):
     )
     settings["ui"]["spend_cap"] = _coerce_spend_cap(ui.get("spend_cap", data.get("max_spend")))
     settings["ui"]["buy_mode"] = _coerce_bool(ui.get("buy_mode", data.get("purchase_submission_enabled", False)))
-    settings["ui"]["event_log_view"] = _normalize_event_log_view(
-        ui.get("event_log_view", data.get("event_log_view", DEFAULT_EVENT_LOG_VIEW))
-    )
     last_seen_version = updates.get("last_seen_version", data.get("last_seen_update_version"))
     settings["updates"]["last_seen_version"] = (
         str(last_seen_version).strip() if last_seen_version else None
@@ -446,12 +433,6 @@ def save_buy_mode(enabled):
     ui = load_ui_settings()
     ui["buy_mode"] = bool(enabled)
     return save_ui_settings(ui)["buy_mode"]
-
-
-def save_event_log_view(view):
-    ui = load_ui_settings()
-    ui["event_log_view"] = _normalize_event_log_view(view)
-    return save_ui_settings(ui)["event_log_view"]
 
 
 def load_update_settings():

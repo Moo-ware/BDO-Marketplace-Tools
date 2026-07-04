@@ -69,6 +69,7 @@ APP_CSS = """
         width: 1fr;
     }
 
+    #topbar-brand-divider,
     #topbar-settings-divider {
         width: auto;
         margin-left: 2;
@@ -348,9 +349,7 @@ APP_CSS = """
     #event-log {
         height: 1fr;
         min-height: 6;
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
+        background: transparent;
         scrollbar-size-vertical: 1;
         scrollbar-size-horizontal: 1;
         scrollbar-color: #343434;
@@ -364,12 +363,22 @@ APP_CSS = """
 
     #event-log-toolbar {
         height: 1;
-        margin-top: 0;
+        margin-top: 1;
         margin-bottom: 0;
-        align-horizontal: right;
     }
 
-    #log-filter-separator {
+    #event-log-title {
+        width: 1fr;
+        content-align: left middle;
+    }
+
+    #event-log-rule {
+        height: 1;
+        margin-bottom: 1;
+        border-top: solid #262626;
+    }
+
+    .log-filter-separator {
         width: auto;
         margin: 0 1;
         content-align: center middle;
