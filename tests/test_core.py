@@ -4488,6 +4488,22 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         events = manager.events
         self.assertEqual(len([event for event in events if "Monitor cycle failed" in event]), 3)
 
+    async def test_event_log_engine_works_standalone(self):
+        # The engine lives in services.event_log and needs no task manager.
+        from bdo_marketplace_tools.services.event_log import EventLog
+
+        log = EventLog(limit=2)
+        log.add("one", "info")
+        log.add("two", "warning")
+        log.add("three", "error")
+
+        self.assertEqual(len(log.plain_events), 2)  # limit evicts the oldest
+        self.assertNotIn("one", "\n".join(log.plain_events))
+        self.assertTrue(log.has_unseen_alerts())
+        log.mark_alerts_seen()
+        self.assertFalse(log.has_unseen_alerts())
+        self.assertEqual(len(log.rendered_for_filter("alerts")), 2)
+
     async def test_divider_events_render_as_rules_only_when_requested(self):
         manager = self.make_task_manager()
 

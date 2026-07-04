@@ -5,8 +5,6 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from rich.text import Text
-
 from bdo_marketplace_tools.market.api_handler import (
     MarketplaceAPIError,
 )
@@ -71,10 +69,9 @@ from bdo_marketplace_tools.storage.paths import (
     STEAM_MARKET_PROFILE_PATH,
     TEST_STATS_DB_PATH,
 )
+from bdo_marketplace_tools.services.event_log import EVENT_LOG_LIMIT, EventLog
 from bdo_marketplace_tools.ui.display import (
     APP_TITLE,
-    COLOR_EVENT_ROUTINE,
-    EVENT_LEVEL_COLORS,
     format_duration,
     highlight,
     highlight_silver,
@@ -87,7 +84,6 @@ _DEFAULT_STATS_PATH = object()
 _DEFAULT_LEGACY_STATS_PATH = object()
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
-EVENT_LOG_LIMIT = 100
 # Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
 SCAN_COVERAGE_FLUSH_THRESHOLD = 12
 STATS_WRITE_RETRY_LIMIT = 2
@@ -173,8 +169,7 @@ class BackgroundTasks:
             if self.persist_ui_settings
             else default_app_settings()["maintenance"]["browser_cache_cleanup_threshold_mb"]
         )
-        self.event_records = deque(maxlen=EVENT_LOG_LIMIT)
-        self.unseen_alerts = False
+        self.event_log = EventLog()
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
@@ -521,91 +516,23 @@ class BackgroundTasks:
             "results": results,
         }
 
+    # Event log delegates: storage, rendering, and the classification policy live in
+    # services.event_log; these keep the call sites and tests on one façade.
     def add_event(self, message, level="info", notable=False, divider=None):
-        # Errors are always notable; everything else opts in at the call site.
-        notable = bool(notable) or level == "error"
-
-        # Identical consecutive events (error/retry storms) fold into one line with a
-        # repeat counter carrying the latest timestamp, instead of flooding the log.
-        message = str(message)
-        last = self.event_records[-1] if self.event_records else None
-        if last is not None and last["message"] == message and last["level"] == level:
-            last["count"] += 1
-            last["timestamp"] = datetime.now().strftime("%H:%M:%S")
-            last["notable"] = last["notable"] or notable
-        else:
-            self.event_records.append(
-                {
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "message": message,
-                    "level": level,
-                    "notable": notable,
-                    "count": 1,
-                    # Optional short label; the Logs view renders the record as a dim
-                    # rule ("── monitor started · 03:40:01 ──") while the Activity
-                    # tail still shows the normal colored line.
-                    "divider": divider,
-                }
-            )
-
-        if level in {"warning", "error"}:
-            self.unseen_alerts = True
-
-    @staticmethod
-    def render_event(record):
-        style = EVENT_LEVEL_COLORS.get(record["level"], EVENT_LEVEL_COLORS["info"])
-        # Routine info AND routine success form the dim noise floor — green is earned by
-        # notability, not by level. Warnings/errors always keep their color.
-        if not record["notable"] and record["level"] in {"info", "success"}:
-            style = COLOR_EVENT_ROUTINE
-        line = f"[dim]{record['timestamp']}[/dim] [{style}]{record['message']}[/{style}]"
-        if record["count"] > 1:
-            line = f"{line} [dim]×{record['count']}[/dim]"
-        return line
-
-    @staticmethod
-    def event_plain_text(record):
-        # Messages may carry Rich markup for the UI; strip it for programmatic use.
-        try:
-            message = Text.from_markup(record["message"]).plain
-        except Exception:
-            message = record["message"]
-        line = f"{record['timestamp']} {message}"
-        if record["count"] > 1:
-            line = f"{line} ×{record['count']}"
-        return line
+        self.event_log.add(message, level, notable=notable, divider=divider)
 
     @property
     def events(self):
-        return tuple(self.event_plain_text(record) for record in self.event_records)
-
-    DIVIDER_RULE_WIDTH = 64
-    DIVIDER_RULE_STYLE = "#3a3a3a"
-
-    @classmethod
-    def render_divider(cls, record):
-        label = f"── {record['divider']} · {record['timestamp']} "
-        rule = label + "─" * max(0, cls.DIVIDER_RULE_WIDTH - len(label))
-        return f"[{cls.DIVIDER_RULE_STYLE}]{rule}[/{cls.DIVIDER_RULE_STYLE}]"
+        return self.event_log.plain_events
 
     def events_for_filter(self, log_filter="all", dividers=False):
-        log_filter = str(log_filter or "all").strip().lower()
-        if log_filter == "notable":
-            records = [record for record in self.event_records if record["notable"]]
-        elif log_filter == "alerts":
-            records = [record for record in self.event_records if record["level"] in {"warning", "error"}]
-        else:
-            records = list(self.event_records)
-        return tuple(
-            self.render_divider(record) if dividers and record.get("divider") else self.render_event(record)
-            for record in records
-        )
+        return self.event_log.rendered_for_filter(log_filter, dividers=dividers)
 
     def has_unseen_alerts(self):
-        return self.unseen_alerts
+        return self.event_log.has_unseen_alerts()
 
     def mark_alerts_seen(self):
-        self.unseen_alerts = False
+        self.event_log.mark_alerts_seen()
 
     def set_update_check_on_startup(self, enabled):
         self.update_check_on_startup = bool(enabled)
