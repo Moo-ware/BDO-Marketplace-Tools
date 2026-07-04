@@ -3,8 +3,8 @@ setlocal
 
 cd /d "%~dp0"
 
-set "WT_COLUMNS=120"
-set "WT_LINES=35"
+set "WT_COLUMNS=114"
+set "WT_LINES=36"
 set "PROJECT_DIR=%CD%"
 set "PYTHONDONTWRITEBYTECODE=1"
 set "LAUNCH_MARKER=%TEMP%\bdo-marketplace-tools-launch.ok"

@@ -35,6 +35,9 @@ SESSION_COOKIE_PATH = DATA_DIR / "session.json"
 
 LOCAL_STATS_PATH = DATA_DIR / "local_stats.json"
 
+STATS_DB_PATH = DATA_DIR / "stats.db"
+TEST_STATS_DB_PATH = DATA_DIR / "stats.test.db"
+
 BROWSER_PROFILES_DIR = DATA_DIR / "browser_profiles"
 PA_MARKET_PROFILE_PATH = BROWSER_PROFILES_DIR / "pa-market"
 STEAM_MARKET_PROFILE_PATH = BROWSER_PROFILES_DIR / "steam-market"

@@ -2,15 +2,19 @@ import asyncio
 import json
 import os
 import requests
+import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import closing
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import main as app_main
 from rich.console import Console
 from textual.color import Color
-from textual.widgets import Button, Input, Select, Static
+from textual.widgets import Button, Input, Select, Static, Tooltip
 from bdo_marketplace_tools.market.api_handler import (
     APIHandler,
     DEFAULT_PURCHASE_DELAY_BOUNDS,
@@ -78,10 +82,17 @@ from bdo_marketplace_tools.market.pricing import (
     purchase_record_count,
     purchase_record_spend,
 )
-from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
+from bdo_marketplace_tools.market.test_mode import (
+    LIVE_BUY_ERROR_TEST_TARGET,
+    SINGLE_ITEM_TEST_TARGET,
+    check_single_item_stock,
+    live_buy_error_test_listing,
+    parse_single_item_stock_response,
+)
 from bdo_marketplace_tools.storage import app_settings as account_mode_module
 from bdo_marketplace_tools.storage import browser_profile_cache as browser_profile_cache_module
 from bdo_marketplace_tools.storage import credentials as credentials_module
+from bdo_marketplace_tools.storage import stats_db as stats_db_module
 from bdo_marketplace_tools.services import task_manager as task_manager_module
 from bdo_marketplace_tools.services import update_checker as update_checker_module
 from bdo_marketplace_tools.storage.paths import PA_MARKET_PROFILE_PATH
@@ -97,6 +108,7 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
     measure_browser_profile_storage,
 )
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
+from bdo_marketplace_tools.ui import charts as charts_module
 from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
     BANNER_BLINK_ART,
@@ -107,6 +119,7 @@ from bdo_marketplace_tools.ui.app import (
     MarketplaceToolsApp,
     ModalAction,
 )
+from bdo_marketplace_tools.ui.widgets import DailyActivityChart
 from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
 
 
@@ -998,6 +1011,22 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(len(fake_context.init_scripts), 1)
         self.assertIn("Setting up your session", fake_context.init_scripts[0])
+
+    def test_browser_notice_scripts_are_ascii(self):
+        from bdo_marketplace_tools.market.browser_auth import (
+            SETUP_NOTICE_CREDENTIALS_SCRIPT,
+            SETUP_NOTICE_SCRIPT,
+            SETUP_NOTICE_WARN_SCRIPT,
+            STEAM_REMEMBER_ME_GUIDE_SCRIPT,
+        )
+
+        for script in (
+            SETUP_NOTICE_SCRIPT,
+            SETUP_NOTICE_WARN_SCRIPT,
+            SETUP_NOTICE_CREDENTIALS_SCRIPT,
+            STEAM_REMEMBER_ME_GUIDE_SCRIPT,
+        ):
+            self.assertTrue(script.isascii())
 
     def test_set_setup_notice_warning_evaluates_in_page(self):
         from bdo_marketplace_tools.market.browser_auth import (
@@ -2779,6 +2808,7 @@ class APIResultTests(unittest.TestCase):
     def test_purchase_result_messages_name_known_codes(self):
         self.assertIn("identical order already exists", purchase_result_message(30, "item", "100"))
         self.assertIn("price mismatch", purchase_result_message(-14, "item", "100"))
+        self.assertIn("not enough silver", purchase_result_message(-16, "item", "100"))
         self.assertIn("duplicate pre-order", purchase_result_message(34, "item", "100"))
         self.assertIn("resultCode 999", purchase_result_message(999, "item", "100"))
 
@@ -3059,35 +3089,106 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(saved_settings["account"]["email"], "user@example.com")
             self.assertNotIn("new-secret", json.dumps(saved_settings))
 
-    def test_missing_local_stats_file_is_initialized_with_default_totals(self):
+    def test_missing_stats_db_is_initialized_with_default_totals(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            local_data_path = Path(temp_dir) / "data" / "local_stats.json"
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "data" / "stats.db"
+            legacy_path = temp_path / "data" / "local_stats.json"
 
-            with patch("bdo_marketplace_tools.services.task_manager.LOCAL_DATA_PATH", local_data_path):
+            with patch("bdo_marketplace_tools.services.task_manager.STATS_DB_PATH", db_path), patch(
+                "bdo_marketplace_tools.services.task_manager.LOCAL_DATA_PATH", legacy_path
+            ):
                 data = task_manager_module._load_local_data()
 
             self.assertEqual(data, LOCAL_DATA)
-            self.assertTrue(local_data_path.exists())
-            payload = json.loads(local_data_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload, LOCAL_DATA)
-            self.assertNotIn("updated_at", payload)
+            self.assertTrue(db_path.exists())
+            with closing(sqlite3.connect(db_path)) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, stats_db_module.SCHEMA_VERSION)
+            # The retired JSON stats file is never created or written anymore.
+            self.assertFalse(legacy_path.exists())
 
-    def test_old_local_data_file_is_ignored_for_fresh_start(self):
+    def test_legacy_local_stats_json_seeds_lifetime_totals_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            local_stats_path = temp_path / "data" / "local_stats.json"
-            old_local_data_path = temp_path / "resources" / "local_data.json"
-            old_local_data_path.parent.mkdir(parents=True)
-            old_local_data_path.write_text(
+            db_path = temp_path / "data" / "stats.db"
+            legacy_path = temp_path / "data" / "local_stats.json"
+            legacy_path.parent.mkdir(parents=True)
+            legacy_path.write_text(
                 json.dumps({"successful_purchases": 7, "silver_spent": 12345}),
                 encoding="utf-8",
             )
 
-            data = task_manager_module.load_local_stats(path=local_stats_path)
+            seeded = stats_db_module.load_lifetime_stats(path=db_path, legacy_json_path=legacy_path)
+            self.assertEqual(seeded, {"successful_purchases": 7, "silver_spent": 12345})
 
-            self.assertEqual(data, LOCAL_DATA)
-            self.assertTrue(local_stats_path.exists())
-            self.assertEqual(json.loads(local_stats_path.read_text(encoding="utf-8")), LOCAL_DATA)
+            legacy_path.write_text(
+                json.dumps({"successful_purchases": 999, "silver_spent": 1}),
+                encoding="utf-8",
+            )
+            reread = stats_db_module.load_lifetime_stats(path=db_path, legacy_json_path=legacy_path)
+            self.assertEqual(reread, {"successful_purchases": 7, "silver_spent": 12345})
+
+    def test_save_lifetime_stats_upserts_totals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "data" / "stats.db"
+            legacy_path = Path(temp_dir) / "data" / "local_stats.json"
+
+            stats_db_module.save_lifetime_stats(3, 500, path=db_path)
+            stats_db_module.save_lifetime_stats(5, 900, path=db_path)
+
+            data = stats_db_module.load_lifetime_stats(path=db_path, legacy_json_path=legacy_path)
+            self.assertEqual(data, {"successful_purchases": 5, "silver_spent": 900})
+
+    def test_unversioned_stats_db_is_promoted_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "data" / "stats.db"
+            legacy_path = Path(temp_dir) / "data" / "local_stats.json"
+            db_path.parent.mkdir(parents=True)
+            detected_at = int(datetime(2026, 7, 3, 9, 0).timestamp())
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE lifetime_stats (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        successful_purchases INTEGER NOT NULL DEFAULT 0,
+                        silver_spent INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT
+                    );
+                    CREATE TABLE outfit_events (
+                        id INTEGER PRIMARY KEY,
+                        event_type TEXT NOT NULL CHECK (event_type IN ('detection', 'purchase')),
+                        occurred_at INTEGER NOT NULL,
+                        item_id TEXT,
+                        quantity INTEGER NOT NULL DEFAULT 1,
+                        silver INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE daily_coverage (
+                        day TEXT PRIMARY KEY,
+                        scans INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO lifetime_stats (id, successful_purchases, silver_spent, updated_at)
+                        VALUES (1, 4, 8000, 'prototype');
+                    INSERT INTO daily_coverage (day, scans) VALUES ('2026-07-03', 3);
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO outfit_events (event_type, occurred_at, item_id, quantity, silver)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (stats_db_module.DETECTION_EVENT, detected_at, "outfit-a", 2, 0),
+                )
+                connection.commit()
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+
+            data = stats_db_module.load_lifetime_stats(path=db_path, legacy_json_path=legacy_path)
+            trends = stats_db_module.load_trends(1, path=db_path, today=date(2026, 7, 3))
+
+            self.assertEqual(data, {"successful_purchases": 4, "silver_spent": 8000})
+            self.assertEqual(trends["daily"][-1]["detected"], 2)
+            self.assertEqual(trends["daily"][-1]["scans"], 3)
+            with closing(sqlite3.connect(db_path)) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, stats_db_module.SCHEMA_VERSION)
 
     def test_old_session_file_is_ignored_for_fresh_start(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3242,6 +3343,244 @@ class LocalRuntimeFileTests(unittest.TestCase):
         self.assertEqual(format_storage_size(0), "0 B")
         self.assertEqual(format_storage_size(1024), "1.0 KiB")
         self.assertEqual(format_storage_size(2 * 1024 * 1024), "2.0 MiB")
+
+
+class StatsHistoryTests(unittest.TestCase):
+    def test_load_trends_buckets_daily_weekday_and_hourly_activity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            today = date(2026, 7, 3)  # a Friday
+            thursday_noon = datetime(2026, 7, 2, 12, 30)
+            friday_evening = datetime(2026, 7, 3, 20, 5)
+
+            stats_db_module.record_detection_events(
+                [["outfit-a", "2", "100"], ["outfit-b", "1", "100"]],
+                at=thursday_noon.timestamp(),
+                path=db_path,
+            )
+            stats_db_module.record_detection_events(
+                [["outfit-a", "1", "100"]],
+                at=friday_evening.timestamp(),
+                path=db_path,
+            )
+            stats_db_module.record_purchase_events(
+                [{"item_id": "outfit-a", "price": "2170000000", "count": 1}],
+                at=friday_evening.timestamp(),
+                path=db_path,
+            )
+            stats_db_module.add_daily_coverage({"2026-07-03": 40}, path=db_path)
+            stats_db_module.add_daily_coverage({"2026-07-03": 2, "2026-07-02": 5}, path=db_path)
+
+            trends = stats_db_module.load_trends(7, path=db_path, today=today)
+
+            self.assertEqual(len(trends["daily"]), 7)
+            daily = {row["day"].isoformat(): row for row in trends["daily"]}
+            self.assertEqual(daily["2026-07-02"]["detected"], 3)
+            self.assertEqual(daily["2026-07-02"]["purchased"], 0)
+            self.assertEqual(daily["2026-07-02"]["scans"], 5)
+            self.assertEqual(daily["2026-07-03"]["detected"], 1)
+            self.assertEqual(daily["2026-07-03"]["purchased"], 1)
+            self.assertEqual(daily["2026-07-03"]["scans"], 42)
+
+            self.assertEqual(trends["weekday"]["detected"][3], 3)  # Thursday
+            self.assertEqual(trends["weekday"]["detected"][4], 1)  # Friday
+            self.assertEqual(trends["weekday"]["purchased"][4], 1)
+            self.assertEqual(trends["hourly"][3][12], 3)
+            self.assertEqual(trends["hourly"][4][20], 1)
+
+    def test_load_trends_ignores_events_outside_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            today = date(2026, 7, 3)
+            stale_moment = datetime(2026, 5, 1, 10, 0)
+
+            stats_db_module.record_detection_events(
+                [["outfit-old", "4", "100"]],
+                at=stale_moment.timestamp(),
+                path=db_path,
+            )
+            stats_db_module.add_daily_coverage({"2026-05-01": 99}, path=db_path)
+
+            trends = stats_db_module.load_trends(30, path=db_path, today=today)
+
+            self.assertEqual(len(trends["daily"]), 30)
+            self.assertTrue(all(row["detected"] == 0 for row in trends["daily"]))
+            self.assertTrue(all(row["scans"] == 0 for row in trends["daily"]))
+            self.assertEqual(sum(trends["weekday"]["detected"]), 0)
+            self.assertEqual(sum(value for row in trends["hourly"] for value in row), 0)
+
+    def test_detection_rows_with_zero_stock_are_not_recorded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            today = date(2026, 7, 3)
+
+            stats_db_module.record_detection_events(
+                [["outfit-a", "0", "100"]],
+                at=datetime(2026, 7, 3, 9, 0).timestamp(),
+                path=db_path,
+            )
+
+            trends = stats_db_module.load_trends(7, path=db_path, today=today)
+            self.assertTrue(all(row["detected"] == 0 for row in trends["daily"]))
+
+
+class TrendChartTests(unittest.TestCase):
+    def test_daily_activity_chart_renders_scale_coverage_and_legend(self):
+        today = date(2026, 7, 3)  # a Friday
+        daily = [
+            {"day": today - timedelta(days=offset), "detected": 0, "purchased": 0, "scans": 0}
+            for offset in range(6, -1, -1)
+        ]
+        daily[-1].update(detected=4, purchased=2, scans=30)
+        daily[-2].update(detected=1, scans=12)
+
+        rendered = charts_module.daily_activity_chart(daily).plain
+
+        self.assertIn("4 ┤", rendered)
+        self.assertIn("3 ┤", rendered)
+        self.assertIn("2 ┤", rendered)
+        self.assertIn("1 ┤", rendered)
+        self.assertIn("▔", rendered)
+        self.assertIn("Fri", rendered)  # 7-day view labels columns by weekday
+        self.assertIn("detected", rendered)
+        self.assertIn("purchased", rendered)
+        self.assertIn("monitored", rendered)
+        legend_rows = [
+            index
+            for index, line in enumerate(rendered.splitlines())
+            if any(label in line for label in ("detected", "purchased", "monitored", "offline"))
+        ]
+        self.assertEqual(legend_rows, [0, 2, 4, 6])
+
+    def test_daily_activity_chart_uses_steady_rounded_axis_ticks(self):
+        today = date(2026, 7, 3)
+        daily = [
+            {"day": today - timedelta(days=offset), "detected": 0, "purchased": 0, "scans": 0}
+            for offset in range(29, -1, -1)
+        ]
+        daily[-2].update(detected=18, purchased=2, scans=8)
+        daily[-1].update(detected=23, purchased=5, scans=8)
+
+        rendered = charts_module.daily_activity_chart(daily).plain
+
+        self.assertIn("25 ┤", rendered)
+        self.assertIn("20 ┤", rendered)
+        self.assertIn("15 ┤", rendered)
+        self.assertIn("10 ┤", rendered)
+        self.assertIn(" 5 ┤", rendered)
+        self.assertNotIn("23 ┤", rendered)
+
+    def test_daily_activity_chart_keeps_small_purchase_segment_proportional_with_spike(self):
+        today = date(2026, 7, 3)
+        daily = [
+            {"day": today - timedelta(days=offset), "detected": 0, "purchased": 0, "scans": 0}
+            for offset in range(29, -1, -1)
+        ]
+        daily[-2].update(detected=18, purchased=2, scans=8)
+        daily[-1].update(detected=100, purchased=0, scans=8)
+
+        rendered = charts_module.daily_activity_chart(daily)
+
+        mixed_spans = [
+            span for span in rendered.spans
+            if " on " in str(span.style) and rendered.plain[span.start:span.end].strip()
+        ]
+        self.assertTrue(mixed_spans)
+        self.assertTrue(rendered.plain.splitlines()[charts_module.CHART_HEIGHT].lstrip().startswith("┼"))
+
+    def test_daily_activity_chart_notes_empty_window(self):
+        today = date(2026, 7, 3)
+        daily = [{"day": today, "detected": 0, "purchased": 0, "scans": 0}]
+
+        rendered = charts_module.daily_activity_chart(daily).plain
+
+        self.assertIn("No outfits in this window yet", rendered)
+
+    def test_weekday_chart_scales_bars_and_shows_counts(self):
+        rendered = charts_module.weekday_chart(
+            {"detected": [10, 0, 5, 0, 0, 0, 0], "purchased": [0] * 7}
+        ).plain
+
+        lines = rendered.splitlines()
+        self.assertEqual(len(lines), 7)
+        self.assertEqual(lines[0], "Mon  " + "█" * 20 + "  10")
+        self.assertEqual(lines[2], "Wed  " + "█" * 10 + "░" * 10 + "  5")
+        self.assertEqual(lines[1], "Tue  " + "░" * 20 + "  0")
+
+    def test_daily_chart_tooltip_geometry_matches_axis_scale_width(self):
+        # 9 detections render against a rounded axis scale of 10, so the y-axis
+        # labels are two characters wide; hover mapping must use the same width.
+        today = date(2026, 7, 3)
+        daily = [
+            {"day": today - timedelta(days=offset), "detected": 0, "purchased": 0, "scans": 0}
+            for offset in range(29, -1, -1)
+        ]
+        daily[-1]["detected"] = 9
+
+        chart = DailyActivityChart()
+        chart._daily = list(daily)
+        chart._set_geometry(charts_module.CHART_HEIGHT)
+
+        rendered = charts_module.daily_activity_chart(daily).plain
+        top_line = rendered.splitlines()[0]
+        self.assertTrue(top_line.startswith("10 ┤"))  # bars begin right after "10 ┤ "
+        first_bar_column = top_line.index("┤") + 2
+
+        self.assertEqual(chart._column_start, len("10") + 3)
+        self.assertEqual(first_bar_column, chart._column_start)
+        self.assertEqual(chart._day_index_for_x(chart._column_start), 0)
+        self.assertIsNone(chart._day_index_for_x(chart._column_start - 1))
+        self.assertEqual(chart._day_index_for_x(chart._column_start + chart._column_width), 1)
+        # The gap column between bars maps to no day.
+        self.assertIsNone(chart._day_index_for_x(chart._column_start + chart._bar_width))
+
+    def test_daily_chart_renders_unpurchased_detections_in_dark_gray(self):
+        # The detected-only remainder stays neutral and quiet so purchased
+        # remains the clear primary signal.
+        self.assertEqual(charts_module.STYLE_DETECTED, "#3f3f3f")
+
+        today = date(2026, 7, 3)
+        daily = [
+            {"day": today - timedelta(days=offset), "detected": 0, "purchased": 0, "scans": 0}
+            for offset in range(29, -1, -1)
+        ]
+        daily[-1].update(detected=8, purchased=3, scans=8)
+
+        rendered = charts_module.daily_activity_chart(daily)
+
+        self.assertNotIn("▒", rendered.plain)  # solid two-tone, no texture
+        detected_solid = [
+            span for span in rendered.spans
+            if str(span.style) == charts_module.STYLE_DETECTED
+            and "█" in rendered.plain[span.start:span.end]
+        ]
+        purchased_solid = [
+            span for span in rendered.spans
+            if str(span.style) == charts_module.STYLE_PURCHASED
+            and "█" in rendered.plain[span.start:span.end]
+        ]
+        self.assertTrue(detected_solid)
+        self.assertTrue(purchased_solid)
+
+    def test_hour_heatmap_chart_shades_active_hours(self):
+        hourly = [[0] * 24 for _ in range(7)]
+        hourly[4][20] = 8
+        hourly[4][21] = 1
+
+        rendered_chart = charts_module.hour_heatmap_chart(hourly)
+        rendered = rendered_chart.plain
+
+        lines = rendered.splitlines()
+        self.assertIn("20", lines[0])
+        friday_row = lines[5]  # header row + Mon..Thu rows
+        self.assertTrue(friday_row.startswith("Fri"))
+        self.assertIn("██", friday_row)
+        self.assertIn("░░", friday_row)
+        self.assertIn("less", rendered)
+        self.assertIn("more", rendered)
+        styles = [str(span.style) for span in rendered_chart.spans]
+        self.assertIn(charts_module._HEAT_STYLES[0], styles)
+        self.assertIn(charts_module._HEAT_STYLES[-1], styles)
 
 
 class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -3791,7 +4130,8 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
-    def make_task_manager(self, test_mode_enabled=False):
+    def make_task_manager(self, test_mode_enabled=False, stats_db_path=None):
+        owns_stats_temp = stats_db_path is None
         with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
             "bdo_marketplace_tools.services.task_manager.load_account_mode",
             return_value=PA_CREDENTIALS_MODE,
@@ -3799,7 +4139,292 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
             "bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared",
             return_value=True,
         ), patch("bdo_marketplace_tools.services.task_manager.load_pa_browser_profile_prepared", return_value=True):
-            return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled, persist_ui_settings=False)
+            manager = BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled, persist_ui_settings=False)
+        if stats_db_path is None:
+            stats_temp = tempfile.TemporaryDirectory()
+            self.addCleanup(stats_temp.cleanup)
+            stats_db_path = Path(stats_temp.name) / ("stats.test.db" if test_mode_enabled else "stats.db")
+        manager.stats_db_path = stats_db_path
+        manager.legacy_stats_path = None
+        if owns_stats_temp:
+            self.addAsyncCleanup(manager.flush_stats_writes)
+        return manager
+
+    async def test_detection_and_purchase_history_uses_mode_specific_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            test_db_path = Path(temp_dir) / "stats.test.db"
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            await manager._record_purchase_history([{"item_id": "outfit-a", "price": "10", "count": 1}])
+            await manager.flush_stats_writes()
+
+            test_manager = self.make_task_manager(test_mode_enabled=True, stats_db_path=test_db_path)
+            await test_manager.process_detected_outfits([["outfit-b", "5", "100"]], allow_purchase=False)
+            await test_manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+            today_row = trends["daily"][-1]
+            self.assertEqual(today_row["detected"], 2)
+            self.assertEqual(today_row["purchased"], 1)
+            self.assertEqual(manager.stats_history_revision, 2)
+            test_trends = stats_db_module.load_trends(1, path=test_db_path)
+            self.assertEqual(test_trends["daily"][-1]["detected"], 5)
+            self.assertEqual(test_trends["daily"][-1]["purchased"], 0)
+            self.assertEqual(test_manager.stats_history_revision, 1)
+
+    async def test_test_mode_refuses_production_stats_db_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            test_db_path = Path(temp_dir) / "stats.test.db"
+
+            with patch("bdo_marketplace_tools.services.task_manager.STATS_DB_PATH", db_path), patch(
+                "bdo_marketplace_tools.services.task_manager.TEST_STATS_DB_PATH",
+                test_db_path,
+            ):
+                manager = self.make_task_manager(test_mode_enabled=True, stats_db_path=test_db_path)
+                manager.stats_db_path = db_path
+
+                with self.assertRaisesRegex(RuntimeError, "production stats DB"):
+                    await manager.process_detected_outfits([["10007", "1", "82500"]], allow_purchase=False)
+
+                await manager.flush_stats_writes()
+
+            self.assertFalse(db_path.exists())
+            self.assertFalse(test_db_path.exists())
+
+    async def test_detection_history_records_episode_starts_not_repeated_sightings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            await manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["detected"], 2)
+            self.assertEqual(manager.stats_history_revision, 1)
+
+            await manager.process_detected_outfits([], allow_purchase=False)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            await manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["detected"], 2)
+            self.assertEqual(manager.stats_history_revision, 1)
+
+            await manager.process_detected_outfits([], allow_purchase=False)
+            await manager.process_detected_outfits([], allow_purchase=False)
+            await manager.process_detected_outfits([["outfit-a", "3", "100"]], allow_purchase=False)
+            await manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["detected"], 5)
+            self.assertEqual(manager.stats_history_revision, 2)
+
+    async def test_detection_history_retries_background_write_without_duplicating_episode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            original_record = stats_db_module.record_detection_events
+            attempts = 0
+
+            def flaky_record(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("locked")
+                return original_record(*args, **kwargs)
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            with patch(
+                "bdo_marketplace_tools.services.task_manager.stats_db.record_detection_events",
+                side_effect=flaky_record,
+            ):
+                await manager.process_detected_outfits([["outfit-a", "1", "100"]], allow_purchase=False)
+                await manager.process_detected_outfits([["outfit-a", "1", "100"]], allow_purchase=False)
+                await manager.flush_stats_writes()
+
+            self.assertEqual(attempts, 2)
+            self.assertIn("outfit-a", manager._active_detection_episodes)
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["detected"], 1)
+            self.assertEqual(manager.stats_history_revision, 1)
+
+    async def test_session_detected_counter_matches_episode_dedup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+            self.assertEqual(manager.session_detected_outfits, 2)
+
+            await manager.process_detected_outfits([], allow_purchase=False)
+            await manager.process_detected_outfits([], allow_purchase=False)
+            await manager.process_detected_outfits([["outfit-a", "1", "100"]], allow_purchase=False)
+            self.assertEqual(manager.session_detected_outfits, 3)
+
+            await manager.flush_stats_writes()
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["detected"], manager.session_detected_outfits)
+
+    async def test_watch_only_detection_events_follow_episodes(self):
+        manager = self.make_task_manager()
+
+        await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+        await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+
+        detection_events = [event for event in manager.events if "detected" in event]
+        self.assertEqual(len(detection_events), 1)
+        self.assertIn("2 available outfits", detection_events[0])
+        self.assertNotIn("new", detection_events[0])  # first sighting: everything is new
+
+        # A new listing joins the lingering one: log it, annotated with what is new.
+        await manager.process_detected_outfits(
+            [["outfit-a", "2", "100"], ["outfit-b", "1", "100"]],
+            allow_purchase=False,
+        )
+
+        detection_events = [event for event in manager.events if "detected" in event]
+        self.assertEqual(len(detection_events), 2)
+        self.assertIn("3 available across 2 outfits (1 new)", detection_events[-1])
+        self.assertEqual(manager.session_detected_outfits, 3)
+
+    async def test_buy_mode_detection_events_flag_repeat_sightings(self):
+        manager = self.make_task_manager()
+        manager.api_handler.buy_item = AsyncMock(return_value={"purchase_records": [], "events": []})
+
+        await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=True, adjust_pricing=False)
+        await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=True, adjust_pricing=False)
+
+        detection_events = [event for event in manager.events if "detected" in event]
+        self.assertEqual(len(detection_events), 2)  # buy mode logs every scan it acts on
+        self.assertIn("2 available outfits. Attempting purchase.", detection_events[0])
+        self.assertIn("2 available outfits (0 new). Attempting purchase.", detection_events[1])
+        self.assertEqual(manager.api_handler.buy_item.await_count, 2)
+        self.assertEqual(manager.session_detected_outfits, 2)
+
+    async def test_purchase_history_survives_lifetime_save_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            manager = self.make_task_manager(stats_db_path=db_path)
+
+            with patch(
+                "bdo_marketplace_tools.services.task_manager._save_local_data",
+                side_effect=OSError("disk full"),
+            ):
+                await manager.record_purchase_summary(
+                    {
+                        "purchase_records": [{"item_id": "outfit-a", "price": "100", "count": 1}],
+                        "events": [{"level": "success", "message": "Purchase succeeded."}],
+                    }
+                )
+                await manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["purchased"], 1)
+            self.assertTrue(any("Stats write failed for lifetime totals" in event for event in manager.events))
+            self.assertTrue(any("Purchase succeeded." in event for event in manager.events))
+            # Memory totals stay ahead and self-heal on the next successful save.
+            self.assertEqual(manager.lifetime_successful_purchases, 1)
+            self.assertEqual(manager.lifetime_silver_spent, 100)
+
+    async def test_purchase_of_suppressed_redetection_keeps_success_rate_sane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            manager = self.make_task_manager(stats_db_path=db_path)
+
+            # A fast relist inside the episode window can be bought without a new
+            # detection episode; detected must still keep pace with purchases.
+            await manager.record_purchase_summary(
+                {
+                    "purchase_records": [{"item_id": "outfit-a", "price": "100", "count": 2}],
+                    "events": [],
+                }
+            )
+
+            self.assertEqual(manager.session_successful_purchases, 2)
+            self.assertEqual(manager.session_detected_outfits, 2)
+            await manager.flush_stats_writes()
+
+    async def test_detection_history_write_does_not_delay_buy_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+            write_release = threading.Event()
+
+            def slow_record(*_args, **_kwargs):
+                write_release.wait(2)
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            manager.purchase_submission_enabled = True
+            manager.api_handler.buy_item = AsyncMock(return_value={"purchase_records": [], "events": []})
+
+            with patch(
+                "bdo_marketplace_tools.services.task_manager.stats_db.record_detection_events",
+                side_effect=slow_record,
+            ):
+                await manager.process_detected_outfits(
+                    [["outfit-a", "1", "100"]],
+                    allow_purchase=True,
+                    adjust_pricing=False,
+                )
+                manager.api_handler.buy_item.assert_awaited_once()
+                self.assertFalse(write_release.is_set())
+                write_release.set()
+                await manager.flush_stats_writes()
+
+    async def test_stats_history_writes_run_in_worker_thread(self):
+        async def run_in_thread(func, *args, **kwargs):
+            threaded_calls.append(func)
+            return func(*args, **kwargs)
+
+        threaded_calls = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+
+            with patch(
+                "bdo_marketplace_tools.services.task_manager.asyncio.to_thread",
+                side_effect=run_in_thread,
+            ):
+                manager = self.make_task_manager(stats_db_path=db_path)
+                await manager.process_detected_outfits([["outfit-a", "2", "100"]], allow_purchase=False)
+                await manager._record_purchase_history([{"item_id": "outfit-a", "price": "10", "count": 1}])
+                await manager.flush_stats_writes()
+
+            trends = stats_db_module.load_trends(1, path=db_path)
+
+        self.assertIn(stats_db_module.record_detection_events, threaded_calls)
+        self.assertIn(stats_db_module.record_purchase_events, threaded_calls)
+        self.assertEqual(trends["daily"][-1]["detected"], 2)
+        self.assertEqual(trends["daily"][-1]["purchased"], 1)
+
+    async def test_scan_coverage_batches_writes_and_flushes_on_threshold_or_stop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stats.db"
+
+            manager = self.make_task_manager(stats_db_path=db_path)
+            threshold = task_manager_module.SCAN_COVERAGE_FLUSH_THRESHOLD
+            for _ in range(threshold - 1):
+                await manager._record_scan_coverage()
+            self.assertFalse(db_path.exists())  # still batched in memory
+
+            await manager._record_scan_coverage()  # threshold reached -> flushed to stats.db
+            await manager.flush_stats_writes()
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["scans"], threshold)
+
+            await manager._record_scan_coverage()
+            await manager.flush_scan_coverage()  # the stop path flushes the remainder
+            trends = stats_db_module.load_trends(1, path=db_path)
+            self.assertEqual(trends["daily"][-1]["scans"], threshold + 1)
+
+            test_db_path = Path(temp_dir) / "stats.test.db"
+            test_manager = self.make_task_manager(test_mode_enabled=True, stats_db_path=test_db_path)
+            await test_manager._record_scan_coverage()
+            self.assertEqual(test_manager._pending_scan_count_total, 1)
+            self.assertFalse(test_db_path.exists())
 
     async def test_event_logs_split_core_and_ui_streams_while_preserving_combined_events(self):
         manager = self.make_task_manager()
@@ -3830,6 +4455,48 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         manager.add_event("Another core event.", "warning")  # core now inactive -> unseen
         self.assertTrue(manager.has_unseen_events("core"))
+
+    async def test_identical_consecutive_events_coalesce_with_repeat_counter(self):
+        manager = self.make_task_manager()
+
+        manager.add_event("Monitor cycle failed: timeout", "error")
+        manager.add_event("Monitor cycle failed: timeout", "error")
+        manager.add_event("Monitor cycle failed: timeout", "error")
+
+        core = manager.events_for_channel("core")
+        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 1)
+        self.assertIn("×3", core[-1])
+        self.assertEqual(len([event for event in manager.events if "Monitor cycle failed" in event]), 1)
+
+        # A different message breaks the run; a later repeat starts a fresh count.
+        manager.add_event("Re-authentication succeeded.", "success")
+        manager.add_event("Monitor cycle failed: timeout", "error")
+
+        core = manager.events_for_channel("core")
+        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 2)
+        self.assertNotIn("×", core[-1])
+
+        # Same message at a different level stays a separate line.
+        manager.add_event("Monitor cycle failed: timeout", "warning")
+        core = manager.events_for_channel("core")
+        self.assertEqual(len([event for event in core if "Monitor cycle failed" in event]), 3)
+
+    async def test_warning_and_error_events_flag_unseen_alerts(self):
+        manager = self.make_task_manager()
+        self.assertFalse(manager.has_unseen_alerts())
+
+        manager.add_event("All good.", "info")
+        manager.add_event("Purchase succeeded.", "success")
+        self.assertFalse(manager.has_unseen_alerts())
+
+        manager.add_event("Purchase failed: price mismatch.", "warning")
+        self.assertTrue(manager.has_unseen_alerts())
+
+        manager.mark_alerts_seen()
+        self.assertFalse(manager.has_unseen_alerts())
+
+        manager.add_event("Monitor stopped after an unexpected error.", "error")
+        self.assertTrue(manager.has_unseen_alerts())
 
     async def test_spend_cap_limits_items_by_price_order(self):
         manager = self.make_task_manager()
@@ -3981,7 +4648,49 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.session_successful_purchases, 2)
         self.assertEqual(manager.session_silver_spent, 165000)
         self.assertFalse(any("Fallback pricing applied" in event for event in manager.events))
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
+
+    async def test_live_buy_error_probe_uses_normal_purchase_pipeline(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.api_handler.login_status = True
+        manager.api_handler.buy_item = AsyncMock(
+            return_value={
+                "purchase_records": [],
+                "events": [{"level": "warning", "message": "Purchase failed for 15280 at 2900000000 silver."}],
+            }
+        )
+
+        result = await manager.debug_run_live_buy_error_probe()
+
+        self.assertTrue(result)
+        self.assertEqual(
+            live_buy_error_test_listing(),
+            [[LIVE_BUY_ERROR_TEST_TARGET["main_key"], "1", LIVE_BUY_ERROR_TEST_TARGET["max_buy_price"]]],
+        )
+        manager.api_handler.buy_item.assert_awaited_once_with(
+            [["15280", "1", "2900000000"]],
+            purchase_delay_bounds=DEFAULT_PURCHASE_DELAY_BOUNDS,
+        )
+        self.assertTrue(any("Live buy error probe submitting item 15280" in event for event in manager.events))
+        self.assertTrue(any("Live buy probe detected: 1 available live buy probe" in event for event in manager.events))
+        self.assertTrue(any("Purchase failed for 15280" in event for event in manager.events))
+
+    async def test_live_buy_error_probe_requires_test_mode_real_session(self):
+        manager = self.make_task_manager()
+        manager.api_handler.buy_item = AsyncMock()
+        self.assertFalse(await manager.debug_run_live_buy_error_probe())
+        manager.api_handler.buy_item.assert_not_called()
+
+        test_manager = self.make_task_manager(test_mode_enabled=True)
+        test_manager.api_handler.buy_item = AsyncMock()
+        self.assertFalse(await test_manager.debug_run_live_buy_error_probe())
+        self.assertTrue(any("requires an online marketplace session" in event for event in test_manager.events))
+
+        test_manager.api_handler.login_status = True
+        test_manager.set_simulated_session(True)
+        self.assertFalse(await test_manager.debug_run_live_buy_error_probe())
+        test_manager.api_handler.buy_item.assert_not_called()
+        self.assertTrue(any("requires a real marketplace session" in event for event in test_manager.events))
 
     async def test_buy_item_can_skip_outfit_price_rules_for_validated_rows(self):
         manager = self.make_task_manager()
@@ -4066,7 +4775,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.session_successful_purchases, 1)
         self.assertEqual(manager.lifetime_successful_purchases, 1)
         self.assertGreater(manager.session_silver_spent, 0)
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
 
     async def test_simulated_session_buy_mode_does_not_call_purchase_api(self):
         manager = self.make_task_manager(test_mode_enabled=True)
@@ -4084,7 +4793,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.session_successful_purchases, 1)
         self.assertGreater(manager.session_silver_spent, 0)
         self.assertTrue(any("Test-mode purchase simulated" in event for event in manager.events))
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
 
     async def test_disabling_simulated_session_returns_to_watch_only(self):
         manager = self.make_task_manager(test_mode_enabled=True)
@@ -4100,7 +4809,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_purchase_summary_does_not_save_local_data(self):
         manager = self.make_task_manager()
         with patch.object(manager, "save_local_data") as save_mock:
-            manager.record_purchase_summary(
+            await manager.record_purchase_summary(
                 {
                     "purchase_records": [],
                     "events": [{"level": "warning", "message": "simulated no purchase"}],
@@ -4114,7 +4823,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_purchase_summary_does_not_add_generic_duplicate_when_reason_exists(self):
         manager = self.make_task_manager()
 
-        manager.record_purchase_summary(
+        await manager.record_purchase_summary(
             {
                 "purchase_records": [],
                 "events": [{"level": "warning", "message": "Purchase failed: price mismatch."}],
@@ -5346,7 +6055,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.purchase_submission_enabled)
         self.assertEqual(manager.session_successful_purchases, 1)
         self.assertTrue(any("Purchase succeeded after retry" in event for event in manager.events))
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
 
     async def test_steam_buy_expired_response_uses_enabled_auto_reauth_flow(self):
         manager = self.make_task_manager()
@@ -5409,7 +6118,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertEqual(manager.session_successful_purchases, 1)
         self.assertTrue(any("Purchase succeeded after PA browser refresh" in event for event in manager.events))
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
 
     async def test_pa_buy_preflight_auth_failure_pauses_buy_mode(self):
         manager = self.make_task_manager()
@@ -5661,11 +6370,21 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
 class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self, launch_mode="live"):
+        stats_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(stats_temp.cleanup)
+        stats_db_path = Path(stats_temp.name) / ("stats.test.db" if launch_mode == "test" else "stats.db")
         with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
             "bdo_marketplace_tools.services.task_manager.load_account_mode",
             return_value=PA_CREDENTIALS_MODE,
         ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
-            manager = BackgroundTasks(FakeAPI(), persist_ui_settings=False)
+            manager = BackgroundTasks(
+                FakeAPI(),
+                test_mode_enabled=launch_mode == "test",
+                persist_ui_settings=False,
+            )
+        manager.stats_db_path = stats_db_path
+        manager.legacy_stats_path = None
+        self.addAsyncCleanup(manager.flush_stats_writes)
         app = MarketplaceToolsApp(manager, manager.api_handler, launch_mode=launch_mode)
         # UI tests must not perform the on-mount network update check; the startup-check
         # behavior is covered by the focused BackgroundTasks update tests instead.
@@ -5681,11 +6400,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 40)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.theme, DEFAULT_THEME)
-                self.assertEqual(len(list(app.query("#tabs .nav-tab"))), 3)
-                self.assertEqual(app.query_one("#tab-settings", Static).content, "⚙")
-                self.assertEqual(app.query_one("#tab-settings").styles.width.value, 2)
-                self.assertEqual(app.query_one("#tab-settings").styles.margin.right, 5)
+                self.assertEqual(len(list(app.query("#tabs .nav-tab"))), 4)
+                self.assertEqual(app.query_one("#tab-settings", Static).content, "Settings")
                 self.assertNotIn("Settings", [str(tab.content) for tab in app.query("#tabs .nav-tab")])
+                self.assertEqual(len(list(app.query("#topbar-settings-divider"))), 1)
                 self.assertEqual(app.query_one("#brand", Static).content, "Marketplace Tools")
                 self.assertEqual(app.query_one("#build-info", Static).content, f"v{APP_VERSION}")
                 self.assertLessEqual(
@@ -5705,7 +6423,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.query_one("#tab-dashboard").has_class("nav-tab-active"))
                 self.assertEqual(app.query_one("#settings-danger-card").border_title, "Danger zone")
                 self.assertIn("Update", str(app.query_one("#settings-update", Static).render()))
-                self.assertEqual(len(list(app.query(".stats-tile"))), 2)
+                self.assertEqual(len(list(app.query(".settings-chip"))), 2)
+                self.assertEqual(len(list(app.query(".stats-tile"))), 0)
                 self.assertEqual(len(list(app.query("#settings-config-list"))), 0)
                 self.assertNotIn("Configuration", str(app.query_one("#content").render()))
                 await pilot.press("2")
@@ -5715,7 +6434,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
                 self.assertEqual(len(list(app.query("#stats-output"))), 0)
-                self.assertEqual(len(list(app.query(".stats-tile"))), 4)
+                self.assertEqual(len(list(app.query(".stats-chip"))), 4)
                 await pilot.press("escape")
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#welcome-card").display)
@@ -5729,6 +6448,121 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(app.current_view, "stats")
                 self.assertTrue(app.query_one("#tab-stats").has_class("nav-tab-active"))
+
+    async def test_stats_view_renders_trend_charts(self):
+        def fake_trends(days, **kwargs):
+            today = date.today()
+            return {
+                "daily": [
+                    {
+                        "day": today - timedelta(days=offset),
+                        "detected": index + 1,
+                        "purchased": 1 if index % 3 == 0 else 0,
+                        "scans": 10 + index,
+                    }
+                    for index, offset in enumerate(range(days - 1, -1, -1))
+                ],
+                "weekday": {"detected": [0] * 7, "purchased": [0] * 7},
+                "hourly": [[0] * 24 for _ in range(7)],
+            }
+
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.storage.stats_db.load_trends", side_effect=fake_trends
+        ) as load_trends_mock:
+            async with app.run_test(size=(120, 50)) as pilot:
+                await pilot.press("3")
+                self.assertEqual(app.current_view, "stats")
+                self.assertEqual(
+                    str(app.query_one("#stats-trends-title", Static).content), "Daily activity · 30 days"
+                )
+                chart_titles = [str(title.content) for title in app.query(".stats-chart-title")]
+                self.assertNotIn("Last 7 days", chart_titles)
+                self.assertIn("Busiest days", chart_titles)
+                self.assertIn("Listing hours", chart_titles)
+                self.assertEqual(list(app.query("#stats-chart-mini")), [])
+                self.assertIsNone(app.query_one("#stats-chart-daily", Static).border_title)
+                # The 7/30 toggle is gone; the hero always loads the 30-day window.
+                self.assertEqual(list(app.query("#stats-range-7")), [])
+                self.assertEqual(list(app.query("#stats-range-30")), [])
+                self.assertEqual(load_trends_mock.call_args_list[0].args[0], 30)
+                daily_chart = app.query_one("#stats-chart-daily", DailyActivityChart)
+                first_tooltip = daily_chart.tooltip_for_day(0)
+                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y"), first_tooltip)
+                self.assertIn("Detected: 1", first_tooltip)
+                self.assertIn("Purchased: 1", first_tooltip)
+                self.assertIn("Scans: 10", first_tooltip)
+                self.assertEqual(daily_chart._day_index_for_x(daily_chart._column_start), 0)
+                weekday_text = str(app.query_one("#stats-chart-weekday", Static).render())
+                self.assertIn("Mon", weekday_text)
+                hours_text = str(app.query_one("#stats-chart-hours", Static).render())
+                self.assertIn("Listing", chart_titles[-1])
+                self.assertIn("less", hours_text)
+                daily_text = str(daily_chart.render())
+                self.assertIn("offline", daily_text)
+                self.assertIn("monitored", daily_text)
+
+    async def test_daily_chart_tooltip_appears_after_near_instant_delay(self):
+        def fake_trends(days, **kwargs):
+            today = date.today()
+            return {
+                "daily": [
+                    {
+                        "day": today - timedelta(days=offset),
+                        "detected": index + 1,
+                        "purchased": 1,
+                        "scans": 10,
+                    }
+                    for index, offset in enumerate(range(days - 1, -1, -1))
+                ],
+                "weekday": {"detected": [0] * 7, "purchased": [0] * 7},
+                "hourly": [[0] * 24 for _ in range(7)],
+            }
+
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.storage.stats_db.load_trends", side_effect=fake_trends
+        ):
+            async with app.run_test(size=(120, 50), tooltips=True) as pilot:
+                await pilot.press("3")
+                daily_chart = app.query_one("#stats-chart-daily", DailyActivityChart)
+
+                self.assertTrue(await pilot.hover(daily_chart, offset=(daily_chart._column_start, 1)))
+                await pilot.pause(app.TOOLTIP_DELAY + 0.05)
+
+                tooltip = app.query_one("#textual-tooltip", Tooltip)
+                self.assertTrue(tooltip.display)
+                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y"), str(tooltip.render()))
+
+    def test_daily_axis_labels_mark_month_changes(self):
+        # A month boundary that falls between the 5-day ticks must still be labelled.
+        end = date(2026, 6, 3)
+        daily = [{"day": end - timedelta(days=offset)} for offset in range(29, -1, -1)]
+        labels = str(charts_module._day_axis_labels(daily, 2, 2, 1))
+        self.assertIn("May 5", labels)
+        self.assertIn("Jun 1", labels)
+        self.assertNotIn("May05", labels)
+
+    async def test_stats_view_surfaces_trend_load_failure(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.storage.stats_db.load_trends",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            async with app.run_test(size=(120, 50)) as pilot:
+                await pilot.press("3")
+                self.assertEqual(app.current_view, "stats")
+                daily_chart = str(app.query_one("#stats-chart-daily", Static).render())
+                self.assertIn("Stats charts unavailable", daily_chart)
+                weekday_chart_text = str(app.query_one("#stats-chart-weekday", Static).render())
+                self.assertIn("Stats charts unavailable", weekday_chart_text)
+
+                app.refresh_stats_trends()
+                chart_errors = [
+                    event for event in app.task_manager.ui_events if "Stats charts failed to load" in event
+                ]
+                self.assertEqual(len(chart_errors), 1)
+                self.assertIn("database is locked", chart_errors[0])
 
     async def test_dashboard_banner_shows_when_terminal_is_large_enough(self):
         app = self.make_app()
@@ -5765,45 +6599,55 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.3)
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
 
-                # Idle: one centered line — status · greeting · lifetime record.
-                footer = str(app.query_one("#welcome-footer", Static).render())
-                self.assertIn("Idle", footer)
-                self.assertIn(app.time_greeting(), footer)
+                # Idle: greeting sits under the mascot; state rides the divider rule.
+                greeting = str(app.query_one("#welcome-greeting", Static).render())
+                status = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Idle", status)
+                self.assertIn(app.time_greeting(), greeting)
                 self.assertIn(
-                    app.time_greeting(), ("Good morning", "Good afternoon", "Good evening", "Up late?")
+                    app.time_greeting(), ("Good morning!", "Good afternoon!", "Good evening!", "Up late?")
                 )
-                self.assertIn("all-time", footer)
+                self.assertIn("all-time", status)
 
-                # Running: status spins, chatter rotates, the stats tail stays.
+                # Running: status spins on the divider, the mascot's chatter rotates above it.
                 app.task_manager.checker_enabled = True
                 app.refresh_live_widgets()
-                footer = str(app.query_one("#welcome-footer", Static).render())
-                self.assertIn("⠋", footer)
-                self.assertIn("Running", footer)
-                self.assertIn("watching the marketplace", footer)
-                self.assertIn("all-time", footer)
+                greeting = str(app.query_one("#welcome-greeting", Static).render())
+                status = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("⠋", status)
+                self.assertIn("Running", status)
+                self.assertIn("watching the marketplace", greeting)
+                self.assertIn("all-time", status)
                 app.advance_running_pulse()
                 self.assertIn("⠙", str(app.query_one("#welcome-footer", Static).render()))
                 app.advance_running_quip()
-                footer = str(app.query_one("#welcome-footer", Static).render())
-                self.assertNotIn("watching the marketplace", footer)
-                self.assertTrue(any(quip in footer for quip in RUNNING_QUIPS[1:]))
+                greeting = str(app.query_one("#welcome-greeting", Static).render())
+                self.assertNotIn("watching the marketplace", greeting)
+                self.assertTrue(any(quip in greeting for quip in RUNNING_QUIPS[1:]))
 
                 app.task_manager.checker_enabled = False
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
-            async with app.run_test(size=(100, 36)):
+            async with app.run_test(size=(100, 36)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
+                self.assertEqual(app.TOOLTIP_DELAY, 0.05)
                 self.assertEqual(app.query_one("#content").styles.overflow_y, "auto")
-                self.assertEqual(app.query_one("#content").styles.scrollbar_size_vertical, 1)
+                self.assertEqual(app.query_one("#content").styles.scrollbar_visibility, "hidden")
+                self.assertEqual(app.query_one("#content").styles.scrollbar_size_vertical, 0)
                 self.assertEqual(app.query_one("#content").styles.scrollbar_color, Color(52, 52, 52))
-                self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
+                # The full event log moved to the Logs tab; the dashboard keeps a fixed tail.
+                self.assertEqual(len(list(app.query("#event-log"))), 0)
+                self.assertEqual(app.query_one("#activity-tail").styles.height.value, 4)
                 self.assertEqual(app.query_one("#topbar").region.y, 0)
                 self.assertEqual(app.query_one("#statusbar").styles.height.value, 1)
                 self.assertEqual(app.query_one("#statusbar").styles.background, Color(16, 16, 16))
                 self.assertEqual(len(list(app.query("#sidebar"))), 0)
+
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
+                self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
                 self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_color, Color(52, 52, 52))
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_size_vertical, 1)
@@ -6457,8 +7301,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("3")
                 # The Stats page live-refreshes, so there is no manual refresh control.
                 self.assertEqual(list(app.query("#refresh-stats")), [])
-                self.assertEqual(len(list(app.query(".stats-tile"))), 4)
-                stat_tiles = [
+                self.assertEqual(len(list(app.query(".stats-chip"))), 4)
+                stat_chips = [
                     app.query_one("#stats-session-detected", Static),
                     app.query_one("#stats-session-purchases", Static),
                     app.query_one("#stats-session-rate", Static),
@@ -6466,17 +7310,16 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
-                    for tile in stat_tiles:
-                        console.print(tile.content)
-                    console.print(app.query_one("#stats-lifetime-list", Static).content)
+                    for chip in stat_chips:
+                        console.print(chip.content)
                 rendered = capture.get()
-                border_titles = "\n".join(str(tile.border_title) for tile in stat_tiles)
 
-        self.assertIn("Success Rate", border_titles)
+        self.assertIn("Success Rate", rendered)
         self.assertIn("80%", rendered)
-        self.assertIn("2B silver", rendered)
-        # Lifetime totals now render as a compact list rather than tiles.
-        self.assertIn("12B silver", rendered)
+        self.assertIn("2B", rendered)
+        # Lifetime totals fold into the chips as dim details.
+        self.assertIn("12B lifetime", rendered)
+        self.assertIn("9 lifetime", rendered)
         self.assertNotIn("Local Data File", rendered)
 
     async def test_marketplace_inventory_page_is_wip_and_uses_standard_action(self):
@@ -6530,34 +7373,46 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
+                self.assertFalse(app.query_one("#test-controls").display)
 
+                await pilot.press("escape")
+                self.assertEqual(app.current_view, "dashboard")
+                self.assertTrue(app.query_one("#test-controls").display)
                 await pilot.click("#add-test-log")
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(any("Synthetic layout probe." in event for event in app.task_manager.events))
 
-    async def test_dashboard_event_log_rehydrates_after_navigation(self):
+    async def test_event_log_rehydrates_after_navigation(self):
         app = self.make_app()
         app.task_manager.add_event("Persistent event before navigation.", "success")
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
+                tail_text = str(app.query_one("#activity-tail", Static).render())
+                self.assertIn("Persistent event before navigation.", tail_text)
+                self.assertEqual(app._dashboard_snapshot, app.dashboard_snapshot())
+
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
 
                 await pilot.press("s")
                 self.assertEqual(app.current_view, "settings")
-                await pilot.press("escape")
-                self.assertEqual(app.current_view, "dashboard")
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
 
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
-                self.assertEqual(app._dashboard_snapshot, app.dashboard_snapshot())
 
-    async def test_dashboard_event_log_switches_between_core_and_ui_streams(self):
+    async def test_event_log_switches_between_core_and_ui_streams(self):
         app = self.make_app()
         app.task_manager.add_event("Core monitor detail.", "success")
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
                 app.set_status("UI setting saved.", "info")
+                app.refresh_live_widgets()
                 await pilot.pause()
 
                 self.assertEqual(len(list(app.query("#event-log-toolbar-title"))), 0)
@@ -6583,6 +7438,34 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("UI setting saved.", event_text)
                 self.assertNotIn("Core monitor detail.", event_text)
 
+    async def test_dashboard_tail_shows_recent_events_and_logs_tab_flags_alerts(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("No activity yet.", str(app.query_one("#activity-tail", Static).render()))
+                self.assertEqual(str(app.query_one("#activity-title", Static).content), "Activity")
+
+                for index in range(7):
+                    app.task_manager.add_event(f"Tail event {index}.", "info")
+                app.refresh_live_widgets()
+                await pilot.pause()
+
+                tail_text = str(app.query_one("#activity-tail", Static).render())
+                self.assertIn("Tail event 6.", tail_text)
+                self.assertNotIn("Tail event 2.", tail_text)  # only the last 4 fit
+                self.assertNotIn("●", str(app.query_one("#tab-logs", Static).content))
+
+                app.task_manager.add_event("Purchase failed: price mismatch.", "warning")
+                app.refresh_live_widgets()
+                await pilot.pause()
+                self.assertIn("●", str(app.query_one("#tab-logs", Static).content))
+
+                await pilot.press("4")
+                self.assertEqual(app.current_view, "logs")
+                self.assertNotIn("●", str(app.query_one("#tab-logs", Static).content))
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("Purchase failed: price mismatch.", event_text)
+
     async def test_debug_controls_are_test_mode_only(self):
         live_app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
@@ -6604,6 +7487,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(test_app.query("#clear-browser-cookies"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-buy"))), 1)
+                self.assertEqual(len(list(test_app.query("#live-buy-error-probe"))), 1)
                 self.assertEqual(len(list(test_app.query("#stop-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-detection"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-buy-success"))), 1)
@@ -6820,6 +7704,38 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 await app.task_manager.stop_single_item_test_checker()
 
+    async def test_live_buy_error_probe_requires_login_and_confirmation(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.set_purchase_delay_range("3.25", "5.5")
+        app.task_manager.debug_run_live_buy_error_probe = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#live-buy-error-probe")
+                await pilot.pause()
+                self.assertIn("Login required", app.status_message)
+                app.task_manager.debug_run_live_buy_error_probe.assert_not_called()
+
+                app.api_handler.login_status = True
+                app.api_handler.email = "user@example.com"
+                await pilot.click("#live-buy-error-probe")
+                await pilot.pause(0.1)
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "ConfirmLiveTestBuyScreen")
+                confirm_console = Console(width=80, color_system=None)
+                with confirm_console.capture() as confirm_capture:
+                    for widget in app.screen_stack[-1].query(Static):
+                        confirm_console.print(widget.content)
+                confirmation_text = confirm_capture.get()
+                self.assertIn("15280", confirmation_text)
+                self.assertIn("2.9B", confirmation_text)
+                self.assertIn("3.25-5.5s", confirmation_text)
+
+                await pilot.click("#confirm-live-test-buy")
+                await pilot.pause(0.2)
+
+                app.task_manager.debug_run_live_buy_error_probe.assert_awaited_once()
+                self.assertIn("Live buy error probe completed", app.status_message)
+
     async def test_polling_modal_saves_preset_equivalent_range_as_preset(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
@@ -6892,13 +7808,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             "bdo_marketplace_tools.ui.app.load_credentials",
             return_value=(None, None),
         ):
-            async with app.run_test(size=(100, 36)) as pilot:
+            # Taller window so the last debug-sidebar button (#fake-buy-success) is on-screen
+            # for the pilot; the greeting line under the mascot costs the sidebar one row.
+            async with app.run_test(size=(100, 40)) as pilot:
                 await pilot.click("#fake-buy-success")
 
         self.assertEqual(app.task_manager.session_detected_outfits, 1)
         self.assertEqual(app.task_manager.session_successful_purchases, 1)
         self.assertGreater(app.task_manager.session_silver_spent, 0)
-        save_mock.assert_called_once()
+        save_mock.assert_awaited_once()
+
+    async def test_test_mode_fake_stats_write_to_test_stats_db(self):
+        app = self.make_app(launch_mode="test")
+        self.assertEqual(app.task_manager.stats_db_path.name, "stats.test.db")
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            # Taller window so the last debug-sidebar button (#fake-buy-success) is on-screen
+            # for the pilot; the greeting line under the mascot costs the sidebar one row.
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.click("#fake-detection")
+                await pilot.pause(0.2)
+                await pilot.click("#fake-buy-success")
+                await pilot.pause(0.2)
+                self.assertEqual(app.task_manager.session_successful_purchases, 1)
+
+        trends = stats_db_module.load_trends(1, path=app.task_manager.stats_db_path)
+        self.assertGreaterEqual(trends["daily"][-1]["detected"], 1)
+        self.assertEqual(trends["daily"][-1]["purchased"], 1)
 
     async def test_test_session_toggle_allows_buy_mode_without_live_purchase_api(self):
         app = self.make_app(launch_mode="test")

@@ -55,10 +55,10 @@ BANNER_BLINK_ART = r"""
 RUNNING_QUIPS = (
     "watching the marketplace",
     "eyes on the listings…",
-    "nothing gets past me",
+    "nothing gets past me!",
     "refreshing so you don't have to",
     "waiting for someone to blink first",
-    "pearl outfits won't hide forever",
+    "outfits won't hide forever…",
 )
 
 TEST_LOG_MESSAGES = [

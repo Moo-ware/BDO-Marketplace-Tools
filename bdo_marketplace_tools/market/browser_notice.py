@@ -98,7 +98,7 @@ __NOTICE_ENSURE_STYLE__
             'Setting up your session' +
           '</div>' +
           '<div style="font-size:12.5px;font-weight:400;color:#e6e3dc;opacity:.85;margin-top:2px;line-height:1.45;">' +
-            'The app is signing you in â€” please donâ€™t click anything. It finishes on its own.' +
+            'The app is signing you in - please don\'t click anything. It finishes on its own.' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -242,7 +242,7 @@ __NOTICE_IDS__
   card.innerHTML =
     __NOTICE_CREDENTIALS_ICON_CHIP__ +
     '<div style="font-size:15px;font-weight:600;color:#f0c069;letter-spacing:.2px;">Wrong email or password</div>' +
-    '<div style="font-size:12.5px;color:#e6e0d4;opacity:.88;margin-top:5px;line-height:1.5;">Update your saved login in the app, then refresh the session. You donâ€™t need to log in here.</div>' +
+    '<div style="font-size:12.5px;color:#e6e0d4;opacity:.88;margin-top:5px;line-height:1.5;">Update your saved login in the app, then refresh the session. You don\'t need to log in here.</div>' +
     '<div style="display:inline-flex;align-items:center;gap:6px;margin-top:11px;padding:5px 11px;border-radius:20px;background:rgba(126,184,138,0.14);">' +
       CHECK + '<span style="font-size:12px;font-weight:600;color:#8fce9c;">Safe to close this window</span>' +
     '</div>';

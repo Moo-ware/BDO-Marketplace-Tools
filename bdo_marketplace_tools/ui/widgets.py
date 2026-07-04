@@ -2,6 +2,81 @@ from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import Static
 
+from bdo_marketplace_tools.ui.charts import (
+    CHART_HEIGHT,
+    daily_activity_chart,
+    daily_activity_column_layout,
+    daily_chart_label_width,
+)
+
+
+class DailyActivityChart(Static):
+    def __init__(self) -> None:
+        super().__init__("", id="stats-chart-daily", classes="stats-chart")
+        self._daily = []
+        self._column_start = 0
+        self._column_width = 1
+        self._bar_width = 1
+
+    def update_daily(self, daily, height=CHART_HEIGHT) -> None:
+        self._daily = list(daily or [])
+        self._set_geometry(height)
+        self.tooltip = None
+        self.update(daily_activity_chart(self._daily, height=height))
+
+    def clear_daily(self) -> None:
+        self._daily = []
+        self.tooltip = None
+
+    def tooltip_for_day(self, index):
+        if index is None or index < 0 or index >= len(self._daily):
+            return None
+        row = self._daily[index]
+        day = row.get("day")
+        day_label = day.strftime("%b %d, %Y") if hasattr(day, "strftime") else str(day)
+        detected = int(row.get("detected") or 0)
+        purchased = int(row.get("purchased") or 0)
+        scans = int(row.get("scans") or 0)
+        rate = f"{round(purchased / detected * 100)}%" if detected else "0%"
+        return (
+            f"{day_label}\n"
+            f"Detected: {detected}\n"
+            f"Purchased: {purchased}\n"
+            f"Scans: {scans}\n"
+            f"Purchase rate: {rate}"
+        )
+
+    def on_mouse_move(self, event) -> None:
+        self.tooltip = self.tooltip_for_day(self._day_index_for_x(event.x))
+
+    def on_leave(self) -> None:
+        self.tooltip = None
+
+    def _set_geometry(self, height=CHART_HEIGHT) -> None:
+        if not self._daily:
+            self._column_start = 0
+            self._column_width = 1
+            self._bar_width = 1
+            return
+        bar_width, gap = daily_activity_column_layout(len(self._daily))
+        max_detected = max(int(row.get("detected") or 0) for row in self._daily)
+        # Must match daily_activity_chart's layout: the label width comes from the
+        # rounded axis scale (9 -> "10"), not the raw max.
+        self._column_start = daily_chart_label_width(max_detected, height) + 3
+        self._column_width = bar_width + gap
+        self._bar_width = bar_width
+
+    def _day_index_for_x(self, x):
+        relative_x = int(x) - self._column_start
+        if relative_x < 0 or not self._daily:
+            return None
+        index = relative_x // self._column_width
+        if index < 0 or index >= len(self._daily):
+            return None
+        if relative_x % self._column_width >= self._bar_width:
+            return None
+        return index
+
 
 class ModalAction(Static):
     class Pressed(Message):

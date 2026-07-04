@@ -54,6 +54,7 @@ PURCHASE_RESULT_REASONS = {
     30: "an identical order already exists",
     34: "item was unavailable or would create a duplicate pre-order",
     -14: "price mismatch",
+    -16: "not enough silver for the order",
     2000: "login session expired",
 }
 

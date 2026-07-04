@@ -3,6 +3,7 @@ import random
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from bdo_marketplace_tools.market.api_handler import (
     MarketplaceAPIError,
@@ -16,7 +17,12 @@ from bdo_marketplace_tools.market.browser_auth import (
     prepare_steam_browser_profile,
 )
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
-from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from bdo_marketplace_tools.market.test_mode import (
+    LIVE_BUY_ERROR_TEST_TARGET,
+    SINGLE_ITEM_TEST_TARGET,
+    check_single_item_stock,
+    live_buy_error_test_listing,
+)
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
     STEAM_BROWSER_MODE,
@@ -56,16 +62,32 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
     measure_all_browser_profile_storage,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
-from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
-from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH, STEAM_MARKET_PROFILE_PATH
+from bdo_marketplace_tools.storage import stats_db
+from bdo_marketplace_tools.storage.paths import (
+    LOCAL_STATS_PATH,
+    PA_MARKET_PROFILE_PATH,
+    STATS_DB_PATH,
+    STEAM_MARKET_PROFILE_PATH,
+    TEST_STATS_DB_PATH,
+)
 from bdo_marketplace_tools.ui.display import APP_TITLE, EVENT_LEVEL_COLORS, format_duration
 from bdo_marketplace_tools.version import APP_VERSION
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
-DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
+DEFAULT_LOCAL_DATA = stats_db.DEFAULT_LIFETIME_STATS
+_DEFAULT_STATS_PATH = object()
+_DEFAULT_LEGACY_STATS_PATH = object()
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
 EVENT_LOG_LIMIT = 20
+# Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
+SCAN_COVERAGE_FLUSH_THRESHOLD = 12
+STATS_WRITE_RETRY_LIMIT = 2
+STATS_WRITE_RETRY_DELAY_SECONDS = 0.1
+# A listing is considered the same availability episode until it has been absent from a
+# couple of successful scans. This avoids counting one visible bundle again on every poll,
+# while still splitting real disappear/reappear cycles.
+DETECTION_EPISODE_MISSED_SCAN_LIMIT = 2
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
 BROWSER_VERIFICATION_MARKERS = (
     "browser verification",
@@ -75,24 +97,37 @@ BROWSER_VERIFICATION_MARKERS = (
 BROWSER_STORAGE_SUMMARY_CACHE_SECONDS = 5
 
 
-def _load_local_data():
-    return load_local_stats(path=LOCAL_DATA_PATH)
+def _same_file_path(left, right):
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
 
-def _create_default_local_data():
-    save_local_stats(DEFAULT_LOCAL_DATA, include_timestamp=False, path=LOCAL_DATA_PATH)
+def _load_local_data(path=_DEFAULT_STATS_PATH, legacy_json_path=_DEFAULT_LEGACY_STATS_PATH):
+    if path is _DEFAULT_STATS_PATH:
+        path = STATS_DB_PATH
+    if legacy_json_path is _DEFAULT_LEGACY_STATS_PATH:
+        legacy_json_path = LOCAL_DATA_PATH
+    return stats_db.load_lifetime_stats(path=path, legacy_json_path=legacy_json_path)
 
 
-def _save_local_data(data):
-    save_local_stats(data, path=LOCAL_DATA_PATH)
+def _save_local_data(data, path=_DEFAULT_STATS_PATH):
+    if path is _DEFAULT_STATS_PATH:
+        path = STATS_DB_PATH
+    stats_db.save_lifetime_stats(
+        data["successful_purchases"],
+        data["silver_spent"],
+        path=path,
+    )
 
 
 class BackgroundTasks:
     def __init__(self, api_handler, test_mode_enabled=False, persist_ui_settings=True):
-        local_data = _load_local_data()
         self.api_handler = api_handler
         self.test_mode_enabled = bool(test_mode_enabled)
         self.persist_ui_settings = bool(persist_ui_settings)
+        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
+        local_data = _load_local_data(path=self.stats_db_path, legacy_json_path=self.legacy_stats_path)
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
@@ -135,6 +170,8 @@ class BackgroundTasks:
         self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.event_log_view = ui_settings.get("event_log_view", "core")
         self.unseen_event_channels = set()
+        self._last_event_state = {}
+        self.unseen_alerts = False
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
@@ -152,6 +189,14 @@ class BackgroundTasks:
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
+        # Bumped whenever stats.db gains new history rows; the Stats view uses it to
+        # re-render trend charts only when there is actually something new to draw.
+        self.stats_history_revision = 0
+        self._pending_scan_counts = {}
+        self._pending_scan_count_total = 0
+        self._pending_stats_writes = deque()
+        self._stats_writer_task = None
+        self._active_detection_episodes = {}
         self.update_check_on_startup = (
             load_update_check_on_startup() if self.persist_ui_settings else True
         )
@@ -165,17 +210,219 @@ class BackgroundTasks:
         self._browser_storage_summary_at = 0.0
 
     def reload_lifetime_stats(self):
-        local_data = _load_local_data()
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        # While lifetime/history writes are still queued, the in-memory counters are
+        # ahead of disk; reloading now would clobber them with stale totals.
+        if self._pending_stats_writes or (
+            self._stats_writer_task is not None and not self._stats_writer_task.done()
+        ):
+            return
+        local_data = _load_local_data(path=self.stats_db_path, legacy_json_path=self.legacy_stats_path)
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
 
-    def save_local_data(self):
-        _save_local_data(
+    def set_test_mode_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.test_mode_enabled:
+            return self.test_mode_enabled
+        self.test_mode_enabled = enabled
+        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
+        self.reload_lifetime_stats()
+        return self.test_mode_enabled
+
+    def _assert_stats_db_path_allowed(self, path, *, require_explicit=False):
+        if not self.test_mode_enabled:
+            return
+        if path is None:
+            if require_explicit:
+                raise RuntimeError("Test mode stats writes require an explicit stats DB path.")
+            return
+        if _same_file_path(path, STATS_DB_PATH):
+            raise RuntimeError("Test mode cannot use the production stats DB.")
+
+    async def save_local_data(self):
+        # Lifetime totals go through the same serialized writer as history rows: one
+        # write path, no concurrent connections, and a failure degrades to a logged
+        # warning instead of an exception on the purchase path. The totals snapshot
+        # is captured here at enqueue time and self-heals on the next save because
+        # the upsert writes absolute values.
+        self._enqueue_stats_write(
+            "lifetime totals",
+            _save_local_data,
             {
                 "successful_purchases": self.lifetime_successful_purchases,
                 "silver_spent": self.lifetime_silver_spent,
+            },
+            path=self.stats_db_path,
+            bump_revision=False,
+        )
+
+    def _start_stats_writer(self):
+        if self._stats_writer_task is not None and not self._stats_writer_task.done():
+            return True
+        try:
+            self._stats_writer_task = asyncio.create_task(self._drain_stats_writes())
+        except RuntimeError:
+            self._stats_writer_task = None
+            return False
+        return True
+
+    def _enqueue_stats_write(self, label, func, *args, bump_revision=True, **kwargs):
+        self._assert_stats_db_path_allowed(kwargs.get("path"), require_explicit=True)
+        self._pending_stats_writes.append(
+            {
+                "label": label,
+                "func": func,
+                "args": args,
+                "kwargs": kwargs,
+                "bump_revision": bump_revision,
             }
         )
+        return self._start_stats_writer()
+
+    async def _drain_stats_writes(self):
+        try:
+            while self._pending_stats_writes:
+                job = self._pending_stats_writes.popleft()
+                written = await self._run_stats_write(job)
+                if written and job["bump_revision"]:
+                    self.stats_history_revision += 1
+        finally:
+            self._stats_writer_task = None
+            if self._pending_stats_writes:
+                self._start_stats_writer()
+
+    async def _run_stats_write(self, job):
+        last_error = None
+        for attempt in range(STATS_WRITE_RETRY_LIMIT + 1):
+            try:
+                await asyncio.to_thread(job["func"], *job["args"], **job["kwargs"])
+                return True
+            except Exception as exc:
+                last_error = exc
+                if attempt < STATS_WRITE_RETRY_LIMIT:
+                    await asyncio.sleep(STATS_WRITE_RETRY_DELAY_SECONDS * (attempt + 1))
+        detail = str(last_error).strip() or last_error.__class__.__name__
+        self.add_event(f"Stats write failed for {job['label']}: {detail}", "warning")
+        return False
+
+    async def flush_stats_writes(self):
+        flushed = False
+        while True:
+            if self._pending_stats_writes:
+                self._start_stats_writer()
+            task = self._stats_writer_task
+            if task is None or task.done() or task is asyncio.current_task():
+                return flushed
+            flushed = True
+            await task
+
+    def _episode_start_rows(self, buy_list):
+        current_rows = {}
+        for item in buy_list or []:
+            try:
+                item_id, stock, price = item[0], item[1], item[2]
+                stock_count = int(stock)
+            except (IndexError, TypeError, ValueError):
+                continue
+
+            if stock_count <= 0:
+                continue
+
+            item_key = str(item_id)
+            if item_key in current_rows:
+                current_rows[item_key][1] = str(int(current_rows[item_key][1]) + stock_count)
+            else:
+                current_rows[item_key] = [item_key, str(stock_count), str(price)]
+
+        episode_start_rows = []
+        for item_key, row in current_rows.items():
+            episode = self._active_detection_episodes.get(item_key)
+            if episode is None:
+                episode_start_rows.append(row)
+                self._active_detection_episodes[item_key] = {"missed_scans": 0}
+            else:
+                episode["missed_scans"] = 0
+
+        for item_key in list(self._active_detection_episodes):
+            if item_key in current_rows:
+                continue
+            missed_scans = int(self._active_detection_episodes[item_key].get("missed_scans", 0)) + 1
+            if missed_scans >= DETECTION_EPISODE_MISSED_SCAN_LIMIT:
+                del self._active_detection_episodes[item_key]
+            else:
+                self._active_detection_episodes[item_key]["missed_scans"] = missed_scans
+
+        return episode_start_rows
+
+    async def _record_detection_history(self, buy_list):
+        # Keep episode state on the monitor path so repeated polls cannot enqueue
+        # duplicate detections, but leave SQLite work to the background writer.
+        # Returns the newly started episode quantity so the session counter can
+        # stay on the same episode-based scale as stats.db.
+        episode_start_rows = self._episode_start_rows(buy_list)
+        if not episode_start_rows:
+            return 0
+        new_episode_count = sum(int(row[1]) for row in episode_start_rows)
+        detected_at = datetime.now().timestamp()
+        rows = [list(row) for row in episode_start_rows]
+        self._enqueue_stats_write(
+            "detection history",
+            stats_db.record_detection_events,
+            rows,
+            at=detected_at,
+            path=self.stats_db_path,
+        )
+        return new_episode_count
+
+    async def _record_purchase_history(self, purchase_records):
+        records = [dict(record) for record in purchase_records or []]
+        if not records:
+            return False
+        purchased_at = datetime.now().timestamp()
+        return self._enqueue_stats_write(
+            "purchase history",
+            stats_db.record_purchase_events,
+            records,
+            at=purchased_at,
+            path=self.stats_db_path,
+        )
+
+    async def _record_scan_coverage(self):
+        day = datetime.now().date().isoformat()
+        self._pending_scan_counts[day] = self._pending_scan_counts.get(day, 0) + 1
+        self._pending_scan_count_total += 1
+        if (
+            self._pending_scan_count_total >= SCAN_COVERAGE_FLUSH_THRESHOLD
+            or len(self._pending_scan_counts) > 1
+        ):
+            return await self.flush_scan_coverage(wait=False)
+        return False
+
+    async def flush_scan_coverage(self, wait=True):
+        pending, self._pending_scan_counts = self._pending_scan_counts, {}
+        self._pending_scan_count_total = 0
+        if not pending:
+            return False
+        enqueued = self._enqueue_stats_write(
+            "scan coverage",
+            stats_db.add_daily_coverage,
+            dict(pending),
+            path=self.stats_db_path,
+        )
+        if wait:
+            await self.flush_stats_writes()
+        return enqueued
+
+    def _schedule_scan_coverage_flush(self):
+        if not self._pending_scan_counts:
+            return
+        try:
+            asyncio.create_task(self.flush_scan_coverage(wait=False))
+        except RuntimeError:
+            pass
 
     def browser_storage_summary(self, *, force=False):
         now = time.time()
@@ -278,13 +525,28 @@ class BackgroundTasks:
         normalized_channel = str(channel or "core").strip().lower()
         if normalized_channel not in {"core", "ui"}:
             normalized_channel = "core"
-        self.events.append(event)
-        if normalized_channel == "ui":
-            self.ui_events.append(event)
+        target = self.ui_events if normalized_channel == "ui" else self.core_events
+
+        # Identical consecutive events (error/retry storms) fold into one line with a
+        # repeat counter carrying the latest timestamp, instead of flooding the log.
+        key = (str(message), style)
+        state = self._last_event_state.get(normalized_channel)
+        if state is not None and state["key"] == key and target and target[-1] == state["rendered"]:
+            state["count"] += 1
+            updated = f"{event} [dim]×{state['count']}[/dim]"
+            target[-1] = updated
+            if self.events and self.events[-1] == state["rendered"]:
+                self.events[-1] = updated
+            state["rendered"] = updated
         else:
-            self.core_events.append(event)
+            self._last_event_state[normalized_channel] = {"key": key, "count": 1, "rendered": event}
+            self.events.append(event)
+            target.append(event)
+
         if normalized_channel != self.event_log_view:
             self.unseen_event_channels.add(normalized_channel)
+        if level in {"warning", "error"}:
+            self.unseen_alerts = True
 
     def events_for_channel(self, channel):
         if str(channel or "").strip().lower() == "ui":
@@ -293,6 +555,12 @@ class BackgroundTasks:
 
     def has_unseen_events(self, channel):
         return str(channel or "").strip().lower() in self.unseen_event_channels
+
+    def has_unseen_alerts(self):
+        return self.unseen_alerts
+
+    def mark_alerts_seen(self):
+        self.unseen_alerts = False
 
     def set_event_log_view(self, view):
         normalized = str(view or "core").strip().lower()
@@ -642,6 +910,7 @@ class BackgroundTasks:
             self.checker_enabled = True
             return False
 
+        self._active_detection_episodes = {}
         self.checker_stop_requested = False
         self.checker_started_at = time.monotonic()
         self.checker_task = asyncio.create_task(self.checker())
@@ -679,11 +948,14 @@ class BackgroundTasks:
         if exc is not None:
             self.add_event(f"Monitor stopped after an unexpected error: {exc}", "error")
 
+        should_flush_pending_coverage = not self.checker_stop_requested
         self.checker_enabled = False
         self.checker_stop_requested = False
         self.checker_started_at = None
         if self.checker_task is task:
             self.checker_task = None
+        if should_flush_pending_coverage:
+            self._schedule_scan_coverage_flush()
 
     def _handle_single_item_test_checker_done(self, task):
         if task.cancelled():
@@ -717,6 +989,8 @@ class BackgroundTasks:
         self.checker_stop_requested = False
         self.checker_started_at = None
         self.checker_task = None
+        await self.flush_scan_coverage()
+        await self.flush_stats_writes()
         return was_running
 
     async def stop_single_item_test_checker(self):
@@ -732,6 +1006,7 @@ class BackgroundTasks:
         self.single_item_test_purchase_enabled = False
         self.single_item_test_checker_started_at = None
         self.single_item_test_checker_task = None
+        await self.flush_stats_writes()
         return was_running
 
     def start_login_status_checker(self):
@@ -752,6 +1027,7 @@ class BackgroundTasks:
             while not self.checker_stop_requested:
                 try:
                     buy_list = await self.api_handler.check_stock()
+                    await self._record_scan_coverage()
                     await self.process_detected_outfits(buy_list)
                     self.consecutive_cycle_errors = 0
                 except Exception as exc:
@@ -807,19 +1083,40 @@ class BackgroundTasks:
         return random.uniform(low * multiplier, high * multiplier)
 
     async def process_detected_outfits(self, buy_list, allow_purchase=None, item_noun="outfit", adjust_pricing=True):
+        new_episode_count = await self._record_detection_history(buy_list)
+
         if not buy_list:
             return
 
+        # The session counter tracks new availability episodes (same scale as the
+        # stats.db history); buying always operates on the full list.
         detected_count = self._detected_outfit_count(buy_list)
-        self.session_detected_outfits += detected_count
+        self.session_detected_outfits += new_episode_count
         purchase_enabled = self.purchase_submission_enabled if allow_purchase is None else allow_purchase
-        detected_label = f"{detected_count} available {self._pluralize(item_noun, detected_count)}"
+        # The total is summed stock across distinct listings, so "4 -> 5" is ambiguous
+        # on its own: spell out the listing count whenever more than one item id is in
+        # the scan, and how much of the total is genuinely new.
+        distinct_listings = len({str(item[0]) for item in buy_list})
+        if distinct_listings > 1:
+            detected_label = (
+                f"{detected_count} available across {distinct_listings} "
+                f"{self._pluralize(item_noun, distinct_listings)}"
+            )
+        else:
+            detected_label = f"{detected_count} available {self._pluralize(item_noun, detected_count)}"
+        if new_episode_count != detected_count:
+            detected_label = f"{detected_label} ({new_episode_count} new)"
         subject = item_noun[:1].upper() + item_noun[1:]
 
         if purchase_enabled:
+            # Buy mode logs every scan because a purchase attempt follows; the
+            # "(N new)" suffix keeps the log on the same episode scale as the
+            # Detected counter.
             self.add_event(f"{subject} detected: {detected_label}. Attempting purchase.", "success")
             await self.buy_item(buy_list, adjust_pricing=adjust_pricing)
-        else:
+        elif new_episode_count > 0:
+            # Watch-only logs once per episode start; repeat sightings of the same
+            # lingering listings would otherwise fill the event log every poll.
             self.add_event(f"{subject} detected: {detected_label}.", "success")
 
     def _detected_outfit_count(self, buy_list):
@@ -834,6 +1131,7 @@ class BackgroundTasks:
         if not self.test_mode_enabled:
             return False
 
+        self._active_detection_episodes.clear()
         await self.process_detected_outfits(DEBUG_OUTFIT_LISTING, allow_purchase=False)
         return True
 
@@ -841,12 +1139,43 @@ class BackgroundTasks:
         if not self.test_mode_enabled:
             return False
 
+        self._active_detection_episodes.clear()
+        new_episode_count = await self._record_detection_history(DEBUG_OUTFIT_LISTING)
         detected_count = self._detected_outfit_count(DEBUG_OUTFIT_LISTING)
-        self.session_detected_outfits += detected_count
+        self.session_detected_outfits += new_episode_count
         self.add_event(f"Outfit detected: {detected_count} available outfits. Simulating purchase.", "success")
 
         adjusted_buy_list = await self.adjust_prices(DEBUG_OUTFIT_LISTING)
-        self.record_purchase_summary(self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded"))
+        await self.record_purchase_summary(
+            self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded")
+        )
+        return True
+
+    async def debug_run_live_buy_error_probe(self):
+        if not self.test_mode_enabled:
+            return False
+
+        if self.simulated_session_enabled:
+            self.add_event("Live buy error probe requires a real marketplace session; disable test session first.", "warning")
+            return False
+
+        if not getattr(self.api_handler, "login_status", False):
+            self.add_event("Live buy error probe requires an online marketplace session.", "warning")
+            return False
+
+        target = LIVE_BUY_ERROR_TEST_TARGET
+        buy_list = live_buy_error_test_listing(target)
+        self._active_detection_episodes.clear()
+        self.add_event(
+            f"Live buy error probe submitting item {target['main_key']} at {target['max_buy_price']} silver.",
+            "warning",
+        )
+        await self.process_detected_outfits(
+            buy_list,
+            allow_purchase=True,
+            item_noun="live buy probe",
+            adjust_pricing=False,
+        )
         return True
 
     def debug_invalidate_marketplace_session(self):
@@ -1094,7 +1423,7 @@ class BackgroundTasks:
                 return
 
             if self.simulated_session_enabled:
-                self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
+                await self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
                 return
 
             try:
@@ -1140,7 +1469,7 @@ class BackgroundTasks:
                         self.add_event(f"Purchase retry failed: {exc}", "error")
                         return
 
-            self.record_purchase_summary(summary)
+            await self.record_purchase_summary(summary)
         finally:
             self.purchase_in_progress = False
             self._complete_pending_auth_reset_if_ready()
@@ -1187,7 +1516,7 @@ class BackgroundTasks:
     def _normalize_buy_list(self, buy_list):
         return [[str(item_id), str(stock), str(price)] for item_id, stock, price in buy_list]
 
-    def record_purchase_summary(self, summary):
+    async def record_purchase_summary(self, summary):
         purchase_records = summary.get("purchase_records", [])
         purchased_count = purchase_record_count(purchase_records)
         silver_spent = purchase_record_spend(purchase_records)
@@ -1195,9 +1524,17 @@ class BackgroundTasks:
         if purchased_count > 0 or silver_spent > 0:
             self.session_successful_purchases += purchased_count
             self.session_silver_spent += silver_spent
+            # Episode dedup can suppress a re-detection that is then bought (fast
+            # relist), so keep the session invariant detected >= purchased instead
+            # of letting the success rate climb past 100%.
+            if self.session_successful_purchases > self.session_detected_outfits:
+                self.session_detected_outfits = self.session_successful_purchases
             self.lifetime_successful_purchases += purchased_count
             self.lifetime_silver_spent += silver_spent
-            self.save_local_data()
+            # History first: the purchase event row is the valuable record, so it
+            # must be queued before anything else on this path can fail.
+            await self._record_purchase_history(purchase_records)
+            await self.save_local_data()
 
         summary_events = summary.get("events", [])
         for event in summary_events:

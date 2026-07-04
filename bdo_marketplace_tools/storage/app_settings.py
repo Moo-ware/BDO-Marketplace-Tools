@@ -290,7 +290,6 @@ def _normalize_settings(data):
     settings["ui"]["event_log_view"] = _normalize_event_log_view(
         ui.get("event_log_view", data.get("event_log_view", DEFAULT_EVENT_LOG_VIEW))
     )
-
     last_seen_version = updates.get("last_seen_version", data.get("last_seen_update_version"))
     settings["updates"]["last_seen_version"] = (
         str(last_seen_version).strip() if last_seen_version else None

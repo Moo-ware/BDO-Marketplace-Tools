@@ -49,26 +49,31 @@ APP_CSS = """
     }
 
     #tab-settings {
-        width: 2;
+        width: auto;
         height: 1;
-        margin: 0 5 0 1;
+        margin: 0;
         color: __COLOR_TEXT_MUTED__;
         content-align: center middle;
     }
 
     #tab-settings:hover {
         color: __COLOR_BRAND__;
-        background: #242424;
     }
 
     #tab-settings.nav-tab-active {
         color: __COLOR_BRAND__;
-        background: #1e1e1e;
         text-style: bold;
     }
 
     #topbar-spacer {
         width: 1fr;
+    }
+
+    #topbar-settings-divider {
+        width: auto;
+        margin-left: 2;
+        color: #3a3a3a;
+        content-align: center middle;
     }
 
     #header-session {
@@ -105,11 +110,22 @@ APP_CSS = """
         overflow: hidden;
     }
 
+    #welcome-greeting {
+        height: 1;
+        color: __COLOR_TEXT_MUTED__;
+        content-align: center middle;
+        text-align: center;
+    }
+
     #welcome-footer {
         height: 2;
         color: __COLOR_TEXT_MUTED__;
         content-align: center middle;
         border-top: solid #2b2b2b;
+    }
+
+    #welcome-card.-compact #welcome-greeting {
+        display: none;
     }
 
     #welcome-card.-compact #welcome-footer {
@@ -306,6 +322,29 @@ APP_CSS = """
         background: #3d2222;
     }
 
+    #activity-header {
+        height: 1;
+        margin-top: 1;
+    }
+
+    #activity-title {
+        width: auto;
+        color: #8f8f8f;
+        text-style: bold;
+    }
+
+    #activity-hint {
+        width: 1fr;
+        text-align: right;
+        color: #5a5a5a;
+    }
+
+    #activity-tail {
+        /* Initial height; App.activity_tail_lines() overrides it at runtime, stepping the
+           tail down before the mascot is hidden on short windows. */
+        height: 4;
+    }
+
     #event-log {
         height: 1fr;
         min-height: 6;
@@ -369,30 +408,37 @@ APP_CSS = """
     }
 
     .modal-action-tile {
-        width: 18;
-        height: 3;
-        margin-right: 1;
+        width: auto;
+        min-width: 6;
+        height: 1;
+        margin-right: 2;
+        padding: 0 1;
         content-align: center middle;
-        border: round #d8d3c8;
-        color: #d8d3c8;
-        background: transparent;
-    }
-
-    .modal-action-tile:hover {
-        border: round __COLOR_BRAND__;
+        border: none;
+        text-style: bold;
         color: __COLOR_BRAND__;
         background: transparent;
     }
 
+    .modal-action-tile:hover {
+        border: none;
+        color: #ffc389;
+        background: transparent;
+    }
+
     .modal-action-destructive {
-        border: round __COLOR_ERROR__;
+        border: none;
         color: __COLOR_ERROR__;
     }
 
     .modal-action-destructive:hover {
-        border: round __COLOR_ERROR__;
+        border: none;
         color: #f2c0c0;
         background: transparent;
+    }
+
+    .action-card .modal-action-tile {
+        margin-top: 1;
     }
 
     .action-card {
@@ -448,10 +494,19 @@ APP_CSS = """
         margin-right: 1;
     }
 
-    .modal-action-compact {
-        width: auto;
-        min-width: 10;
-        padding: 0 2;
+    .settings-chip-row {
+        height: 3;
+        margin-bottom: 1;
+    }
+
+    .settings-chip {
+        width: 1fr;
+        max-width: 44;
+        height: 3;
+        margin-right: 1;
+        padding: 0 1;
+        background: #1c1b1b;
+        content-align: left middle;
     }
 
     .settings-section-title {
@@ -467,35 +522,65 @@ APP_CSS = """
         margin-bottom: 1;
     }
 
-    .stats-section-title {
-        color: __COLOR_BRAND__;
+    .stats-chip-row {
+        height: 3;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
+    .stats-chip {
+        width: 1fr;
+        height: 3;
+        min-width: 12;
+        margin-right: 1;
+        padding: 0 1;
+        background: #1c1b1b;
+        content-align: left middle;
+    }
+
+    .stats-chart-title {
+        width: auto;
+        height: 1;
+        color: #8f8f8f;
         text-style: bold;
         margin-bottom: 1;
     }
 
-    .stats-row {
-        height: 4;
+    .stats-chart {
+        width: auto;
+        height: auto;
         margin-bottom: 1;
     }
 
-    .stats-tile {
+    .stats-chart-column {
+        width: auto;
+        height: auto;
+    }
+
+    #stats-col-weekday {
+        width: 31;
+        margin-right: 6;
+    }
+
+    #stats-col-hours {
         width: 1fr;
-        height: 4;
-        min-width: 12;
-        margin-right: 1;
-        padding: 0 1;
-        content-align: center middle;
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        border-title-align: center;
+    }
+
+    #stats-trends-title {
+        margin-top: 1;
+    }
+
+    #stats-chart-row {
+        height: auto;
+        margin-top: 1;
     }
 
     #content {
         height: 1fr;
         overflow-y: auto;
-        scrollbar-size-vertical: 1;
-        scrollbar-size-horizontal: 1;
+        scrollbar-visibility: hidden;
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 0;
         scrollbar-color: #343434;
         scrollbar-color-hover: #4a4a4a;
         scrollbar-color-active: #5f5f5f;
