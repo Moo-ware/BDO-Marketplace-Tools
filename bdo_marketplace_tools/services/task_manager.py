@@ -31,7 +31,6 @@ from bdo_marketplace_tools.storage.app_settings import (
     default_app_settings,
     load_browser_cache_cleanup_threshold_mb,
     load_account_mode,
-    load_last_seen_update_version,
     load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
@@ -43,7 +42,6 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
-    save_last_seen_update_version,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -197,9 +195,6 @@ class BackgroundTasks:
         self._active_detection_episodes = {}
         self.update_check_on_startup = (
             load_update_check_on_startup() if self.persist_ui_settings else True
-        )
-        self.last_seen_update_version = (
-            load_last_seen_update_version() if self.persist_ui_settings else None
         )
         self.available_update_version = None
         self.update_check_completed = False
@@ -592,15 +587,7 @@ class BackgroundTasks:
         if manual:
             self.add_event(message, "warning", notable=True)
             return
-        # Startup nudge: announce a given version once so launches are not spammed.
-        if latest_version != self.last_seen_update_version:
-            self.add_event(message, "warning", notable=True)
-            self._remember_seen_update_version(latest_version)
-
-    def _remember_seen_update_version(self, version):
-        self.last_seen_update_version = version
-        if self.persist_ui_settings:
-            self.last_seen_update_version = save_last_seen_update_version(version)
+        self.add_event(message, "warning", notable=True)
 
     def current_delay_label(self):
         if self.delay == "custom":

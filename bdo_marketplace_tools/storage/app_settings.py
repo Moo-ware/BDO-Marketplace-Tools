@@ -115,10 +115,8 @@ def default_app_settings():
             "buy_mode": False,
         },
         "updates": {
-            # Most recent version the user has already been notified about, so a newer
-            # release is announced once on startup instead of on every launch. None until
-            # the first notice. The manual "Check for Updates" action ignores this and
-            # always reports the current status.
+            # Legacy compatibility value from older builds. Startup now warns on every
+            # launch while a newer release is available instead of suppressing repeats.
             "last_seen_version": None,
             # Whether to check GitHub for a newer version on startup (soft, non-blocking,
             # silent on failure, and skipped in test mode). The manual check always works.

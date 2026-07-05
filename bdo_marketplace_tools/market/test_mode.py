@@ -20,7 +20,7 @@ SINGLE_ITEM_TEST_TARGET = {
     "choose_key": "0",
     "main_category": "1",
     "sub_category": "1",
-    "max_buy_price": "82500",
+    "max_buy_price": "92500",
 }
 
 LIVE_BUY_ERROR_TEST_TARGET = {

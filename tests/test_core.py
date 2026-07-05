@@ -114,6 +114,7 @@ from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
     BANNER_BLINK_ART,
     DEFAULT_THEME,
+    MASCOT_ZZZ_TRAIL,
     RUNNING_QUIPS,
     STATUS_STYLES,
     DashboardTile,
@@ -3602,7 +3603,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
         result = await check_single_item_stock(handler)
 
-        self.assertEqual(result, [["10007", "6", "82500"]])
+        self.assertEqual(result, [["10007", "6", "92500"]])
         self.assertIs(captured["client"], requests)
         self.assertEqual(captured["method"], "POST")
         self.assertTrue(captured["url"].endswith("/Trademarket/GetWorldMarketSubList"))
@@ -3638,7 +3639,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
         result = await check_single_item_stock(handler)
 
-        self.assertEqual(result, [["10007", "1", "82500"]])
+        self.assertEqual(result, [["10007", "1", "92500"]])
 
     async def test_single_item_stock_check_rejects_public_endpoint_error_code(self):
         handler = object.__new__(APIHandler)
@@ -3689,12 +3690,12 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
             "single-item test",
         )
 
-        self.assertEqual(result, [["10007", "2", "82500"]])
+        self.assertEqual(result, [["10007", "2", "92500"]])
 
     async def test_single_item_stock_response_uses_configured_test_buy_price_not_public_prices(self):
         target = {
             **SINGLE_ITEM_TEST_TARGET,
-            "max_buy_price": "82500",
+            "max_buy_price": "92500",
         }
         response_json = {
             "resultCode": 0,
@@ -3707,7 +3708,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
             "single-item test",
         )
 
-        self.assertEqual(result, [["10007", "1", "82500"]])
+        self.assertEqual(result, [["10007", "1", "92500"]])
 
     async def test_single_item_stock_response_rejects_api_error_codes(self):
         with self.assertRaises(MarketplaceResponseError):
@@ -3975,7 +3976,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("79,000", summary["events"][0]["message"])
         self.assertIn("silver", summary["events"][0]["message"])
-        self.assertIn("submitted up to 82,500", summary["events"][0]["message"])
+        self.assertIn("bid up to 82,500", summary["events"][0]["message"])
 
     async def test_buy_item_result_code_zero_preorder_does_not_count_as_purchase(self):
         handler = object.__new__(APIHandler)
@@ -4632,7 +4633,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_item_test_checker_processes_detection_without_live_buy(self):
         manager = self.make_task_manager(test_mode_enabled=True)
         manager.purchase_submission_enabled = True
-        stock_check = AsyncMock(return_value=[["10007", "2", "82500"]])
+        stock_check = AsyncMock(return_value=[["10007", "2", "92500"]])
         manager.api_handler.buy_item = AsyncMock()
 
         with patch("bdo_marketplace_tools.services.task_manager.check_single_item_stock", stock_check), patch(
@@ -4653,13 +4654,13 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_single_item_test_checker_can_buy_without_outfit_price_adjustment(self):
         manager = self.make_task_manager(test_mode_enabled=True)
-        stock_check = AsyncMock(return_value=[["10007", "2", "82500"]])
+        stock_check = AsyncMock(return_value=[["10007", "2", "92500"]])
         manager.api_handler.buy_item = AsyncMock(
             return_value={
                 "purchase_records": [
                     {
                         "item_id": "10007",
-                        "price": 82500,
+                        "price": 92500,
                         "count": 2,
                         "result_code": 0,
                     }
@@ -4684,12 +4685,12 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         stock_check.assert_awaited_once_with(manager.api_handler, SINGLE_ITEM_TEST_TARGET)
         manager.api_handler.buy_item.assert_awaited_once_with(
-            [["10007", "2", "82500"]],
+            [["10007", "2", "92500"]],
             purchase_delay_bounds=DEFAULT_PURCHASE_DELAY_BOUNDS,
         )
         self.assertEqual(manager.session_detected_outfits, 2)
         self.assertEqual(manager.session_successful_purchases, 2)
-        self.assertEqual(manager.session_silver_spent, 165000)
+        self.assertEqual(manager.session_silver_spent, 185000)
         self.assertFalse(any("Fallback pricing applied" in event for event in manager.events))
         save_mock.assert_awaited_once()
 
@@ -6646,13 +6647,26 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(150, 45)) as pilot:
                 app.animations_enabled = True
+                app._zzz_step = 0  # pin the sleep trail so banner equality is deterministic
+                app.refresh_live_widgets()
 
-                # Mascot blink swaps the banner art and restores it shortly after.
-                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
-                app.blink_mascot()
+                # Idle mascot dozes (eyes closed). Most blink ticks are skipped so the peek
+                # stays rare (~every 8-12s); it only opens when the countdown reaches zero.
                 self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)
-                await pilot.pause(0.3)
-                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
+                app._idle_peek_countdown = 2
+                app.blink_mascot()
+                self.assertFalse(app._mascot_blinking)  # throttled — no peek this tick
+                self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)
+
+                # Eyes crack open once the countdown elapses.
+                app._idle_peek_countdown = 0
+                app.blink_mascot()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)  # drowsy peek
+                await pilot.pause(1.5)  # the peek is held ~1.35s
+                self.assertFalse(app._mascot_blinking)  # the timer ended the peek
+                app._zzz_step = 0
+                app.refresh_mascot_rest()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)
 
                 # Idle: greeting sits under the mascot; state rides the divider rule.
                 greeting = str(app.query_one("#welcome-greeting", Static).render())
@@ -6664,21 +6678,64 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("all-time", status)
 
-                # Running: status spins on the divider, the mascot's chatter rotates above it.
+                # Idle chatter stays on the time greeting — it does not rotate.
+                app.advance_running_quip()
+                idle_greeting = str(app.query_one("#welcome-greeting", Static).render())
+                self.assertIn(app.time_greeting(), idle_greeting)
+
+                # The empty step lingers (the long gap between sets) before the next z.
+                app._zzz_step = 0
+                app._zzz_gap = 0
+                app.advance_mascot_zzz()
+                self.assertEqual(app._zzz_step, 0)  # still blank — dwelling in the gap
+
+                # The sleep clock freezes during a peek, so no z-reveals are lost.
+                app._mascot_blinking = True
+                app._zzz_step = 1
+                app._zzz_gap = 0
+                app.advance_mascot_zzz()
+                self.assertEqual(app._zzz_step, 1)  # frozen — did not advance under the guard
+                app._mascot_blinking = False
+
+                # Once the gap elapses the trail builds a z at a time.
+                app._zzz_step = 0
+                app._zzz_gap = app.ZZZ_GAP_TICKS - 1
+                app.advance_mascot_zzz()
+                self.assertEqual(app._zzz_step, 1)
+                self.assertIn("z", app.query_one("#banner").render())
+
+                app._zzz_step = len(MASCOT_ZZZ_TRAIL)
+                app.refresh_mascot_rest()
+                self.assertIn("Z", app.query_one("#banner").render())  # full trail
+                app._zzz_step = 0
+                app.refresh_mascot_rest()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)  # reset
+
+                # Running: mascot wakes (eyes open), status spins on the divider, the chatter
+                # rotates above it, and the strip switches to the session stats.
                 app.task_manager.checker_enabled = True
                 app.refresh_live_widgets()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)  # awake
                 greeting = str(app.query_one("#welcome-greeting", Static).render())
                 status = str(app.query_one("#welcome-footer", Static).render())
                 self.assertIn("⠋", status)
                 self.assertIn("Running", status)
                 self.assertIn("watching the marketplace", greeting)
-                self.assertIn("all-time", status)
+                self.assertNotIn("all-time", status)
+                self.assertIn("bought", status)
+                self.assertIn("spent", status)
                 app.advance_running_pulse()
                 self.assertIn("⠙", str(app.query_one("#welcome-footer", Static).render()))
                 app.advance_running_quip()
                 greeting = str(app.query_one("#welcome-greeting", Static).render())
                 self.assertNotIn("watching the marketplace", greeting)
                 self.assertTrue(any(quip in greeting for quip in RUNNING_QUIPS[1:]))
+
+                # Awake blink: eyes close briefly, then reopen (opposite of the idle doze).
+                app.blink_mascot()
+                self.assertEqual(app.query_one("#banner").render(), BANNER_BLINK_ART)
+                await pilot.pause(0.3)
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
 
                 app.task_manager.checker_enabled = False
 
@@ -6986,7 +7043,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(toggle_region.right, deck_region.right)
                 self.assertGreater(toggle_region.x, app.query_one("#dashboard-tiles").region.right)
 
-                # Running state: toggle flips to STOP and the info bar picks up the session stats.
+                # Running state: toggle flips to STOP (which carries the runtime) and the
+                # session stats live on the welcome-card footer, not the status bar.
                 toggle_console = Console(width=40, color_system=None)
                 self.assertTrue(app.query_one("#monitor-toggle").has_class("toggle-start"))
                 with toggle_console.capture() as toggle_capture:
@@ -6999,24 +7057,27 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     toggle_console.print(app.query_one("#monitor-toggle", Static).content)
                 self.assertIn("STOP", toggle_capture.get())
                 info_bar = str(app.query_one("#status-keys", Static).render())
-                self.assertIn("bought", info_bar)
-                self.assertIn("2/4", info_bar)
-                self.assertIn("50%", info_bar)
-                self.assertIn("run", info_bar)
+                self.assertNotIn("bought", info_bar)
+                self.assertNotIn("run ", info_bar)
                 footer_text = str(app.query_one("#welcome-footer", Static).render())
                 self.assertIn("Running", footer_text)
+                self.assertIn("bought", footer_text)
+                self.assertIn("2 of 4 seen", footer_text)
+                self.assertIn("50%", footer_text)
+                self.assertIn("spent", footer_text)
+                self.assertIn("1.5B of ∞", footer_text)
+                self.assertNotIn("all-time", footer_text)
 
                 # A fresh run shows the stats immediately (dimmed zeros) but no misleading 0%.
                 app.task_manager.session_detected_outfits = 0
                 app.task_manager.session_successful_purchases = 0
                 app.task_manager.session_silver_spent = 0
                 app.refresh_live_widgets()
-                info_bar = str(app.query_one("#status-keys", Static).render())
-                self.assertIn("bought", info_bar)
-                self.assertIn("0/0", info_bar)
-                self.assertNotIn("%", info_bar)
-                self.assertIn("spent", info_bar)
-                self.assertIn("run", info_bar)
+                footer_text = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("bought", footer_text)
+                self.assertIn("0 of 0 seen", footer_text)
+                self.assertNotIn("%", footer_text)
+                self.assertIn("spent", footer_text)
                 app.task_manager.session_detected_outfits = 4
                 app.task_manager.session_successful_purchases = 2
                 app.task_manager.session_silver_spent = 1_500_000_000
@@ -7407,24 +7468,24 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
-                cases = [
-                    (0, 0, "error"),
-                    (1, 10, "error"),
-                    (3, 10, "orange"),
-                    (5, 10, "warning"),
-                    (8, 10, "success"),
-                ]
+                # No detections yet -> neutral idle, not a red "0%" alarm.
+                self.assertEqual(app.purchase_rate_style(0, 0), STATUS_STYLES["idle"])
+                # Ramp endpoints anchor exactly on the palette's red and green.
+                self.assertEqual(app.purchase_rate_style(0, 10), "bold rgb(209,106,106)")
+                self.assertEqual(app.purchase_rate_style(8, 10), "bold rgb(126,184,138)")
+                self.assertEqual(app.purchase_rate_style(10, 10), "bold rgb(126,184,138)")
 
-                for successful, detected, expected_level in cases:
-                    app.task_manager.session_successful_purchases = successful
-                    app.task_manager.session_detected_outfits = detected
-                    self.assertEqual(app.purchase_rate_level(), expected_level)
+                # The ramp is continuous: the green channel rises and red falls as the
+                # rate climbs, and the 70s already read green-leaning (not flat yellow).
+                def rgb(bought, detected):
+                    style = app.purchase_rate_style(bought, detected)
+                    return tuple(int(p) for p in style[style.index("(") + 1 : style.index(")")].split(","))
 
-                self.assertEqual(STATUS_STYLES["error"], "bold rgb(209,106,106)")
-                self.assertEqual(STATUS_STYLES["success"], "bold rgb(126,184,138)")
-                self.assertEqual(STATUS_STYLES["info"], "bold rgb(232,229,220)")
-                self.assertEqual(STATUS_STYLES["steam"], "bold rgb(19,100,151)")
-                self.assertEqual(STATUS_STYLES["gold"], "bold rgb(218,177,86)")
+                low, mid, high = rgb(3, 10), rgb(5, 10), rgb(7, 10)
+                # green-minus-red rises monotonically as the hit rate climbs...
+                self.assertLess(low[1] - low[0], mid[1] - mid[0])
+                self.assertLess(mid[1] - mid[0], high[1] - high[0])
+                self.assertGreater(high[1], high[0])  # ...and by 70% green dominates red
 
     async def test_sidebar_test_log_button_adds_dashboard_event(self):
         app = self.make_app(launch_mode="test")
@@ -8219,7 +8280,7 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
                 persist_ui_settings=False,
             )
 
-    async def test_startup_check_announces_new_version_once(self):
+    async def test_startup_check_announces_new_version_every_time(self):
         manager = self._make_manager()
         result = update_checker_module.UpdateCheckResult("update-available", APP_VERSION, latest_version="9.9.9")
         with patch("bdo_marketplace_tools.services.task_manager.run_update_check", return_value=result):
@@ -8228,15 +8289,14 @@ class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(first.update_available)
         self.assertEqual(manager.available_update_version, "9.9.9")
-        self.assertEqual(manager.last_seen_update_version, "9.9.9")
-        # Announced exactly once across two startup checks.
+        # Announced on every startup check while the app is outdated.
         notices = [event for event in manager.events if "9.9.9" in event]
-        self.assertEqual(len(notices), 1)
+        self.assertEqual(len(notices), 2)
         # The available-update notice is yellow (warning level) and notable.
         from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS
 
         rendered_notices = [event for event in manager.events_for_filter("notable") if "9.9.9" in event]
-        self.assertEqual(len(rendered_notices), 1)
+        self.assertEqual(len(rendered_notices), 2)
         # The line is wrapped in warning yellow (the version highlight inside is bold white).
         self.assertIn(f"[{EVENT_LEVEL_COLORS['warning']}]Update available", rendered_notices[0])
         # Every startup also prints the running version to the log.

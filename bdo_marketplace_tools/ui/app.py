@@ -56,10 +56,12 @@ from bdo_marketplace_tools.ui.theme import (
     BANNER_BLINK_ART,
     DEFAULT_THEME,
     IDLE_DOT,
+    MASCOT_ZZZ_TRAIL,
     RUNNING_QUIPS,
     STATUS_DOT,
     STATUS_STYLES,
     TEST_LOG_MESSAGES,
+    rate_spectrum_style,
 )
 from bdo_marketplace_tools.storage import stats_db
 from bdo_marketplace_tools.ui.charts import hour_heatmap_chart, weekday_chart
@@ -139,6 +141,10 @@ class MarketplaceToolsApp(App[None]):
         self.animations_enabled = True
         self._pulse_index = 0
         self._quip_index = 0
+        self._mascot_blinking = False
+        self._zzz_step = 0
+        self._zzz_gap = 0
+        self._idle_peek_countdown = 1
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
@@ -196,6 +202,7 @@ class MarketplaceToolsApp(App[None]):
         self.set_interval(0.12, self.advance_running_pulse)
         self.set_interval(4.0, self.blink_mascot)
         self.set_interval(30.0, self.advance_running_quip)
+        self.set_interval(0.8, self.advance_mascot_zzz)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
 
     def on_resize(self, event) -> None:
@@ -614,19 +621,15 @@ class MarketplaceToolsApp(App[None]):
 
         return Group(details)
 
-    def purchase_rate_level(self) -> str:
-        detected = self.task_manager.session_detected_outfits
+    def purchase_rate_style(self, bought: int | None = None, detected: int | None = None) -> str:
+        # Continuous red->green ramp so the rate color climbs smoothly with the hit rate.
+        if detected is None:
+            detected = self.task_manager.session_detected_outfits
+        if bought is None:
+            bought = self.task_manager.session_successful_purchases
         if detected <= 0:
-            return "error"
-
-        percentage = (self.task_manager.session_successful_purchases / detected) * 100
-        if percentage >= 80:
-            return "success"
-        if percentage >= 50:
-            return "warning"
-        if percentage >= 25:
-            return "orange"
-        return "error"
+            return STATUS_STYLES["idle"]
+        return rate_spectrum_style(bought / detected)
 
     def refresh_live_widgets(self) -> None:
         self.refresh_chrome_status()
@@ -661,6 +664,9 @@ class MarketplaceToolsApp(App[None]):
         return label
 
     RUNNING_PULSE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    # The Zzz builds quickly (one z per ~0.8s tick) then rests blank for this many ticks
+    # before the next set — a long pause between sleep breaths (~5s at the 0.8s tick).
+    ZZZ_GAP_TICKS = 6
 
     def refresh_chrome_status(self) -> None:
         tm = self.task_manager
@@ -678,7 +684,9 @@ class MarketplaceToolsApp(App[None]):
 
         try:
             bar = Text()
-            separator = "  ·  "
+            # The bottom status bar uses the header's "│" line divider (dim #3a3a3a),
+            # not the strip's brighter dot.
+            separator = "  │  "
             buying = tm.purchase_submission_enabled
             bar.append(
                 f"{STATUS_DOT} " if buying else f"{IDLE_DOT} ",
@@ -688,28 +696,8 @@ class MarketplaceToolsApp(App[None]):
             bar.append(separator, style="#3a3a3a")
             bar.append("cap ", style="#6f6f6f")
             bar.append(self.spend_cap_short_label(), style="#d8d3c8")
-            if running:
-                detected = tm.session_detected_outfits
-                bought = tm.session_successful_purchases
-                bar.append(separator, style="#3a3a3a")
-                bar.append("bought ", style="#6f6f6f")
-                bar.append(f"{bought}/{detected}", style="#d8d3c8" if detected else "#6f6f6f")
-                # The rate joins only after the first detection: 0% of nothing is noise.
-                if detected > 0:
-                    bar.append(" ")
-                    bar.append(
-                        format_percent(bought, detected),
-                        style=STATUS_STYLES[self.purchase_rate_level()],
-                    )
-                bar.append(separator, style="#3a3a3a")
-                bar.append("spent ", style="#6f6f6f")
-                bar.append(
-                    format_compact_number(tm.session_silver_spent),
-                    style="#d8d3c8" if tm.session_silver_spent else "#6f6f6f",
-                )
-                bar.append(separator, style="#3a3a3a")
-                bar.append("run ", style="#6f6f6f")
-                bar.append(self.short_runtime_label(), style="#d8d3c8")
+            # Session stats live on the welcome-card footer while running; the runtime
+            # lives on the STOP button. The status bar stays mode + cap on every tab.
             self.query_one("#status-keys", Static).update(bar)
         except Exception:
             pass
@@ -727,6 +715,7 @@ class MarketplaceToolsApp(App[None]):
             card.display = self.current_view == "dashboard"
             card.set_class(not self.should_show_banner(), "-compact")
             self.query_one("#banner", Static).display = self.should_show_banner()
+            self.refresh_mascot_rest()
         except Exception:
             pass
         self.refresh_welcome_footer(running)
@@ -746,26 +735,58 @@ class MarketplaceToolsApp(App[None]):
         # live state (running/idle · lifetime record) sits on the footer line below it.
         try:
             tm = self.task_manager
-            if running:
-                chatter_line = RUNNING_QUIPS[self._quip_index % len(RUNNING_QUIPS)]
-            else:
-                chatter_line = self.time_greeting()
+            pool = self.chatter_pool(running)
+            chatter_line = pool[self._quip_index % len(pool)]
             self.query_one("#welcome-greeting", Static).update(
                 Text(chatter_line, style="bold #d8d3c8")
             )
 
             footer = Text()
+            # One consistent divider dot everywhere in the strip, at a single bright tone,
+            # so idle and running read the same (no dim/bright mismatch).
+            sep = "  ·  "
+            sep_style = COLOR_TEXT_MUTED
             if running:
+                # Running: the strip carries the session — bought, rate, and spend read
+                # against the cap. Idle keeps the lifetime record.
                 frame = self.RUNNING_PULSE_FRAMES[self._pulse_index]
                 footer.append(f"{frame} ", style=COLOR_BRAND)
                 footer.append("Running", style=STATUS_STYLES["success"])
+                detected = tm.session_detected_outfits
+                bought = tm.session_successful_purchases
+                footer.append(sep, style=sep_style)
+                footer.append("bought ", style="#6f6f6f")
+                # Bought is the number that matters, so the "seen" denominator recedes to
+                # gray — bought wins by contrast without adding weight or color.
+                footer.append(str(bought), style="#d8d3c8" if detected else "#6f6f6f")
+                footer.append(" of ", style="#6f6f6f")
+                footer.append(str(detected), style="#8f8f8f" if detected else "#6f6f6f")
+                footer.append(" seen", style="#6f6f6f")
+                # The rate joins only after the first detection: 0% of nothing is noise.
+                if detected > 0:
+                    footer.append(" (", style="#6f6f6f")
+                    footer.append(
+                        format_percent(bought, detected),
+                        style=self.purchase_rate_style(bought, detected),
+                    )
+                    footer.append(")", style="#6f6f6f")
+                footer.append(sep, style=sep_style)
+                footer.append("spent ", style="#6f6f6f")
+                spent = tm.session_silver_spent
+                # Session silver in the same gold as the idle lifetime figures.
+                footer.append(
+                    format_compact_number(spent),
+                    style=COLOR_GOLD if spent else "#6f6f6f",
+                )
+                footer.append(f" of {self.spend_cap_short_label()}", style="#6f6f6f")
             else:
                 footer.append(f"{IDLE_DOT} Idle", style="#777777")
-            footer.append("  ·  ", style="#3a3a3a")
-            footer.append(f"{tm.lifetime_successful_purchases:,}", style=COLOR_GOLD)
-            footer.append(" outfits · ", style=COLOR_TEXT_MUTED)
-            footer.append(format_compact_number(tm.lifetime_silver_spent), style=COLOR_GOLD)
-            footer.append(" silver all-time", style=COLOR_TEXT_MUTED)
+                footer.append(sep, style=sep_style)
+                footer.append(f"{tm.lifetime_successful_purchases:,}", style=COLOR_GOLD)
+                footer.append(" outfits", style=COLOR_TEXT_MUTED)
+                footer.append(sep, style=sep_style)
+                footer.append(format_compact_number(tm.lifetime_silver_spent), style=COLOR_GOLD)
+                footer.append(" silver all-time", style=COLOR_TEXT_MUTED)
             self.query_one("#welcome-footer", Static).update(footer)
         except Exception:
             pass
@@ -778,15 +799,75 @@ class MarketplaceToolsApp(App[None]):
         self._pulse_index = (self._pulse_index + 1) % len(self.RUNNING_PULSE_FRAMES)
         self.refresh_welcome_footer(True)
 
+    def chatter_pool(self, running: bool) -> list[str]:
+        # Running: the eager quips rotate. Idle: just the live time-of-day greeting (the
+        # mascot's sleep is shown by the Zzz trail, not chatter).
+        if running:
+            return list(RUNNING_QUIPS)
+        return [self.time_greeting()]
+
     def advance_running_quip(self) -> None:
         if not self.animations_enabled or self.current_view != "dashboard":
             return
-        if not self.task_manager.monitor_running():
+        # The mascot chatters in both states now — eager while running, dozy while idle.
+        running = self.task_manager.monitor_running()
+        pool = self.chatter_pool(running)
+        if len(pool) < 2:
             return
+        current = self._quip_index % len(pool)
         # Random pick, but never the same line twice in a row.
-        choices = [i for i in range(len(RUNNING_QUIPS)) if i != self._quip_index]
+        choices = [i for i in range(len(pool)) if i != current]
         self._quip_index = random.choice(choices)
-        self.refresh_welcome_footer(True)
+        self.refresh_welcome_footer(running)
+
+    def mascot_rest_frame(self) -> str:
+        # The mascot's resting face IS the monitor state: eyes open (awake) while running,
+        # eyes closed + a rising "Zzz" while idle (dozing) — so starting the bot visibly
+        # wakes it. With animations off (tests), the plain logo stays neutral.
+        if not self.animations_enabled:
+            return BANNER_ART
+        if self.task_manager.monitor_running():
+            return BANNER_ART
+        return self._augment_zzz(BANNER_BLINK_ART)
+
+    def _augment_zzz(self, base_art: str) -> str:
+        # Overlay the first _zzz_step cells of the trail onto blank cells of the banner
+        # grid (overwrites spaces in place, so total width never changes → no shift).
+        if self._zzz_step <= 0:
+            return base_art
+        rows = [list(line) for line in base_art.split("\n")]
+        for row, col, char in MASCOT_ZZZ_TRAIL[: self._zzz_step]:
+            if row < len(rows) and col < len(rows[row]):
+                rows[row][col] = char
+        return "\n".join("".join(row) for row in rows)
+
+    def advance_mascot_zzz(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if self.task_manager.monitor_running():
+            return
+        # Freeze the sleep clock while a drowsy peek owns the banner. Otherwise the step
+        # would advance under the blink guard (unpainted), swallowing z-reveals — most
+        # visibly the final Z — and making the cadence look random.
+        if self._mascot_blinking:
+            return
+        # A set builds quickly (z -> z -> z), then the empty step lingers ZZZ_GAP_TICKS
+        # ticks so there's a long blank pause before the next set begins.
+        if self._zzz_step == 0:
+            self._zzz_gap += 1
+            if self._zzz_gap < self.ZZZ_GAP_TICKS:
+                return
+            self._zzz_gap = 0
+        self._zzz_step = (self._zzz_step + 1) % (len(MASCOT_ZZZ_TRAIL) + 1)
+        self.refresh_mascot_rest()
+
+    def refresh_mascot_rest(self) -> None:
+        if self._mascot_blinking:
+            return
+        try:
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
+        except Exception:
+            pass
 
     def blink_mascot(self) -> None:
         if not self.animations_enabled or self.current_view != "dashboard":
@@ -797,12 +878,30 @@ class MarketplaceToolsApp(App[None]):
             return
         if not banner.display:
             return
-        banner.update(BANNER_BLINK_ART)
-        self.set_timer(0.15, self._end_mascot_blink)
+        # Awake: a quick alert blink (eyes close briefly). Dozing: a slow drowsy peek
+        # (eyes crack open briefly). The rest frame is the opposite in each state.
+        running = self.task_manager.monitor_running()
+        if not running:
+            # The idle peek shares the 4s blink timer but should be rare — skip most
+            # ticks so the sleeping eyes only crack open every ~8-12s.
+            if self._idle_peek_countdown > 0:
+                self._idle_peek_countdown -= 1
+                return
+            self._idle_peek_countdown = random.randint(1, 2)
+        self._mascot_blinking = True
+        if running:
+            banner.update(BANNER_BLINK_ART)
+            self.set_timer(0.15, self._end_mascot_blink)
+        else:
+            # Drowsy peek: eyes crack open but the Zzz stays — still dozing. Held long
+            # (~1.35s) so the idle wake reads as a slow, sleepy stir.
+            banner.update(self._augment_zzz(BANNER_ART))
+            self.set_timer(1.35, self._end_mascot_blink)
 
     def _end_mascot_blink(self) -> None:
+        self._mascot_blinking = False
         try:
-            self.query_one("#banner", Static).update(BANNER_ART)
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
         except Exception:
             pass
 
@@ -1481,8 +1580,7 @@ class MarketplaceToolsApp(App[None]):
             f" · {format_compact_number(tm.lifetime_successful_purchases)} lifetime", style="#6f6f6f"
         )
 
-        rate_level = self.purchase_rate_level() if detected else "idle"
-        rate_value = Text(format_percent(bought, detected), style=STATUS_STYLES[rate_level])
+        rate_value = Text(format_percent(bought, detected), style=self.purchase_rate_style(bought, detected))
         rate_value.append(f" · {bought}/{detected}", style="#6f6f6f")
 
         spent_value = Text(format_compact_number(tm.session_silver_spent), style=STATUS_STYLES["info"])

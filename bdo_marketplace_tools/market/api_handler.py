@@ -83,9 +83,11 @@ def purchase_result_message(result_code, item_id, price):
 
 def purchase_success_message(item_id, actual_price, submitted_price=None):
     if submitted_price is not None and int(submitted_price) != int(actual_price):
+        # The submitted buyPrice is a ceiling; the marketplace fills at the real
+        # listing price. "Bid up to" tells the reader the ceiling was not what was paid.
         return (
             f"Purchase request succeeded for {_item_and_price(item_id, actual_price)} "
-            f"(submitted up to {_format_silver_amount(submitted_price)})."
+            f"(bid up to {_format_silver_amount(submitted_price)})."
         )
     return purchase_result_message(0, item_id, actual_price)
 
