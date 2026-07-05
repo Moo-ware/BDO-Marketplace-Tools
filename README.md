@@ -6,7 +6,7 @@
   <a href="https://www.python.org/downloads/">
     <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
   </a>
-  <img alt="Version 1.2.1-beta" src="https://img.shields.io/badge/Version-1.2.1--beta-blueviolet">
+  <img alt="Version 1.3.0-beta" src="https://img.shields.io/badge/Version-1.3.0--beta-blueviolet">
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
@@ -37,8 +37,9 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Custom silver spend cap per session, stopping future purchases if cap is met.
 - Tracks current session's outfit detections, successful purchases, and silver spent. 
 - Tracks lifetime silver spent, and successful purchases.
-- Provides logging for actions, purchases, detection, and errors.
-- Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
+- Provides a unified Logs tab for actions, purchases, detections, session/auth outcomes, and errors.
+- Provides a Stats tab with lifetime totals and SQLite-backed 30-day trend charts for daily activity, busiest days, and listing hours.
+- Provides a marketplace inventory view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
 
 ### Technical Features
 
@@ -46,12 +47,12 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
 - Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
 - Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
-- Secure session and credential persistence with JSON cookie storage, legacy pickle-session migration, local email initialization, and OS keyring-backed password storage.
+- Secure per-user runtime storage under `%LOCALAPPDATA%\bdo-marketplace-tools\data` by default, with `BDO_DATA_DIR` override support, JSON cookie storage, SQLite stats history, browser profiles, and OS keyring-backed password storage.
 - Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
 - Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
 - Resilient network and response validation for timeouts, malformed JSON, unexpected API shapes, invalid listing rows, stale pricing, duplicate orders, and unavailable items.
-- Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
-- Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
+- Textual-based terminal dashboard with top-tab navigation, live runtime metrics, modal control flows, inventory/status views, test-mode-only simulation controls, and headless UI workflow tests.
+- Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, stats history, and dashboard workflows.
 
 ## App Status
 
@@ -86,19 +87,22 @@ py -3 main.py
 
 `run.bat` uses Windows Terminal when available so the Textual UI opens at a usable size. Set `BDO_DISABLE_WT=1` before launching to run in the current console instead.
 
+Runtime data is stored outside the app folder by default at `%LOCALAPPDATA%\bdo-marketplace-tools\data`. Set `BDO_DATA_DIR` before launch to use a portable or custom data location.
+
 ## Disclaimer
 
 This repository is provided as a proof of concept and educational purposes ONLY. I am *NOT* responsible for anything that happens to your account if you choose to use this.
 
 ## Known Issues
 
-If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
+If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not automate CAPTCHA challenges, but browser auth can detect visible challenges and keep the browser open so you can complete them manually.
 
 Known problematic result codes:
 
 - `resultCode=30`: identical order already exists. This has been observed with `resultMsg=eErrNoAlreadyReservationDay`.
 - `resultCode=34`: item unavailable, already taken, or the request would create a duplicate pre-order.
 - `resultCode=-14`: price mismatch. This can happen when PA decide to change max outfit prices. needs updating if that's the case.
+- `resultCode=-16`: not enough silver for the order.
 - `resultCode=2000`: marketplace login session expired upon buy attempt. The app attempts to refresh/re-authenticate and re buy the item.
 
 Unknown purchase codes are reported as `resultCode {code}` in the event log so they can be documented after a new capture.
