@@ -6588,9 +6588,17 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.query_one("#welcome-card").display)
                 self.assertTrue(app.query_one("#tab-settings").has_class("nav-tab-active"))
                 self.assertFalse(app.query_one("#tab-dashboard").has_class("nav-tab-active"))
+                # Every section is a labeled border-title card; the account/session status
+                # chips and the dev-jargon preamble are gone.
                 self.assertEqual(app.query_one("#settings-danger-card").border_title, "Danger zone")
-                self.assertIn("Update", str(app.query_one("#settings-update", Static).render()))
-                self.assertEqual(len(list(app.query(".settings-chip"))), 2)
+                self.assertEqual(app.query_one("#settings-about-card").border_title, "About")
+                self.assertEqual(app.query_one("#settings-update-card").border_title, "Updates")
+                self.assertEqual(app.query_one("#settings-storage-card").border_title, "Storage")
+                about_facts = str(app.query_one("#settings-about-facts", Static).render())
+                self.assertIn("channel", about_facts)
+                self.assertIn("schema", about_facts)
+                self.assertIn("mode", about_facts)
+                self.assertEqual(len(list(app.query(".settings-chip"))), 0)
                 self.assertEqual(len(list(app.query(".stats-tile"))), 0)
                 self.assertEqual(len(list(app.query("#settings-config-list"))), 0)
                 self.assertNotIn("Configuration", str(app.query_one("#content").render()))
@@ -8130,6 +8138,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("s")
                 rendered = str(app.query_one("#settings-storage-facts", Static).render())
+                storage_border_title = app.query_one("#settings-storage-card").border_title
                 cache_input = app.query_one("#settings-cache-threshold-input", Input)
                 cache_input_value = cache_input.value
                 cache_input_width = cache_input.styles.width.value
@@ -8142,7 +8151,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 cache_input_kept_focus_after_click_away = app.focused is cache_input
 
-        self.assertIn("Storage", rendered)
+        self.assertEqual(storage_border_title, "Storage")
         self.assertIn("512.0 MiB", rendered)
         self.assertIn("disposable", rendered)
         self.assertIn("200.0 MiB", rendered)

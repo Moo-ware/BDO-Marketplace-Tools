@@ -197,13 +197,15 @@ APP_CSS = """
         margin-bottom: 1;
     }
 
-    .settings-note {
-        color: __COLOR_TEXT_MUTED__;
-        margin-bottom: 1;
+    #settings-identity {
+        height: 1;
+        margin: 0 1 1 1;
     }
 
-    #settings-about {
-        margin-bottom: 0;
+    .action-card-line-tight {
+        width: 1fr;
+        height: 1;
+        content-align: left middle;
     }
 
     #settings-cache-threshold-input {
@@ -462,10 +464,6 @@ APP_CSS = """
         margin-bottom: 1;
     }
 
-    #settings-update-card, #settings-storage-card {
-        margin-bottom: 0;
-    }
-
     .action-card-info {
         width: 1fr;
         height: 3;
@@ -484,7 +482,7 @@ APP_CSS = """
         height: 1;
     }
 
-    #settings-storage-card, #settings-danger-card {
+    #settings-about-card, #settings-storage-card, #settings-danger-card {
         padding: 1 1;
     }
 
@@ -504,21 +502,6 @@ APP_CSS = """
         content-align: center middle;
         color: __COLOR_TEXT_MUTED__;
         margin-right: 1;
-    }
-
-    .settings-chip-row {
-        height: 3;
-        margin-bottom: 1;
-    }
-
-    .settings-chip {
-        width: 1fr;
-        max-width: 44;
-        height: 3;
-        margin-right: 1;
-        padding: 0 1;
-        background: #1c1b1b;
-        content-align: left middle;
     }
 
     #settings-status {

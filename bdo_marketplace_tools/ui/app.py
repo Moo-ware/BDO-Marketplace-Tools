@@ -1415,47 +1415,47 @@ class MarketplaceToolsApp(App[None]):
             pass
 
     async def mount_settings(self, content: Container) -> None:
-        await content.mount(Static(id="settings-about", classes="settings-note"))
+        await content.mount(Static(id="settings-identity"))
 
-        await content.mount(
-            Horizontal(
-                Static(id="settings-account", classes="settings-chip"),
-                Static(id="settings-session", classes="settings-chip"),
-                classes="settings-chip-row",
-            )
+        about_card = Vertical(
+            Static(id="settings-about-facts", classes="action-card-line-tight"),
+            id="settings-about-card",
+            classes="action-card",
         )
+        await content.mount(about_card)
+        about_card.border_title = "About"
 
-        await content.mount(
-            Horizontal(
-                Static(id="settings-update", classes="action-card-info"),
-                ModalAction("Check Now", "settings-check-update", extra_classes="modal-action-compact"),
-                ModalAction("Startup: On", "settings-toggle-update-startup", extra_classes="modal-action-compact"),
-                id="settings-update-card",
-                classes="action-card",
-            )
+        update_card = Horizontal(
+            Static(id="settings-update", classes="action-card-info"),
+            ModalAction("Check Now", "settings-check-update", extra_classes="modal-action-compact"),
+            ModalAction("Startup: On", "settings-toggle-update-startup", extra_classes="modal-action-compact"),
+            id="settings-update-card",
+            classes="action-card",
         )
+        await content.mount(update_card)
+        update_card.border_title = "Updates"
 
-        await content.mount(
-            Vertical(
-                Static(id="settings-storage-facts", classes="action-card-line"),
-                Horizontal(
-                    Label("Auto-clean at", classes="cache-inline-label"),
-                    Input(
-                        value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
-                        type="integer",
-                        id="settings-cache-threshold-input",
-                        select_on_focus=False,
-                    ),
-                    Label("MiB", classes="cache-inline-label"),
-                    Static(classes="action-card-spacer"),
-                    ModalAction("Save", "settings-save-cache-limit", extra_classes="modal-action-compact"),
-                    ModalAction("Clean now", "settings-clean-cache", extra_classes="modal-action-compact"),
-                    classes="cache-controls-row",
+        storage_card = Vertical(
+            Static(id="settings-storage-facts", classes="action-card-line"),
+            Horizontal(
+                Label("Auto-clean at", classes="cache-inline-label"),
+                Input(
+                    value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
+                    type="integer",
+                    id="settings-cache-threshold-input",
+                    select_on_focus=False,
                 ),
-                id="settings-storage-card",
-                classes="action-card",
-            )
+                Label("MiB", classes="cache-inline-label"),
+                Static(classes="action-card-spacer"),
+                ModalAction("Save", "settings-save-cache-limit", extra_classes="modal-action-compact"),
+                ModalAction("Clean now", "settings-clean-cache", extra_classes="modal-action-compact"),
+                classes="cache-controls-row",
+            ),
+            id="settings-storage-card",
+            classes="action-card",
         )
+        await content.mount(storage_card)
+        storage_card.border_title = "Storage"
         await content.mount(Static("", id="settings-status"))
 
         await content.mount(
@@ -1492,58 +1492,51 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_settings_summary(self) -> None:
         try:
-            about = self.query_one("#settings-about", Static)
+            identity = self.query_one("#settings-identity", Static)
         except Exception:
             return
 
         tm = self.task_manager
-        steam_mode = tm.uses_steam_browser_session()
-        session_label, session_detail, session_level = self.session_status_state()
 
-        about_text = Text()
-        about_text.append("Marketplace Tools", style=COLOR_INFO)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(f"v{APP_VERSION} ({APP_CHANNEL})", style=COLOR_TEXT_MUTED)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(f"schema v{SETTINGS_SCHEMA_VERSION}", style=COLOR_TEXT_MUTED)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(self.launch_mode, style=COLOR_WARNING if self.is_test_mode else COLOR_TEXT_MUTED)
-        about.update(about_text)
-
-        account_value = self.status_text(
-            "Steam Account" if steam_mode else "Pearl Abyss", "steam" if steam_mode else "gold"
+        # Identity header: product name left, version right-aligned.
+        header = Table.grid(expand=True)
+        header.add_column(justify="left")
+        header.add_column(justify="right")
+        header.add_row(
+            Text("Marketplace Tools", style=f"bold {COLOR_BRAND}"),
+            Text(f"v{APP_VERSION}", style=COLOR_INFO),
         )
-        account_value.append(f" · {tm.account_mode_detail()}", style="#6f6f6f")
-        session_value = self.status_text(session_label, session_level)
-        session_value.append(f" · {session_detail}", style="#6f6f6f")
-        for chip_id, title, value_text in (
-            ("settings-account", "Account", account_value),
-            ("settings-session", "Session", session_value),
+        identity.update(header)
+
+        # About facts: the build metadata, laid out as labeled facts rather than a jargon dump.
+        facts = Text()
+        for index, (label, value, value_style) in enumerate(
+            (
+                ("channel", str(APP_CHANNEL).lower(), COLOR_INFO),
+                ("schema", str(SETTINGS_SCHEMA_VERSION), COLOR_INFO),
+                ("mode", self.launch_mode, STATUS_STYLES["warning"] if self.is_test_mode else COLOR_INFO),
+            )
         ):
-            body = Table.grid(expand=True)
-            body.add_column(justify="left")
-            body.add_row(Text(title, style="bold #8f8f8f"))
-            body.add_row(value_text)
-            try:
-                self.query_one(f"#{chip_id}", Static).update(body)
-            except Exception:
-                pass
+            if index:
+                facts.append("      ")
+            facts.append(f"{label}  ", style="#6f6f6f")
+            facts.append(value, style=value_style)
+        try:
+            self.query_one("#settings-about-facts", Static).update(facts)
+        except Exception:
+            pass
 
         update_line = Text()
-        update_line.append("Update", style=f"bold {COLOR_TEXT_MUTED}")
-        update_line.append("   ")
         if tm.available_update_version:
-            update_line.append(f"v{tm.available_update_version}", style=STATUS_STYLES["warning"])
-            update_detail = "New version available"
+            update_line.append("▲ ", style=STATUS_STYLES["warning"])
+            update_line.append(f"v{tm.available_update_version} available", style=STATUS_STYLES["warning"])
+            update_line.append(f"   ·   you have v{APP_VERSION}", style=COLOR_TEXT_MUTED)
         elif tm.update_check_completed:
             update_line.append("✓ ", style=STATUS_STYLES["success"])
             update_line.append("Up to date", style=STATUS_STYLES["success"])
-            update_detail = f"v{APP_VERSION}"
+            update_line.append(f"   ·   latest is v{APP_VERSION}", style=COLOR_TEXT_MUTED)
         else:
-            update_line.append("Unknown", style=STATUS_STYLES["info"])
-            update_detail = "Not checked yet"
-        update_line.append("   ·   ", style=COLOR_TEXT_MUTED)
-        update_line.append(update_detail, style=COLOR_TEXT_MUTED)
+            update_line.append("Not checked yet", style=COLOR_TEXT_MUTED)
         try:
             self.query_one("#settings-update", Static).update(update_line)
         except Exception:
@@ -1557,8 +1550,6 @@ class MarketplaceToolsApp(App[None]):
 
         storage = tm.browser_storage_summary()
         storage_line = Text()
-        storage_line.append("Storage", style=f"bold {COLOR_TEXT_MUTED}")
-        storage_line.append("   ")
         storage_line.append(f"{format_storage_size(storage.total_bytes)} used", style=COLOR_INFO)
         storage_line.append("   ·   ", style=COLOR_TEXT_MUTED)
         storage_line.append(
