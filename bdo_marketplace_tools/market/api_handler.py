@@ -205,18 +205,6 @@ class APIHandler:
             raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
         return data
 
-    def _extract_cookie_dict(self, response=None):
-        cookies = {}
-        cookies.update(self.session.cookies.get_dict())
-
-        if response is not None:
-            request_cookies = getattr(response.request, "_cookies", None)
-            if request_cookies is not None:
-                cookies.update(request_cookies.get_dict())
-            cookies.update(response.cookies.get_dict())
-
-        return cookies
-
     async def check_stock(self):
         url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)
@@ -296,7 +284,10 @@ class APIHandler:
         self.login_status = False
         return False
 
-    async def buy_item(self, buy_list, purchase_delay_bounds=None):
+    async def buy_item(self, buy_list, purchase_delay_bounds=None, *, on_purchase=None):
+        # on_purchase: optional synchronous observer called with each purchase_record the
+        # moment that item is secured (before the inter-buy delay). Cosmetic only — it is
+        # exception-isolated and must never influence purchasing, retries, or timing.
         url = f"{self._game_trade_url()}/GameTradeMarket/BuyItem"
         headers = self._market_headers(
             f"{self._trade_url()}/",
@@ -403,6 +394,11 @@ class APIHandler:
                     "result_code": result_code,
                 }
                 summary["purchase_records"].append(purchase_record)
+                if on_purchase is not None:
+                    try:
+                        on_purchase(purchase_record)
+                    except Exception:
+                        pass  # observer failures must never affect the purchase flow
                 summary["events"].append(
                     {
                         "level": "success",
@@ -675,14 +671,6 @@ class APIHandler:
             jar.set_cookie(requests.cookies.create_cookie(**kwargs))
 
         self.session.cookies.update(jar)
-
-    def import_browser_cookies(self, cookies):
-        new_session = self._session_from_browser_cookies(cookies)
-        if not new_session.cookies:
-            return 0
-
-        self.session = new_session
-        return len(new_session.cookies)
 
     async def validate_and_save_imported_session(self, cookies):
         previous_session = self.session

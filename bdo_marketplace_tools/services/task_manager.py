@@ -67,7 +67,7 @@ from bdo_marketplace_tools.storage.paths import (
     STEAM_MARKET_PROFILE_PATH,
     TEST_STATS_DB_PATH,
 )
-from bdo_marketplace_tools.services.event_log import EVENT_LOG_LIMIT, EventLog
+from bdo_marketplace_tools.services.event_log import EventLog
 from bdo_marketplace_tools.ui.display import (
     APP_TITLE,
     format_duration,
@@ -81,6 +81,13 @@ DEFAULT_LOCAL_DATA = stats_db.DEFAULT_LIFETIME_STATS
 _DEFAULT_STATS_PATH = object()
 _DEFAULT_LEGACY_STATS_PATH = object()
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
+DEBUG_MULTI_OUTFIT_INITIAL_LISTING = [["debug-premium-outfit-a", "2", "2020000000"]]
+DEBUG_MULTI_OUTFIT_JOINED_LISTING = [
+    ["debug-premium-outfit-a", "2", "2020000000"],
+    ["debug-premium-outfit-b", "1", "2020000000"],
+]
+DEBUG_BUNDLED_OUTFIT_LISTING = [["debug-premium-outfit", "8", "2020000000"]]
+DEBUG_BUNDLED_PURCHASE_TICK_SECONDS = 5.0
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
 # Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
 SCAN_COVERAGE_FLUSH_THRESHOLD = 12
@@ -176,6 +183,12 @@ class BackgroundTasks:
         self.session_detected_outfits = 0
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
+        # Live per-item purchase ticks for the UI celebration: bumped the moment each item
+        # in a buy list is secured (api_handler on_purchase observer), while the official
+        # session totals above still commit once per batch in record_purchase_summary.
+        # Cosmetic mirror only — never used for stats, history, or spend-cap math.
+        self.purchase_progress_count = 0
+        self.purchase_progress_silver = 0
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = False
         self.purchase_in_progress = False
@@ -616,10 +629,6 @@ class BackgroundTasks:
     def purchase_delay_range(self):
         low, high = self.purchase_delay_bounds
         return f"{self._format_seconds(low)}-{self._format_seconds(high)}s"
-
-    def recommended_delay_label(self):
-        label, (low, high) = self.delay_choices["3"]
-        return f"{label} ({low}-{high}s)"
 
     def set_custom_delay_range(self, low, high):
         low = int(low)
@@ -1102,6 +1111,15 @@ class BackgroundTasks:
         await self.process_detected_outfits(DEBUG_OUTFIT_LISTING, allow_purchase=False)
         return True
 
+    async def debug_fake_multi_outfit_detection(self):
+        if not self.test_mode_enabled:
+            return False
+
+        self._active_detection_episodes.clear()
+        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_INITIAL_LISTING, allow_purchase=False)
+        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_JOINED_LISTING, allow_purchase=False)
+        return True
+
     async def debug_simulate_purchase_success(self):
         if not self.test_mode_enabled:
             return False
@@ -1120,6 +1138,60 @@ class BackgroundTasks:
         await self.record_purchase_summary(
             self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded")
         )
+        return True
+
+    async def debug_simulate_bundled_purchase_success(self, progress_callback=None):
+        if not self.test_mode_enabled:
+            return False
+
+        self._active_detection_episodes.clear()
+        new_episode_count = await self._record_detection_history(DEBUG_BUNDLED_OUTFIT_LISTING)
+        detected_count = self._detected_outfit_count(DEBUG_BUNDLED_OUTFIT_LISTING)
+        self.session_detected_outfits += new_episode_count
+        self.add_event(
+            f"Outfit detected: {highlight(detected_count)} available outfits in one bundled buy list.",
+            "success",
+            notable=True,
+        )
+
+        adjusted_buy_list = await self.adjust_prices(DEBUG_BUNDLED_OUTFIT_LISTING)
+        item_id, stock, price = adjusted_buy_list[0]
+        purchase_records = []
+        self._sync_purchase_progress_to_committed()
+        self.purchase_in_progress = True
+        try:
+            stock_count = int(stock)
+            for index in range(stock_count):
+                record = {
+                    "item_id": item_id,
+                    "price": int(price),
+                    "count": 1,
+                    "result_code": 0,
+                }
+                purchase_records.append(record)
+                self._note_purchase_progress(record)
+                if progress_callback is not None:
+                    try:
+                        progress_callback()
+                    except Exception:
+                        pass
+                if index < stock_count - 1:
+                    await asyncio.sleep(DEBUG_BUNDLED_PURCHASE_TICK_SECONDS)
+
+            await self.record_purchase_summary(
+                {
+                    "purchase_records": purchase_records,
+                    "events": [
+                        {
+                            "level": "success",
+                            "message": f"Simulated bundled buy list succeeded for {len(purchase_records)} outfits.",
+                        }
+                    ],
+                }
+            )
+        finally:
+            self.purchase_in_progress = False
+            self._complete_pending_auth_reset_if_ready()
         return True
 
     async def debug_run_live_buy_error_probe(self):
@@ -1385,7 +1457,24 @@ class BackgroundTasks:
             ],
         }
 
+    def _note_purchase_progress(self, purchase_record):
+        # Synchronous, exception-isolated observer invoked from the buy loop per secured
+        # item. Plain integer bumps only — the buy path's timing is untouched. Both values
+        # compute before either counter moves, so a malformed record is an atomic no-op.
+        try:
+            count = purchase_record_count([purchase_record])
+            silver = purchase_record_spend([purchase_record])
+        except Exception:
+            return
+        self.purchase_progress_count += count
+        self.purchase_progress_silver += silver
+
+    def _sync_purchase_progress_to_committed(self):
+        self.purchase_progress_count = max(self.purchase_progress_count, self.session_successful_purchases)
+        self.purchase_progress_silver = max(self.purchase_progress_silver, self.session_silver_spent)
+
     async def buy_item(self, buy_list, adjust_pricing=True):
+        self._sync_purchase_progress_to_committed()
         self.purchase_in_progress = True
         if adjust_pricing:
             updated_buy_list = await self.adjust_prices(buy_list)
@@ -1399,13 +1488,17 @@ class BackgroundTasks:
                 return
 
             if self.simulated_session_enabled:
-                await self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
+                simulated_summary = self._simulated_purchase_summary(capped_buy_list)
+                for record in simulated_summary.get("purchase_records", []):
+                    self._note_purchase_progress(record)
+                await self.record_purchase_summary(simulated_summary)
                 return
 
             try:
                 summary = await self.api_handler.buy_item(
                     capped_buy_list,
                     purchase_delay_bounds=self.purchase_delay_bounds,
+                    on_purchase=self._note_purchase_progress,
                 )
             except MarketplaceAPIError as exc:
                 if not self.uses_steam_browser_session() and self._requires_browser_verification(exc):
@@ -1424,6 +1517,7 @@ class BackgroundTasks:
                         summary = await self.api_handler.buy_item(
                             capped_buy_list,
                             purchase_delay_bounds=self.purchase_delay_bounds,
+                            on_purchase=self._note_purchase_progress,
                         )
                     except MarketplaceAPIError as exc:
                         if self._requires_browser_verification(exc):
@@ -1440,6 +1534,7 @@ class BackgroundTasks:
                         summary = await self.api_handler.buy_item(
                             capped_buy_list,
                             purchase_delay_bounds=self.purchase_delay_bounds,
+                            on_purchase=self._note_purchase_progress,
                         )
                     except MarketplaceAPIError as exc:
                         self.add_event(f"Purchase retry failed: {exc}", "error")

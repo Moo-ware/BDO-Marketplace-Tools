@@ -100,7 +100,23 @@ APP_CSS = """
         height: auto;
         border: round #3a3a3a;
         padding: 0 1;
-        margin: 1 0;
+        margin: 0 0 1 0;
+    }
+
+    #greeting-row {
+        height: 1;
+        margin-top: 1;
+        layers: base badges;
+    }
+
+    #buy-badges {
+        /* Auto-width overlay docked to the right of the chatter's own row. Because it is
+           auto-width (not full-width) on a higher layer, it only covers the empty right
+           cells — never the centered chatter — so buys never shift the chatter. */
+        width: auto;
+        dock: right;
+        layer: badges;
+        color: __COLOR_BRAND__;
     }
 
     #banner {
@@ -112,7 +128,9 @@ APP_CSS = """
     }
 
     #welcome-greeting {
+        width: 100%;
         height: 1;
+        layer: base;
         color: __COLOR_TEXT_MUTED__;
         content-align: center middle;
         text-align: center;
@@ -125,7 +143,7 @@ APP_CSS = """
         border-top: solid #2b2b2b;
     }
 
-    #welcome-card.-compact #welcome-greeting {
+    #welcome-card.-compact #greeting-row {
         display: none;
     }
 
@@ -173,22 +191,8 @@ APP_CSS = """
         content-align: right middle;
     }
 
-    .screen-heading {
-        text-style: bold;
-        color: __COLOR_BRAND__;
-        margin-bottom: 1;
-    }
-
     .panel {
         border: round #3a3a3a;
-        padding: 1;
-        margin-bottom: 1;
-    }
-
-    .settings-panel {
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
         padding: 1;
         margin-bottom: 1;
     }
@@ -402,7 +406,6 @@ APP_CSS = """
         text-style: bold;
     }
 
-    #stats-actions,
     #wallet-actions {
         height: auto;
         margin-bottom: 1;
@@ -516,12 +519,6 @@ APP_CSS = """
         padding: 0 1;
         background: #1c1b1b;
         content-align: left middle;
-    }
-
-    .settings-section-title {
-        color: __COLOR_BRAND__;
-        text-style: bold;
-        margin-bottom: 1;
     }
 
     #settings-status {

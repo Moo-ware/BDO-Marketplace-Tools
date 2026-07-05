@@ -33,7 +33,7 @@ class DailyActivityChart(Static):
             return None
         row = self._daily[index]
         day = row.get("day")
-        day_label = day.strftime("%b %d, %Y") if hasattr(day, "strftime") else str(day)
+        day_label = day.strftime("%b %d, %Y (%a)") if hasattr(day, "strftime") else str(day)
         detected = int(row.get("detected") or 0)
         purchased = int(row.get("purchased") or 0)
         scans = int(row.get("scans") or 0)
@@ -228,5 +228,4 @@ class CredentialActionTile(Static):
 
 
 SteamSetupTile = CredentialActionTile
-
 

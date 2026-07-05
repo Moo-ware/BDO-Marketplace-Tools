@@ -113,6 +113,7 @@ from bdo_marketplace_tools.ui.display import COLOR_EVENT_ROUTINE
 from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
     BANNER_BLINK_ART,
+    BANNER_STAR_ART,
     DEFAULT_THEME,
     MASCOT_ZZZ_TRAIL,
     RUNNING_QUIPS,
@@ -3978,6 +3979,50 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("silver", summary["events"][0]["message"])
         self.assertIn("bid up to 82,500", summary["events"][0]["message"])
 
+    async def test_buy_item_notifies_observer_per_item_and_isolates_observer_failures(self):
+        def make_handler():
+            handler = object.__new__(APIHandler)
+
+            async def valid_session():
+                return True
+
+            class FakeResponse:
+                def json(self):
+                    return {"resultCode": 0, "resultMsg": "10007-0-1-82500-1-79000-0-0-0-False"}
+
+            async def fake_session_request(*args, **kwargs):
+                return FakeResponse()
+
+            handler.ensure_session_valid = valid_session
+            handler._session_request = fake_session_request
+            handler._json_response = APIHandler._json_response.__get__(handler, APIHandler)
+            handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
+            handler._purchase_result_details = APIHandler._purchase_result_details.__get__(handler, APIHandler)
+            handler._optional_positive_int = APIHandler._optional_positive_int.__get__(handler, APIHandler)
+            return handler
+
+        # The observer fires once per secured item (stock 2 -> two attempts -> two calls).
+        seen = []
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()):
+            summary = await APIHandler.buy_item(
+                make_handler(), [["10007", "2", "82500"]], on_purchase=seen.append
+            )
+        self.assertEqual(summary["purchased"], 2)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0]["price"], 79000)
+        self.assertEqual(seen[0]["count"], 1)
+
+        # A broken observer never affects the purchase flow: same summary, no exception.
+        def broken(_record):
+            raise RuntimeError("observer boom")
+
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()):
+            summary = await APIHandler.buy_item(
+                make_handler(), [["10007", "2", "82500"]], on_purchase=broken
+            )
+        self.assertEqual(summary["purchased"], 2)
+        self.assertEqual(len(summary["purchase_records"]), 2)
+
     async def test_buy_item_result_code_zero_preorder_does_not_count_as_purchase(self):
         handler = object.__new__(APIHandler)
 
@@ -4542,6 +4587,36 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.add_event("Monitor stopped after an unexpected error.", "error")
         self.assertTrue(manager.has_unseen_alerts())
 
+    async def test_buy_flow_ticks_per_item_purchase_progress(self):
+        manager = self.make_task_manager()
+        manager.simulated_session_enabled = True
+
+        await manager.buy_item([["outfit-a", "2", "100"]], adjust_pricing=False)
+
+        # Live progress ticks mirror the committed totals (per item on the live path,
+        # per record on the simulated one) — cosmetic only, never used for stats.
+        self.assertEqual(manager.purchase_progress_count, 2)
+        self.assertEqual(manager.purchase_progress_silver, 200)
+        self.assertEqual(manager.session_successful_purchases, 2)
+        self.assertEqual(manager.session_silver_spent, 200)
+
+        # The observer itself is exception-proof even with a malformed record.
+        manager._note_purchase_progress({"unexpected": "shape"})
+        self.assertEqual(manager.purchase_progress_count, 2)
+
+    async def test_purchase_progress_syncs_to_committed_before_ticked_batch(self):
+        manager = self.make_task_manager()
+        manager.simulated_session_enabled = True
+        manager.session_successful_purchases = 1
+        manager.session_silver_spent = 50
+
+        await manager.buy_item([["outfit-a", "2", "100"]], adjust_pricing=False)
+
+        self.assertEqual(manager.purchase_progress_count, 3)
+        self.assertEqual(manager.purchase_progress_silver, 250)
+        self.assertEqual(manager.session_successful_purchases, 3)
+        self.assertEqual(manager.session_silver_spent, 250)
+
     async def test_spend_cap_limits_items_by_price_order(self):
         manager = self.make_task_manager()
         manager.max_spend = 250
@@ -4625,7 +4700,9 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await manager.start_single_item_test_checker())
         self.assertIsNone(manager.single_item_test_checker_task)
         self.assertFalse(await manager.debug_fake_outfit_detection())
+        self.assertFalse(await manager.debug_fake_multi_outfit_detection())
         self.assertFalse(await manager.debug_simulate_purchase_success())
+        self.assertFalse(await manager.debug_simulate_bundled_purchase_success())
         self.assertFalse(manager.set_simulated_session(True))
         self.assertFalse(manager.simulated_session_enabled)
         self.assertFalse(manager.api_handler.login_status)
@@ -4687,6 +4764,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once_with(
             [["10007", "2", "92500"]],
             purchase_delay_bounds=DEFAULT_PURCHASE_DELAY_BOUNDS,
+            on_purchase=manager._note_purchase_progress,
         )
         self.assertEqual(manager.session_detected_outfits, 2)
         self.assertEqual(manager.session_successful_purchases, 2)
@@ -4714,6 +4792,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once_with(
             [["15280", "1", "2900000000"]],
             purchase_delay_bounds=DEFAULT_PURCHASE_DELAY_BOUNDS,
+            on_purchase=manager._note_purchase_progress,
         )
         self.assertTrue(any("Live buy error probe submitting item 15280" in event for event in manager.events))
         self.assertTrue(any("Live buy probe detected: 1 available live buy probe" in event for event in manager.events))
@@ -4745,6 +4824,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once_with(
             [["10007", "1", "82500"]],
             purchase_delay_bounds=DEFAULT_PURCHASE_DELAY_BOUNDS,
+            on_purchase=manager._note_purchase_progress,
         )
         self.assertFalse(any("Fallback pricing applied" in event for event in manager.events))
 
@@ -4760,6 +4840,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once_with(
             [["10007", "1", "82500"]],
             purchase_delay_bounds=(4.5, 8.0),
+            on_purchase=manager._note_purchase_progress,
         )
 
         with self.assertRaises(ValueError):
@@ -4819,6 +4900,33 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.session_successful_purchases, 1)
         self.assertEqual(manager.lifetime_successful_purchases, 1)
         self.assertGreater(manager.session_silver_spent, 0)
+        save_mock.assert_awaited_once()
+
+    async def test_fake_bundled_purchase_ticks_eight_items_without_live_api(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        progress_callback = Mock()
+        expected_spend = 8 * int(PREMIUM_OUTFIT_MAX_PRICE)
+
+        with patch.object(manager, "save_local_data") as save_mock, patch(
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await manager.debug_simulate_bundled_purchase_success(
+                progress_callback=progress_callback
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(manager.session_detected_outfits, 8)
+        self.assertEqual(manager.purchase_progress_count, 8)
+        self.assertEqual(manager.purchase_progress_silver, expected_spend)
+        self.assertEqual(manager.session_successful_purchases, 8)
+        self.assertEqual(manager.session_silver_spent, expected_spend)
+        self.assertFalse(manager.purchase_in_progress)
+        self.assertEqual(progress_callback.call_count, 8)
+        self.assertEqual(sleep_mock.await_count, 7)
+        self.assertEqual([args.args[0] for args in sleep_mock.await_args_list], [5.0] * 7)
+        self.assertIsNone(getattr(manager.api_handler, "buy_item", None))
+        self.assertTrue(any("one bundled buy list" in event for event in manager.events))
         save_mock.assert_awaited_once()
 
     async def test_simulated_session_buy_mode_does_not_call_purchase_api(self):
@@ -6544,7 +6652,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(load_trends_mock.call_args_list[0].args[0], 30)
                 daily_chart = app.query_one("#stats-chart-daily", DailyActivityChart)
                 first_tooltip = daily_chart.tooltip_for_day(0)
-                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y"), first_tooltip)
+                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y (%a)"), first_tooltip)
                 self.assertIn("Detected: 1", first_tooltip)
                 self.assertIn("Purchased: 1", first_tooltip)
                 self.assertIn("Scans: 10", first_tooltip)
@@ -6588,7 +6696,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 tooltip = app.query_one("#textual-tooltip", Tooltip)
                 self.assertTrue(tooltip.display)
-                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y"), str(tooltip.render()))
+                self.assertIn((date.today() - timedelta(days=29)).strftime("%b %d, %Y (%a)"), str(tooltip.render()))
 
     def test_daily_axis_labels_mark_month_changes(self):
         # A month boundary that falls between the 5-day ticks must still be labelled.
@@ -6737,6 +6845,227 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.3)
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
 
+                app.task_manager.checker_enabled = False
+
+    async def test_mascot_flashes_star_eyes_on_successful_buy(self):
+        app = self.make_app()
+        app.task_manager.session_successful_purchases = 2  # a pre-existing (loaded) count
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.animations_enabled = True
+                await pilot.pause()
+                # A count present at load is adopted as the baseline — no reaction fires.
+                self.assertEqual(app._celebrated_purchases, 2)
+                self.assertFalse(app._mascot_celebrating)
+
+                # A genuine new buy flashes the star-eyes frame.
+                app.task_manager.session_successful_purchases = 3
+                app.refresh_live_widgets()
+                await pilot.pause()
+                self.assertTrue(app._mascot_celebrating)
+                self.assertEqual(app.query_one("#banner", Static).render(), BANNER_STAR_ART)
+
+                # The celebration reverts the mascot to its rest frame.
+                app._end_mascot_celebrate()
+                self.assertFalse(app._mascot_celebrating)
+                self.assertNotEqual(app.query_one("#banner", Static).render(), BANNER_STAR_ART)
+
+    async def test_buy_badges_pin_right_of_chatter_row_without_shifting_it(self):
+        app = self.make_app()  # animations off: badges render from the count regardless
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                # No buys: the chatter carries no badges and the overlay is empty.
+                greeting = str(app.query_one("#welcome-greeting", Static).render())
+                self.assertNotIn("✦", greeting)
+                self.assertEqual(str(app.query_one("#buy-badges", Static).render()).strip(), "")
+                chatter_region = app.query_one("#welcome-greeting").region
+                card_bottom = app.query_one("#welcome-card").region.bottom
+                footer_present = app.query_one("#welcome-footer").region.height > 0
+
+                # Buys populate the overlay, NOT the chatter text, and the chatter never
+                # moves — its region is byte-identical with and without badges.
+                app.task_manager.session_successful_purchases = 3
+                app.refresh_live_widgets()
+                await pilot.pause()
+                self.assertNotIn("✦", str(app.query_one("#welcome-greeting", Static).render()))
+                badges = app.query_one("#buy-badges")
+                self.assertEqual(str(badges.render()).count("✦"), 3)
+                self.assertEqual(app.query_one("#welcome-greeting").region, chatter_region)
+                # Same row as the chatter, right-aligned — and the footer below is untouched.
+                self.assertEqual(badges.region.y, chatter_region.y)
+                self.assertEqual(badges.region.right, chatter_region.right)
+                self.assertLess(badges.region.bottom, card_bottom - 1)  # above the footer
+                self.assertTrue(footer_present and app.query_one("#welcome-footer").region.height > 0)
+
+                # Past the cap it collapses to a compact count; zero buys renders nothing.
+                app.task_manager.session_successful_purchases = 15
+                self.assertEqual(str(app.render_buy_badges()), "✦ ×15")
+                app.task_manager.session_successful_purchases = 0
+                self.assertIsNone(app.render_buy_badges())
+
+    async def test_purchase_strip_set_piece_shows_price_and_rolls(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.animations_enabled = True
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()  # baseline: 0 buys, no reaction
+                await pilot.pause()
+                self.assertFalse(app._footer_celebrating)
+
+                # A buy lands: the set piece takes over the strip immediately. The call
+                # returns at once (non-blocking) — it never waits on the buy loop.
+                app.task_manager.session_successful_purchases = 1
+                app.task_manager.session_silver_spent = 890_000_000
+                app.refresh_live_widgets()
+                self.assertTrue(app._footer_celebrating)
+                self.assertIn("BOUGHT", str(app.query_one("#welcome-footer", Static).render()))
+
+                # Frame 2 names the count and the batch price.
+                app._show_strip_coins()
+                coins = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("1 outfit secured", coins)
+                self.assertIn("890,000,000", coins)
+
+                # Drive the count-up to its end; the final spent value holds briefly before
+                # the strip settles back to the live stats.
+                with patch.object(app, "set_timer", wraps=app.set_timer) as timer_spy:
+                    app._roll_step = app.STRIP_ROLL_STEPS
+                    app._advance_strip_rollup()
+                timer_spy.assert_any_call(app.STRIP_ROLL_SETTLE_SECONDS, app._end_strip_celebration)
+                self.assertTrue(app._footer_celebrating)
+                self.assertIn("spent", str(app.query_one("#welcome-footer", Static).render()))
+                app._end_strip_celebration()
+                self.assertFalse(app._footer_celebrating)
+                footer = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("Running", footer)
+                self.assertIn("890M", footer)
+                app.task_manager.checker_enabled = False
+
+    async def test_purchase_strip_set_piece_folds_in_buys_mid_animation(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)):
+                app.animations_enabled = True
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+
+                # First buy starts the set piece.
+                app.task_manager.session_successful_purchases = 1
+                app.task_manager.session_silver_spent = 900_000_000
+                app.refresh_live_widgets()
+                self.assertTrue(app._footer_celebrating)
+
+                # A second buy lands before it finishes — the frames read the live totals,
+                # so the coins frame re-renders with the folded count and batch silver.
+                app.task_manager.session_successful_purchases = 2
+                app.task_manager.session_silver_spent = 1_800_000_000
+                app.refresh_live_widgets()
+                self.assertTrue(app._footer_celebrating)
+                app._render_strip_coins()
+                coins = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("2 outfits secured", coins)
+                self.assertIn("1,800,000,000", coins)
+
+                # The roll ends on the latest total, not the stale one — and the fold never
+                # fires a second celebration after settle.
+                app._roll_step = app.STRIP_ROLL_STEPS
+                app._advance_strip_rollup()
+                self.assertTrue(app._footer_celebrating)
+                app._end_strip_celebration()
+                self.assertFalse(app._footer_celebrating)
+                self.assertIn("1.8B", str(app.query_one("#welcome-footer", Static).render()))
+                app.refresh_live_widgets()
+                self.assertFalse(app._footer_celebrating)
+                app.task_manager.checker_enabled = False
+
+    async def test_purchase_strip_coins_frame_holds_and_ticks_through_a_buy_list(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)):
+                app.animations_enabled = True
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+
+                # Item 1 of a 3-item buy list is secured: the per-item tick starts the set
+                # piece while the batch is still in progress.
+                app.task_manager.purchase_in_progress = True
+                app.task_manager.purchase_progress_count = 1
+                app.task_manager.purchase_progress_silver = 900_000_000
+                app.refresh_live_widgets()
+                self.assertTrue(app._footer_celebrating)
+
+                # The coins frame holds while the buy list is processing...
+                app._show_strip_coins()
+                for _ in range(app.STRIP_COINS_MIN_TICKS + 2):
+                    app._advance_strip_coins()
+                self.assertTrue(app._footer_celebrating)
+                self.assertIn("1 outfit secured", str(app.query_one("#welcome-footer", Static).render()))
+
+                # ...and live-updates as each further item is secured.
+                app.task_manager.purchase_progress_count = 3
+                app.task_manager.purchase_progress_silver = 2_700_000_000
+                app._advance_strip_coins()
+                coins = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("3 outfits secured", coins)
+                self.assertIn("2,700,000,000", coins)
+
+                # Batch done (stats committed): the frame releases into the count-up.
+                app.task_manager.purchase_in_progress = False
+                app.task_manager.session_successful_purchases = 3
+                app.task_manager.session_silver_spent = 2_700_000_000
+                app._advance_strip_coins()
+                self.assertIn("spent", str(app.query_one("#welcome-footer", Static).render()))
+
+                app._roll_step = app.STRIP_ROLL_STEPS
+                app._advance_strip_rollup()
+                self.assertTrue(app._footer_celebrating)
+                app._end_strip_celebration()
+                self.assertFalse(app._footer_celebrating)
+                # Settle baselines both signals: no re-fire on the next poll.
+                app.refresh_live_widgets()
+                self.assertFalse(app._footer_celebrating)
+                self.assertIn("2.7B", str(app.query_one("#welcome-footer", Static).render()))
+                app.task_manager.checker_enabled = False
+
+    async def test_purchase_strip_set_piece_fires_on_test_buy_while_idle(self):
+        # "Fake Buy Success" simulates a buy without the monitor running — the set piece
+        # must still play (it isn't gated on monitor_running), so test buys preview it.
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.animations_enabled = True
+                app.refresh_live_widgets()  # baseline, monitor idle
+                await pilot.pause()
+                self.assertFalse(app.task_manager.monitor_running())
+
+                app.task_manager.session_successful_purchases = 1
+                app.task_manager.session_silver_spent = 890_000_000
+                app.refresh_live_widgets()
+                self.assertTrue(app._footer_celebrating)
+                self.assertIn("BOUGHT", str(app.query_one("#welcome-footer", Static).render()))
+
+                # Settles back to the idle strip (lifetime record), not a crash.
+                app._roll_step = app.STRIP_ROLL_STEPS
+                app._advance_strip_rollup()
+                self.assertTrue(app._footer_celebrating)
+                app._end_strip_celebration()
+                self.assertFalse(app._footer_celebrating)
+                self.assertIn("all-time", str(app.query_one("#welcome-footer", Static).render()))
+
+    async def test_purchase_strip_set_piece_skipped_without_animations(self):
+        app = self.make_app()  # animations off
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(120, 40)):
+                app.task_manager.checker_enabled = True
+                app.refresh_live_widgets()
+                app.task_manager.session_successful_purchases = 1
+                app.task_manager.session_silver_spent = 890_000_000
+                app.refresh_live_widgets()
+                # No set piece; the strip renders the live stats directly.
+                self.assertFalse(app._footer_celebrating)
+                self.assertNotIn("BOUGHT", str(app.query_one("#welcome-footer", Static).render()))
                 app.task_manager.checker_enabled = False
 
     async def test_dashboard_content_remains_scrollable(self):
@@ -7096,6 +7425,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 await pilot.click("#tile-monitor")
                 await pilot.pause()
+                await pilot.pause(0.05)  # let the modal screen finish mounting under load
                 monitor_note = str(app.query_visible_one(".modal-note", Static).render())
                 self.assertIn("online marketplace session", monitor_note)
                 self.assertIn("refresh Session from the dashboard", monitor_note)
@@ -7645,7 +7975,9 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(test_app.query("#live-buy-error-probe"))), 1)
                 self.assertEqual(len(list(test_app.query("#stop-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-detection"))), 1)
+                self.assertEqual(len(list(test_app.query("#fake-multi-detection"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-buy-success"))), 1)
+                self.assertEqual(len(list(test_app.query("#fake-bundled-buy"))), 1)
 
     async def test_reauthentication_debug_buttons_call_test_hooks(self):
         app = self.make_app(launch_mode="test")
@@ -7948,6 +8280,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#fake-detection")
+                await pilot.pause()  # let the async detection worker finish
 
         app.task_manager.buy_item.assert_not_called()
         self.assertEqual(app.task_manager.session_detected_outfits, 1)
@@ -7967,6 +8300,79 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.task_manager.session_detected_outfits, 1)
         self.assertEqual(app.task_manager.session_successful_purchases, 1)
         self.assertGreater(app.task_manager.session_silver_spent, 0)
+        save_mock.assert_awaited_once()
+
+    async def test_fake_bundled_buy_button_runs_eight_item_debug_bundle(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.api_handler.buy_item = AsyncMock()
+        with patch.object(app.task_manager, "save_local_data") as save_mock, patch(
+            "bdo_marketplace_tools.services.task_manager.DEBUG_BUNDLED_PURCHASE_TICK_SECONDS",
+            0.0,
+        ), patch(
+            "bdo_marketplace_tools.ui.app.load_credentials",
+            return_value=(None, None),
+        ):
+            async with app.run_test(size=(100, 42)) as pilot:
+                app.query_one("#fake-bundled-buy").scroll_visible(animate=False)
+                await pilot.pause()
+                await pilot.click("#fake-bundled-buy")
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if app.task_manager.session_successful_purchases == 8:
+                        break
+
+        app.task_manager.api_handler.buy_item.assert_not_called()
+        self.assertEqual(app.task_manager.session_detected_outfits, 8)
+        self.assertEqual(app.task_manager.purchase_progress_count, 8)
+        self.assertEqual(app.task_manager.session_successful_purchases, 8)
+        self.assertFalse(app.task_manager.purchase_in_progress)
+        self.assertIn("8 outfits", app.status_message)
+        save_mock.assert_awaited_once()
+
+    async def test_fake_bundled_buy_button_runs_in_background_and_live_ticks(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.api_handler.buy_item = AsyncMock()
+        with patch.object(app.task_manager, "save_local_data") as save_mock, patch(
+            "bdo_marketplace_tools.services.task_manager.DEBUG_BUNDLED_PURCHASE_TICK_SECONDS",
+            0.25,
+        ), patch(
+            "bdo_marketplace_tools.ui.app.load_credentials",
+            return_value=(None, None),
+        ):
+            async with app.run_test(size=(120, 42)) as pilot:
+                app.animations_enabled = True
+                app.refresh_live_widgets()
+                app.query_one("#fake-bundled-buy").scroll_visible(animate=False)
+                await pilot.pause()
+                await pilot.click("#fake-bundled-buy")
+
+                for _ in range(20):
+                    await pilot.pause(0.02)
+                    if app.task_manager.purchase_progress_count >= 1:
+                        break
+
+                self.assertTrue(app.task_manager.purchase_in_progress)
+                self.assertEqual(app.task_manager.purchase_progress_count, 1)
+                self.assertEqual(app.task_manager.session_successful_purchases, 0)
+                self.assertIn("running", app.status_message)
+
+                app._show_strip_coins()
+                footer = str(app.query_one("#welcome-footer", Static).render())
+                self.assertIn("1 outfit secured", footer)
+                self.assertNotIn("8 outfits secured", footer)
+
+                for _ in range(120):
+                    await pilot.pause(0.03)
+                    if (
+                        not app.task_manager.purchase_in_progress
+                        and app.task_manager.session_successful_purchases == 8
+                    ):
+                        break
+
+        app.task_manager.api_handler.buy_item.assert_not_called()
+        self.assertEqual(app.task_manager.purchase_progress_count, 8)
+        self.assertEqual(app.task_manager.session_successful_purchases, 8)
+        self.assertFalse(app.task_manager.purchase_in_progress)
         save_mock.assert_awaited_once()
 
     async def test_test_mode_fake_stats_write_to_test_stats_db(self):

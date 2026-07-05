@@ -433,10 +433,6 @@ def save_buy_mode(enabled):
     return save_ui_settings(ui)["buy_mode"]
 
 
-def load_update_settings():
-    return read_app_settings()["updates"]
-
-
 def load_update_check_on_startup():
     return read_app_settings()["updates"]["check_on_startup"]
 

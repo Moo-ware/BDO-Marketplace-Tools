@@ -27,7 +27,6 @@ from bdo_marketplace_tools.ui.display import (
     COLOR_ERROR,
     COLOR_GOLD,
     COLOR_INFO,
-    COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
     format_compact_number,
@@ -54,6 +53,7 @@ from bdo_marketplace_tools.ui.styles import APP_CSS
 from bdo_marketplace_tools.ui.theme import (
     BANNER_ART,
     BANNER_BLINK_ART,
+    BANNER_STAR_ART,
     DEFAULT_THEME,
     IDLE_DOT,
     MASCOT_ZZZ_TRAIL,
@@ -142,6 +142,24 @@ class MarketplaceToolsApp(App[None]):
         self._pulse_index = 0
         self._quip_index = 0
         self._mascot_blinking = False
+        self._mascot_celebrating = False
+        # Easter egg: the mascot flashes star-eyes when a buy lands, and a ✦ badge joins its
+        # chatter line per session buy. None means "not yet baselined" — the first refresh
+        # adopts the current count so a loaded/seeded total never fires the flash; only a
+        # genuine increase does.
+        self._celebrated_purchases = None
+        # Strip set piece (footer flash -> coins+price -> spent count-up) on a buy. Rides the
+        # same trigger as the mascot star-eyes; its own flag keeps the 1s footer refresh from
+        # stomping the frames. The frames read the live purchase-progress ticks, so the coins
+        # frame holds and counts up while a buy list is still being processed, and buys that
+        # land mid-animation fold in automatically.
+        self._footer_celebrating = False
+        self._reward_spent = 0
+        self._roll_from = 0
+        self._roll_to = 0
+        self._roll_step = 0
+        self._celebration_from_count = 0
+        self._coins_ticks = 0
         self._zzz_step = 0
         self._zzz_gap = 0
         self._idle_peek_countdown = 1
@@ -161,7 +179,12 @@ class MarketplaceToolsApp(App[None]):
         with Vertical(id="main"):
             with Vertical(id="welcome-card"):
                 yield Static(BANNER_ART, id="banner")
-                yield Static("", id="welcome-greeting")
+                # Chatter and the ✦ tally share one row: the chatter is a full-width centered
+                # Static, and the badges are an auto-width overlay docked to that row's right
+                # edge — so buys never nudge the centered chatter.
+                with Horizontal(id="greeting-row"):
+                    yield Static("", id="welcome-greeting")
+                    yield Static("", id="buy-badges")
                 yield Static("", id="welcome-footer")
             if self.is_test_mode:
                 with Horizontal(id="body"):
@@ -181,7 +204,9 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Live 2.9B Buy", id="live-buy-error-probe", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
                         yield Button("Fake Detection", id="fake-detection", compact=True)
+                        yield Button("Fake Multi Detect", id="fake-multi-detection", compact=True)
                         yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
+                        yield Button("Fake Bundle x8", id="fake-bundled-buy", compact=True)
             else:
                 yield Container(id="content")
         with Horizontal(id="statusbar"):
@@ -417,14 +442,6 @@ class MarketplaceToolsApp(App[None]):
             return "Password Needed", mask_email(email), "warning", email, password
         return "Not Set", "No account configured", "error", email, password
 
-    def delay_options(self) -> list[tuple[str, str]]:
-        options = [
-            (f"{label} ({low}-{high}s)", key)
-            for key, (label, (low, high)) in self.task_manager.delay_choices.items()
-        ]
-        options.append((f"Custom ({self.task_manager.current_delay_range()})", "custom"))
-        return options
-
     def session_status_state(self) -> tuple[str, str, str]:
         if self.is_simulated_session:
             return "TEST", "Simulated auth", "warning"
@@ -585,42 +602,6 @@ class MarketplaceToolsApp(App[None]):
             body.add_row(value_text, Text(""))
         return body
 
-    def status_table(self, snapshot: tuple[str, ...] | None = None) -> Group:
-        snapshot = snapshot or self.dashboard_snapshot()
-        (
-            credential_status,
-            credential_detail,
-            credential_level,
-            login_status,
-            _monitor_status,
-            _mode,
-            delay_label,
-            delay_range,
-            purchase_delay_range,
-            _purchase_rate,
-            _purchase_detail,
-            _silver_spent,
-            _spend_detail,
-            _runtime,
-        ) = snapshot
-
-        details = Table.grid(expand=True)
-        details.add_column("Label", style="bold", no_wrap=True, width=13)
-        details.add_column("Arrow", style="dim", no_wrap=True, width=3)
-        details.add_column("Value", no_wrap=True, width=20)
-        details.add_column("Detail", style="dim", no_wrap=True, overflow="ellipsis")
-        details.add_row("Credentials", "->", self.status_text(credential_status, credential_level), credential_detail)
-        details.add_row(
-            "Session",
-            "->",
-            self.status_text(login_status, self.session_status_state()[2]),
-            self.session_status_state()[1],
-        )
-        details.add_row("Polling", "->", self.status_text(delay_label, "info", show_dot=False), delay_range)
-        details.add_row("Buy Delay", "->", self.status_text(purchase_delay_range, "info", show_dot=False), "Between buys")
-
-        return Group(details)
-
     def purchase_rate_style(self, bought: int | None = None, detected: int | None = None) -> str:
         # Continuous red->green ramp so the rate color climbs smoothly with the hit rate.
         if detected is None:
@@ -716,9 +697,178 @@ class MarketplaceToolsApp(App[None]):
             card.set_class(not self.should_show_banner(), "-compact")
             self.query_one("#banner", Static).display = self.should_show_banner()
             self.refresh_mascot_rest()
+            self.sync_purchase_reward()
         except Exception:
             pass
         self.refresh_welcome_footer(running)
+
+    def observed_purchase_totals(self) -> tuple[int, int]:
+        # Live view of session buys: per-item progress ticks lead during a buy list; the
+        # committed session totals catch up (and cover paths that never tick, like Fake Buy
+        # Success). max() of the two is monotonic within a session, so nothing fires twice.
+        tm = self.task_manager
+        return (
+            max(tm.session_successful_purchases, tm.purchase_progress_count),
+            max(tm.session_silver_spent, tm.purchase_progress_silver),
+        )
+
+    def sync_purchase_reward(self) -> None:
+        # Watches the observed buy totals; on a genuine increase the mascot flashes
+        # star-eyes and the strip plays its set piece. The ✦ tally is a bottom-right overlay.
+        count, spent = self.observed_purchase_totals()
+        if self._celebrated_purchases is None or count < self._celebrated_purchases:
+            # Baseline / session reset — adopt the totals silently, no reaction.
+            self._celebrated_purchases = count
+            self._reward_spent = spent
+        elif count > self._celebrated_purchases:
+            gained = count - self._celebrated_purchases
+            roll_from = self._reward_spent
+            self._celebrated_purchases = count
+            self._reward_spent = spent
+            self.celebrate_purchase()
+            self.celebrate_purchase_strip(gained, roll_from, spent)
+        try:
+            badges = self.render_buy_badges()
+            self.query_one("#buy-badges", Static).update(badges if badges is not None else Text(""))
+        except Exception:
+            pass
+
+    def celebrate_purchase(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        try:
+            banner = self.query_one("#banner", Static)
+        except Exception:
+            return
+        if not banner.display:
+            return
+        self._mascot_celebrating = True
+        banner.update(BANNER_STAR_ART)
+        self.set_timer(1.2, self._end_mascot_celebrate)
+
+    def _end_mascot_celebrate(self) -> None:
+        self._mascot_celebrating = False
+        try:
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
+        except Exception:
+            pass
+
+    # ── Strip set piece: flash -> coins+price -> spent count-up, on a buy ────────────
+    STRIP_FLASH_SECONDS = 0.9
+    STRIP_COINS_TICK = 0.2  # coins-frame refresh cadence while it live-counts the batch
+    STRIP_COINS_MIN_TICKS = 6  # minimum coins-frame time (~1.2s) even for a single instant buy
+    STRIP_ROLL_STEPS = 12
+    STRIP_ROLL_INTERVAL = 0.12  # ~1.4s of count-up so the roll reads, not flickers
+    STRIP_ROLL_SETTLE_SECONDS = 1.5  # hold the final spent value before restoring the live strip
+
+    def celebrate_purchase_strip(self, gained: int, roll_from: int, roll_to: int) -> None:
+        # Cosmetic and UI-thread only — the buy loop never waits on this. Fires whenever the
+        # mascot does (any buy: live, Start Test Buy, or Fake Buy Success), so it isn't gated
+        # on the monitor running; it just settles to whichever strip (running/idle) is current.
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if self._footer_celebrating:
+            # Frames render from the live observed totals, so a buy landing mid-animation
+            # folds in on the next frame tick — nothing to restart or retarget by hand.
+            return
+        observed_count, _observed_spent = self.observed_purchase_totals()
+        self._roll_from = roll_from
+        self._celebration_from_count = observed_count - max(1, gained)
+        self._footer_celebrating = True
+        self._show_strip_flash()
+
+    def _set_strip(self, footer: Text) -> None:
+        try:
+            self.query_one("#welcome-greeting", Static).update(Text("Nice grab!", style=f"bold {COLOR_GOLD}"))
+            self.query_one("#welcome-footer", Static).update(footer)
+        except Exception:
+            pass
+
+    def _show_strip_flash(self) -> None:
+        self._set_strip(Text("✦ ✦ ✦   BOUGHT   ✦ ✦ ✦", style=f"bold {COLOR_GOLD}"))
+        self.set_timer(self.STRIP_FLASH_SECONDS, self._show_strip_coins)
+
+    def _render_strip_coins(self) -> None:
+        observed_count, observed_spent = self.observed_purchase_totals()
+        gained = max(1, observed_count - self._celebration_from_count)
+        noun = "outfit" if gained == 1 else "outfits"
+        spent = max(0, observed_spent - self._roll_from)  # silver on this batch = the price
+        footer = Text("◍ ◍ ◍  ", style=COLOR_GOLD)
+        footer.append(f"{gained} {noun} secured", style="#d8d3c8")
+        footer.append("  ·  ", style=COLOR_TEXT_MUTED)
+        footer.append(f"{spent:,}", style=f"bold {COLOR_GOLD}")
+        footer.append(" silver", style="#6f6f6f")
+        self._set_strip(footer)
+
+    def _show_strip_coins(self) -> None:
+        self._coins_ticks = 0
+        self._render_strip_coins()
+        self.set_timer(self.STRIP_COINS_TICK, self._advance_strip_coins)
+
+    def _advance_strip_coins(self) -> None:
+        if not self._footer_celebrating:
+            return
+        self._render_strip_coins()
+        self._coins_ticks += 1
+        # Hold the coins frame while the buy list is still being processed — each secured
+        # item ticks the count/silver up live — then move on once the batch is done (with a
+        # minimum frame time so a single instant buy still reads).
+        if self.task_manager.purchase_in_progress or self._coins_ticks < self.STRIP_COINS_MIN_TICKS:
+            self.set_timer(self.STRIP_COINS_TICK, self._advance_strip_coins)
+            return
+        self._roll_step = 0
+        self._advance_strip_rollup()
+
+    def _advance_strip_rollup(self) -> None:
+        # Retarget to the live total each step so the roll always converges on the truth,
+        # even if another buy lands mid-roll (observed totals are monotonic in-session).
+        _count, self._roll_to = self.observed_purchase_totals()
+        steps = self.STRIP_ROLL_STEPS
+        fraction = self._roll_step / steps
+        value = round(self._roll_from + (self._roll_to - self._roll_from) * fraction)
+        footer = Text("spent ", style="#6f6f6f")
+        footer.append(format_compact_number(value), style=f"bold {COLOR_GOLD}")
+        footer.append(f" of {self.spend_cap_short_label()}", style="#6f6f6f")
+        self._set_strip(footer)
+        if self._roll_step < steps:
+            self._roll_step += 1
+            self.set_timer(self.STRIP_ROLL_INTERVAL, self._advance_strip_rollup)
+        else:
+            self.set_timer(self.STRIP_ROLL_SETTLE_SECONDS, self._end_strip_celebration)
+
+    def _end_strip_celebration(self) -> None:
+        self._footer_celebrating = False
+        # Re-baseline on the observed totals (more buys may have landed during the set
+        # piece and were folded in live — they must not fire a second celebration).
+        self._celebrated_purchases, self._reward_spent = self.observed_purchase_totals()
+        self._quip_index = 0
+        self.refresh_welcome_footer(self.task_manager.monitor_running())
+
+    # One ✦ badge per session buy, trailing the mascot's chatter (newest a shade brighter).
+    # Individual stars up to the cap, then a compact "✦ ×N" so a long session can't overrun
+    # the centered line.
+    BUY_BADGE_STAR = "✦"
+    # Kept short so the right-aligned strip never reaches the centered footer stats, even at
+    # the 96-col minimum width; past the cap it collapses to a compact "✦ ×N".
+    BUY_BADGE_CAP = 6
+
+    def render_buy_badges(self) -> Text | None:
+        count = self.task_manager.session_successful_purchases
+        if count <= 0:
+            return None
+        badges = Text()
+        if count <= self.BUY_BADGE_CAP:
+            for index in range(count):
+                if index:
+                    badges.append(" ")
+                # Right-aligned, the row grows leftward, so the newest star lands on the
+                # left — brighten it (index 0) rather than the rightmost.
+                style = "#ffd9a8" if index == 0 else COLOR_BRAND
+                badges.append(self.BUY_BADGE_STAR, style=style)
+        else:
+            badges.append(self.BUY_BADGE_STAR, style=COLOR_BRAND)
+            badges.append(f" ×{count}", style="#ffd9a8")
+        return badges
 
     def time_greeting(self) -> str:
         hour = time.localtime().tm_hour
@@ -733,10 +883,15 @@ class MarketplaceToolsApp(App[None]):
     def refresh_welcome_footer(self, running: bool) -> None:
         # Two rows: the mascot's chatter/greeting sits centered right under the art, and the
         # live state (running/idle · lifetime record) sits on the footer line below it.
+        if self._footer_celebrating:
+            # The strip set piece owns both rows until it settles.
+            return
         try:
             tm = self.task_manager
             pool = self.chatter_pool(running)
             chatter_line = pool[self._quip_index % len(pool)]
+            # The chatter stays centered on its own line, so accumulating badges never nudge
+            # it — the ✦ tally lives in its own bottom-right overlay (see sync_purchase_reward).
             self.query_one("#welcome-greeting", Static).update(
                 Text(chatter_line, style="bold #d8d3c8")
             )
@@ -849,7 +1004,7 @@ class MarketplaceToolsApp(App[None]):
         # Freeze the sleep clock while a drowsy peek owns the banner. Otherwise the step
         # would advance under the blink guard (unpainted), swallowing z-reveals — most
         # visibly the final Z — and making the cadence look random.
-        if self._mascot_blinking:
+        if self._mascot_blinking or self._mascot_celebrating:
             return
         # A set builds quickly (z -> z -> z), then the empty step lingers ZZZ_GAP_TICKS
         # ticks so there's a long blank pause before the next set begins.
@@ -862,7 +1017,7 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_mascot_rest()
 
     def refresh_mascot_rest(self) -> None:
-        if self._mascot_blinking:
+        if self._mascot_blinking or self._mascot_celebrating:
             return
         try:
             self.query_one("#banner", Static).update(self.mascot_rest_frame())
@@ -872,6 +1027,8 @@ class MarketplaceToolsApp(App[None]):
     def blink_mascot(self) -> None:
         if not self.animations_enabled or self.current_view != "dashboard":
             return
+        if self._mascot_celebrating:
+            return  # a buy celebration owns the banner; don't blink over the stars
         try:
             banner = self.query_one("#banner", Static)
         except Exception:
@@ -900,6 +1057,8 @@ class MarketplaceToolsApp(App[None]):
 
     def _end_mascot_blink(self) -> None:
         self._mascot_blinking = False
+        if self._mascot_celebrating:
+            return  # a buy landed mid-blink; leave the stars for the celebration timer
         try:
             self.query_one("#banner", Static).update(self.mascot_rest_frame())
         except Exception:
@@ -1777,8 +1936,18 @@ class MarketplaceToolsApp(App[None]):
             await self.stop_single_item_test_monitor()
         elif button_id == "fake-detection":
             await self.fake_outfit_detection()
+        elif button_id == "fake-multi-detection":
+            await self.fake_multi_outfit_detection()
         elif button_id == "fake-buy-success":
             await self.fake_buy_success()
+        elif button_id == "fake-bundled-buy":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.fake_bundled_buy_success(),
+                    name="fake-bundled-buy",
+                    group="debug-actions",
+                    exclusive=True,
+                )
 
     async def on_dashboard_tile_pressed(self, event: DashboardTile.Pressed) -> None:
         event.stop()
@@ -2323,6 +2492,14 @@ class MarketplaceToolsApp(App[None]):
         self.set_status("Fake detection processed through watch-only path.")
         await self.return_to_dashboard()
 
+    async def fake_multi_outfit_detection(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        await self.task_manager.debug_fake_multi_outfit_detection()
+        self.set_status("Fake multi-listing detection processed.")
+        await self.return_to_dashboard()
+
     async def fake_buy_success(self) -> None:
         if not self._debug_action_allowed():
             return
@@ -2330,6 +2507,18 @@ class MarketplaceToolsApp(App[None]):
         await self.task_manager.debug_simulate_purchase_success()
         self.set_status("Fake detection and purchase recorded.")
         await self.return_to_dashboard()
+
+    async def fake_bundled_buy_success(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        self.set_status("Fake bundled buy list running: 8 outfits.")
+        await self.return_to_dashboard()
+        await self.task_manager.debug_simulate_bundled_purchase_success(
+            progress_callback=self.refresh_live_widgets
+        )
+        self.refresh_live_widgets()
+        self.set_status("Fake bundled buy list recorded: 8 outfits.")
 
     async def prepare_steam_browser_profile(self) -> None:
         try:

@@ -79,6 +79,13 @@ BANNER_BLINK_ART = r"""
 ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝                ███████████
 """.strip("\n")
 
+# Easter egg: the mascot's eyes flash to stars for a beat on each successful buy. Derived
+# from BANNER_ART by swapping only the eye segment, so the width can never drift and the
+# celebration never shifts layout. The eye row appears exactly once in the art.
+_MASCOT_EYES_OPEN = "████  █████████  ████"
+_MASCOT_EYES_STARS = "████✦ █████████✦ ████"
+BANNER_STAR_ART = BANNER_ART.replace(_MASCOT_EYES_OPEN, _MASCOT_EYES_STARS)
+
 # Rotating footer lines while the monitor runs. Index 0 is the default; the pool is
 # cosmetic and safe to edit freely.
 RUNNING_QUIPS = (
