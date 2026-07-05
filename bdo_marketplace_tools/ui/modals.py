@@ -155,11 +155,12 @@ class PollingModal(DashboardModalScreen):
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Polling"
             dialog.border_subtitle = "esc"
-            yield Static("Presets", classes="modal-section-title")
             yield Static(
                 "Polling controls how often the app checks the marketplace for new listings. Slower polling is calmer; faster polling checks more often.",
+                id="polling-note",
                 classes="modal-note",
             )
+            yield Static("Presets", id="polling-presets-title", classes="modal-section-title")
             with Horizontal(id="polling-recommendations", classes="modal-summary-row"):
                 yield PollingPresetTile("1", "Fast")
                 yield PollingPresetTile("2", "Balanced")

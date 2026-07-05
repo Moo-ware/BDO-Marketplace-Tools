@@ -28,7 +28,12 @@ def highlight(value):
 
 
 def highlight_silver(value):
-    """Brand-orange emphasis, reserved for silver amounts and buy mode."""
+    """Gold emphasis for silver amounts, matching the dashboard spent display."""
+    return f"[bold {COLOR_GOLD}]{value}[/bold {COLOR_GOLD}]"
+
+
+def highlight_brand(value):
+    """Brand-orange emphasis for non-silver mode labels and action names."""
     return f"[bold {COLOR_BRAND}]{value}[/bold {COLOR_BRAND}]"
 
 

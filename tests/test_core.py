@@ -109,7 +109,7 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
 )
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui import charts as charts_module
-from bdo_marketplace_tools.ui.display import COLOR_EVENT_ROUTINE
+from bdo_marketplace_tools.ui.display import COLOR_BRAND, COLOR_EVENT_ROUTINE, COLOR_GOLD
 from bdo_marketplace_tools.ui.app import (
     BANNER_ART,
     BANNER_BLINK_ART,
@@ -2814,6 +2814,9 @@ class APIResultTests(unittest.TestCase):
         self.assertIn("not enough silver", purchase_result_message(-16, "item", "100"))
         self.assertIn("duplicate pre-order", purchase_result_message(34, "item", "100"))
         self.assertIn("resultCode 999", purchase_result_message(999, "item", "100"))
+        success_message = purchase_result_message(0, "item", "100")
+        self.assertIn(f"[bold {COLOR_GOLD}]100[/bold {COLOR_GOLD}]", success_message)
+        self.assertNotIn(f"[bold {COLOR_BRAND}]100[/bold {COLOR_BRAND}]", success_message)
 
     def test_purchase_result_code_validation(self):
         handler = object.__new__(APIHandler)
@@ -7158,10 +7161,34 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 credential_status, credential_detail, credential_level, _, _ = app.credential_state()
+                credentials_tile = [
+                    item for item in app.dashboard_tile_data(app.dashboard_snapshot()) if item[0] == "credentials"
+                ][0]
 
         self.assertEqual(credential_status, "PA Account")
         self.assertEqual(credential_detail, "us**@example.com")
         self.assertEqual(credential_level, "gold")
+        self.assertEqual(credentials_tile[1], "PA Account")
+        self.assertFalse(credentials_tile[4])
+        self.assertEqual(app.status_text(credentials_tile[1], credentials_tile[3], show_dot=credentials_tile[4]).plain, "PA Account")
+
+    async def test_dashboard_credentials_tile_omits_dot_for_steam_account(self):
+        app = self.make_app()
+        app.task_manager.account_mode = STEAM_BROWSER_MODE
+        app.api_handler.account_mode = STEAM_BROWSER_MODE
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)):
+                credentials_tile = [
+                    item for item in app.dashboard_tile_data(app.dashboard_snapshot()) if item[0] == "credentials"
+                ][0]
+
+        self.assertEqual(credentials_tile[1], "Steam Account")
+        self.assertFalse(credentials_tile[4])
+        self.assertEqual(
+            app.status_text(credentials_tile[1], credentials_tile[3], show_dot=credentials_tile[4]).plain,
+            "Steam Account",
+        )
 
     async def test_credentials_modal_clear_pa_account_action_clears_saved_credentials(self):
         app = self.make_app()
@@ -7457,8 +7484,14 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(len(list(app.screen_stack[-1].query("#delay-select"))), 0)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-summary"))), 0)
-                polling_note = str(app.query_visible_one(".modal-note", Static).render())
+                polling_note_widget = app.query_visible_one("#polling-note", Static)
+                polling_note = str(polling_note_widget.render())
                 self.assertIn("how often the app checks the marketplace", polling_note)
+                self.assertLess(polling_note_widget.region.y, app.query_visible_one("#polling-presets-title").region.y)
+                self.assertLess(
+                    app.query_visible_one("#polling-presets-title").region.y,
+                    app.query_visible_one("#polling-recommendations").region.y,
+                )
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-recommendations"))), 1)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-preset-1"))), 1)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-preset-2"))), 1)
@@ -8332,10 +8365,30 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_bundled_buy_button_runs_in_background_and_live_ticks(self):
         app = self.make_app(launch_mode="test")
         app.task_manager.api_handler.buy_item = AsyncMock()
-        with patch.object(app.task_manager, "save_local_data") as save_mock, patch(
-            "bdo_marketplace_tools.services.task_manager.DEBUG_BUNDLED_PURCHASE_TICK_SECONDS",
-            0.25,
-        ), patch(
+        first_tick_seen = asyncio.Event()
+        release_bundle = asyncio.Event()
+        expected_spend = 8 * int(PREMIUM_OUTFIT_MAX_PRICE)
+
+        async def controlled_bundle(progress_callback=None):
+            app.task_manager.session_detected_outfits = 8
+            app.task_manager.purchase_in_progress = True
+            app.task_manager.purchase_progress_count = 1
+            app.task_manager.purchase_progress_silver = int(PREMIUM_OUTFIT_MAX_PRICE)
+            if progress_callback is not None:
+                progress_callback()
+            first_tick_seen.set()
+            await release_bundle.wait()
+            app.task_manager.purchase_progress_count = 8
+            app.task_manager.purchase_progress_silver = expected_spend
+            app.task_manager.session_successful_purchases = 8
+            app.task_manager.session_silver_spent = expected_spend
+            app.task_manager.purchase_in_progress = False
+            if progress_callback is not None:
+                progress_callback()
+            return True
+
+        app.task_manager.debug_simulate_bundled_purchase_success = AsyncMock(side_effect=controlled_bundle)
+        with patch(
             "bdo_marketplace_tools.ui.app.load_credentials",
             return_value=(None, None),
         ):
@@ -8348,9 +8401,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 for _ in range(20):
                     await pilot.pause(0.02)
-                    if app.task_manager.purchase_progress_count >= 1:
+                    if first_tick_seen.is_set():
                         break
 
+                self.assertTrue(first_tick_seen.is_set())
                 self.assertTrue(app.task_manager.purchase_in_progress)
                 self.assertEqual(app.task_manager.purchase_progress_count, 1)
                 self.assertEqual(app.task_manager.session_successful_purchases, 0)
@@ -8361,6 +8415,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("1 outfit secured", footer)
                 self.assertNotIn("8 outfits secured", footer)
 
+                release_bundle.set()
                 for _ in range(120):
                     await pilot.pause(0.03)
                     if (
@@ -8370,10 +8425,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                         break
 
         app.task_manager.api_handler.buy_item.assert_not_called()
+        app.task_manager.debug_simulate_bundled_purchase_success.assert_awaited_once()
         self.assertEqual(app.task_manager.purchase_progress_count, 8)
         self.assertEqual(app.task_manager.session_successful_purchases, 8)
         self.assertFalse(app.task_manager.purchase_in_progress)
-        save_mock.assert_awaited_once()
 
     async def test_test_mode_fake_stats_write_to_test_stats_db(self):
         app = self.make_app(launch_mode="test")

@@ -72,7 +72,7 @@ from bdo_marketplace_tools.ui.display import (
     APP_TITLE,
     format_duration,
     highlight,
-    highlight_silver,
+    highlight_brand,
 )
 from bdo_marketplace_tools.version import APP_VERSION
 
@@ -879,7 +879,7 @@ class BackgroundTasks:
         self.checker_task.add_done_callback(self._handle_checker_done)
         self.checker_enabled = True
         mode = self.monitor_mode_label()
-        mode_markup = highlight_silver(mode) if self.purchase_submission_enabled else highlight(mode)
+        mode_markup = highlight_brand(mode) if self.purchase_submission_enabled else highlight(mode)
         self.add_event(
             f"Monitor started — {mode_markup}.",
             "info",

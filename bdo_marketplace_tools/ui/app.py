@@ -33,6 +33,7 @@ from bdo_marketplace_tools.ui.display import (
     format_compact_silver,
     format_percent,
     highlight,
+    highlight_brand,
     highlight_silver,
     mask_email,
 )
@@ -532,7 +533,10 @@ class MarketplaceToolsApp(App[None]):
             self.task_manager.purchase_submission_enabled
             or self.task_manager.single_item_test_purchase_enabled
         )
-        mode_level = "success" if buying else "idle"
+        # Non-idle level flags buy mode; refresh_dashboard_tiles renders it as an amber
+        # warning triangle (caution: spends silver) with neutral text, rather than coloring
+        # the whole label — keeps the dashboard's color count down. Watch-only stays idle.
+        mode_level = "orange" if buying else "idle"
         _session_label, session_detail, session_level = self.session_status_state()
 
         return [
@@ -540,7 +544,7 @@ class MarketplaceToolsApp(App[None]):
             ("spent", silver_spent, spend_tile_detail, "info", False),
             ("polling", delay_label, delay_range, "info", False),
             ("buy-delay", purchase_delay_range, "Between buys", "info", False),
-            ("credentials", credential_status, credential_tile_detail, credential_level, True),
+            ("credentials", credential_status, credential_tile_detail, credential_level, False),
             (
                 "session",
                 login_status,
@@ -562,6 +566,14 @@ class MarketplaceToolsApp(App[None]):
                     spent_text = "0B"
                 value_text = Text(spent_text, style=STATUS_STYLES["info"])
                 value_text.append(f" / {cap_text}", style="#777777")
+            elif tile_key == "monitor":
+                # Buy mode wears a small amber warning triangle (caution: this mode spends
+                # silver) with neutral white text; watch-only rests as the plain idle ○.
+                if level == "idle":
+                    value_text = self.status_text(value, "idle", show_dot=show_dot)
+                else:
+                    value_text = Text("▲ ", style=STATUS_STYLES["orange"])
+                    value_text.append(value, style=STATUS_STYLES["info"])
             elif level == "muted":
                 value_text = Text(value, style="dim #aaaaaa")
             else:
@@ -2178,7 +2190,7 @@ class MarketplaceToolsApp(App[None]):
         self.task_manager.set_purchase_submission_enabled(True)
         # Arming buy mode is a deliberate choice, not a fault — the orange mode name carries
         # the caution; the sentence itself stays on the dim noise floor.
-        self.set_status(f"Mode set to {highlight_silver('Buy mode')}. Starting the monitor will ask for confirmation.", "info")
+        self.set_status(f"Mode set to {highlight_brand('Buy mode')}. Starting the monitor will ask for confirmation.", "info")
         self.sync_mode_switches(True, except_id=source_switch_id)
         self.refresh_settings_summary()
         self.refresh_live_widgets()
@@ -2186,7 +2198,7 @@ class MarketplaceToolsApp(App[None]):
     def _handle_running_buy_mode_confirmation(self, confirmed: bool) -> None:
         self.task_manager.set_purchase_submission_enabled(bool(confirmed))
         if confirmed:
-            self.set_status(f"{highlight_silver('Buy mode')} enabled for the running monitor.", "info")
+            self.set_status(f"{highlight_brand('Buy mode')} enabled for the running monitor.", "info")
         else:
             self.set_status("Buy mode canceled. Monitor remains watch only.", "info")
         self.sync_mode_switches(self.task_manager.purchase_submission_enabled)
@@ -2868,4 +2880,3 @@ class MarketplaceToolsApp(App[None]):
         await self.task_manager.flush_stats_writes()
         self.api_handler.save_session()
         self.exit()
-
