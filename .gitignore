@@ -151,7 +151,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-*.pkl
+# Project-local runtime and agent files
 *.json
 # Legacy/private in-repo data dir. Live data now lives in the per-user dir resolved by
 # bdo_marketplace_tools/storage/paths.py (%LOCALAPPDATA%\bdo-marketplace-tools).
@@ -159,12 +159,7 @@ data/
 docs/dev/
 .changesets/
 agent/
-agents.md
 AGENTS.md
-test.py
-response.py
-ping.py
 run-test.bat
 .codex-local-notes.md
-.codex-pycache/
 .offline-markdown-preview/
