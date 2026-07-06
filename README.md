@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img alt="Marketplace Tools dashboard" src="docs/assets/dashboard.png" width="900">
+  <img alt="Marketplace Tools dashboard" src="docs/assets/dashboardnew.png" width="900">
 </p>
 
 <p align="center">
