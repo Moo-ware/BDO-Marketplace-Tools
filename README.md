@@ -6,63 +6,71 @@
   <a href="https://www.python.org/downloads/">
     <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
   </a>
-  <img alt="Version 1.2.1-beta" src="https://img.shields.io/badge/Version-1.2.1--beta-blueviolet">
+  <img alt="Version 1.3.0-beta" src="https://img.shields.io/badge/Version-1.3.0--beta-blueviolet">
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
 
 <p>
-  <img alt="Status: Testing" src="https://img.shields.io/badge/Status-Testing-yellow">
   <img alt="Launcher Supported" src="https://img.shields.io/badge/Launcher-Supported-brightgreen">
   <img alt="Steam Supported" src="https://img.shields.io/badge/Steam-Supported-brightgreen">
-  <img alt="OTP WIP" src="https://img.shields.io/badge/OTP-WIP-yellow">
+  <img alt="OTP Manual" src="https://img.shields.io/badge/OTP-Manual-yellow">
 </p>
 
 </div>
 
-![Marketplace Tools dashboard](docs/assets/dashboard.png)
+<p align="center">
+  A Python terminal application for monitoring and tracking <em>Black Desert Online</em> Central Market outfit listings. Built around an <code>asyncio</code> monitor over the market's HTTP API, with a Textual dashboard and SQLite-backed stats. Watch-only by default; buy mode is opt-in.
+</p>
 
+<p align="center">
+  <img alt="Marketplace Tools dashboard" src="docs/assets/dashboard.png" width="900">
+</p>
 
-Python CLI app for monitoring the *Black Desert Online* marketplace through authenticated HTTP/API requests. It maintains a persistent marketplace session, continuously checks for outfit listings at a custom polling interval, handles long-running monitoring sessions with custom built re-authentication workflow, and executes buy-order requests as soon as matching items become available, in millieseconds.
+<p align="center">
+  <em>Live dashboard with session state, buy controls, spend cap, and a compact activity feed.</em>
+</p>
 
+<p align="center">
+  <img alt="Marketplace Tools stats page" src="docs/assets/statspage.png" width="900">
+</p>
+
+<p align="center">
+  <em>SQLite-backed stats view for recent detections, purchases, busiest days, listing hours, and monitored/offline days.</em>
+</p>
 
 ## Features
 
 ### Core Capabilities
 
-- Live interactive dashboard.
-- Monitors BDO marketplace for outfit listings.
-- Automated purchasing of outfits upon detection.
-- Adjustable marketplace polling speed and delay between individual buy attempts.
-- Custom silver spend cap per session, stopping future purchases if cap is met.
-- Tracks current session's outfit detections, successful purchases, and silver spent. 
-- Tracks lifetime silver spent, and successful purchases.
-- Provides logging for actions, purchases, detection, and errors.
-- Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
+- **Automatic market monitoring.** Continuously scans the Central Market at an adjustable interval and detects outfit listings the moment they appear — no manual refreshing required.
+- **Watch-only by default.** On launch it only reports what it finds and never spends silver. Buying stays disabled until you explicitly enable it.
+- **Optional buy mode.** When enabled, it submits purchase requests as listings appear, bounded by a per-session spend cap you set and a configurable delay between buys.
+- **Unified dashboard.** A single live view shows session status, current monitor activity, and a running feed of recent events.
+- **Activity and stats tracking.** A dedicated stats page records detections and purchases, busiest days, common listing hours, and the bot's online/offline coverage.
+- **Multi-account support.** Works with both Pearl Abyss launcher and Steam accounts (see Account Support below).
+- **Inventory view** for stored silver and Value Pack status — currently in progress.
 
 ### Technical Features
 
-- Marketplace API integration for listing scans, wallet data, session refresh, authentication, and `BuyItem` purchase requests.
-- Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
-- Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
-- Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
-- Secure session and credential persistence with JSON cookie storage, legacy pickle-session migration, local email initialization, and OS keyring-backed password storage.
-- Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
-- Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
-- Resilient network and response validation for timeouts, malformed JSON, unexpected API shapes, invalid listing rows, stale pricing, duplicate orders, and unavailable items.
-- Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
-- Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
+- **Async concurrency (`asyncio`).** A non-blocking monitoring loop offloads blocking network I/O with `asyncio.to_thread()`, fans out concurrent male/female category scans via `asyncio.gather()`, and serializes session-sensitive requests behind an `asyncio.Lock` — all inside guarded task lifecycles with exponential retry backoff and automatic session-expiry recovery.
+- **Direct REST/HTTP API integration.** Interfaces with the BDO Central Market API for public stock scans, wallet lookups, session validation, and authenticated `BuyItem` calls, using isolated `requests.Session` clients for connection pooling and reuse without ever mixing authenticated and unauthenticated state.
+- **Custom protocol decoder.** A custom-modified parser unpacks the market's proprietary packed response format, with defensive validation against malformed rows and unexpected payload shapes rather than trusting the wire format.
+- **SQLite persistence layer.** Time-series storage with schema versioning and migrations, lifetime aggregate totals, timestamped outfit events, daily scan-coverage tracking, a legacy JSON-to-SQLite data migration, and a single serialized background writer that eliminates write contention.
+- **Browser-automation authentication.** Playwright-based (Patchright) automation over persistent, app-owned browser profiles drives Steam / Pearl Abyss login and imports only the marketplace session cookies required — no game credentials ever touched.
+- **Secure credential handling.** Optional account passwords are stored in the OS-native keyring, never in plaintext, and used solely to auto-fill the official login page.
+- **Safety-gated purchase pipeline.** End-to-end guards — buy-mode confirmation, real-time spend-cap enforcement, actual-price accounting, randomized per-item delay bounds, an observer callback for live purchase telemetry, and a single automatic retry after re-authentication.
+- **Reactive Textual TUI.** A terminal UI built on the Textual framework — dashboard modals, hoverable chart tooltips, a filtered event log, and frame-based animations — backed by a 300+ test headless suite that drives the full application end to end.
 
-## App Status
+## Supported
 
-This app is currently undergoing a codebase rewrite. Features may be incomplete, unstable, or temporarily broken. Message me on discord if you encounter any errors.
+| Category | Details |
+| --- | --- |
+| **Accounts** | Pearl Abyss launcher · Steam |
+| **Region** | NA / EU only |
+| **OTP / two-factor** | Not currently supported |
 
-## Supported Versions
-
-Last verified compatibility: June 30, 2026.
-
-Pearl Abyss launcher accounts are supported through saved email/password credentials.
-Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, run Steam Initial Setup once, then use `Refresh Session` from the dashboard. Initial setup uses the app-owned browser profile to visit the main Black Desert site, handle required-only cookie consent when available, and open Steam's official login page so you can manually log into Steam. The app only observes local browser state, such as Steam login cookie names or the loaded Store account menu, then closes the browser when Steam login is detected. Steam credentials and OTP values are never stored by the app.
+<sub>Last verified June 30, 2026.</sub>
 
 ## Running the App
 
@@ -84,31 +92,33 @@ Or run directly from the repository root:
 py -3 main.py
 ```
 
+Use test mode when working on UI, screenshots, or synthetic stats:
+
+```powershell
+run.bat --test-mode
+```
+
 `run.bat` uses Windows Terminal when available so the Textual UI opens at a usable size. Set `BDO_DISABLE_WT=1` before launching to run in the current console instead.
 
-## Disclaimer
-
-This repository is provided as a proof of concept and educational purposes ONLY. I am *NOT* responsible for anything that happens to your account if you choose to use this.
+Runtime data is stored outside the repository by default at `%LOCALAPPDATA%\bdo-marketplace-tools\data`. Set `BDO_DATA_DIR` before launch to use a portable or custom data location.
 
 ## Known Issues
 
-If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
+- OTP and CAPTCHA challenges are manual. The app can keep the browser open and wait, but it does not automate verification challenges.
+- Marketplace endpoints, result codes, and login pages can change without notice. Unknown purchase codes are shown in the event log as `resultCode {code}` so they can be documented after a fresh capture.
+- Stats history writes are best effort. If the local SQLite database stays locked after retries, a chart event or scan-coverage marker can be missed while the monitor keeps running.
+- Multi-item purchase batches are still committed after the batch returns. A future change will persist and log each successful item as it completes.
 
-Known problematic result codes:
+## Planned Work
 
-- `resultCode=30`: identical order already exists. This has been observed with `resultMsg=eErrNoAlreadyReservationDay`.
-- `resultCode=34`: item unavailable, already taken, or the request would create a duplicate pre-order.
-- `resultCode=-14`: price mismatch. This can happen when PA decide to change max outfit prices. needs updating if that's the case.
-- `resultCode=2000`: marketplace login session expired upon buy attempt. The app attempts to refresh/re-authenticate and re buy the item.
+- Marketplace inventory polish.
+- Automated pre-order workflow.
+- More configurable marketplace categories.
 
-Unknown purchase codes are reported as `resultCode {code}` in the event log so they can be documented after a new capture.
+## Disclaimer
+
+This repository is provided for proof-of-concept and educational purposes only. Use it at your own risk; I am not responsible for anything that happens to your account if you choose to use it.
 
 ## Contact
 
 For questions or bug reports, use the issue tracker or my Discord: `._.__.__._._.__._____.__._.___.`
-
-## Planned Work
-
-- Marketplace Inventory viewer
-- Automated pre-orders
-- More configurable marketplace categories

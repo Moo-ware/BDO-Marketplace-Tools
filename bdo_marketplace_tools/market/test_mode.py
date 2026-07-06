@@ -20,8 +20,20 @@ SINGLE_ITEM_TEST_TARGET = {
     "choose_key": "0",
     "main_category": "1",
     "sub_category": "1",
-    "max_buy_price": "82500",
+    "max_buy_price": "92500",
 }
+
+LIVE_BUY_ERROR_TEST_TARGET = {
+    "name": "Live Buy Error Probe",
+    "main_key": "15280",
+    "stock": "1",
+    "max_buy_price": "2900000000",
+}
+
+
+def live_buy_error_test_listing(target=None):
+    target = target or LIVE_BUY_ERROR_TEST_TARGET
+    return [[target["main_key"], target["stock"], target["max_buy_price"]]]
 
 
 async def check_single_item_stock(api_handler, target=None):

@@ -2,13 +2,6 @@ import os
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-# Pre-AppData location: data used to live inside the app folder. Kept only as a migration
-# source (see storage/migration.py) so existing installs don't lose stats/session/profiles
-# when the user updates by re-downloading or re-cloning the app.
-LEGACY_DATA_DIR = PROJECT_ROOT / "data"
-
 APP_DIR_NAME = "bdo-marketplace-tools"
 # Set BDO_DATA_DIR to keep data anywhere you like (portable installs, tests, power users).
 DATA_DIR_ENV_VAR = "BDO_DATA_DIR"
@@ -42,7 +35,9 @@ SESSION_COOKIE_PATH = DATA_DIR / "session.json"
 
 LOCAL_STATS_PATH = DATA_DIR / "local_stats.json"
 
+STATS_DB_PATH = DATA_DIR / "stats.db"
+TEST_STATS_DB_PATH = DATA_DIR / "stats.test.db"
+
 BROWSER_PROFILES_DIR = DATA_DIR / "browser_profiles"
 PA_MARKET_PROFILE_PATH = BROWSER_PROFILES_DIR / "pa-market"
 STEAM_MARKET_PROFILE_PATH = BROWSER_PROFILES_DIR / "steam-market"
-STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH = BROWSER_PROFILES_DIR / "steam-market-diagnostic"

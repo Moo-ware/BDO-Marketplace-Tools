@@ -1,38 +1,81 @@
-﻿from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.events import Click
 from textual.message import Message
-from textual.widget import Widget
 from textual.widgets import Static
-from textual.widgets._header import HeaderClock
 
-from bdo_marketplace_tools.ui.display import APP_TITLE
+from bdo_marketplace_tools.ui.charts import (
+    CHART_HEIGHT,
+    daily_activity_chart,
+    daily_activity_column_layout,
+    daily_chart_label_width,
+)
 
-class AppHeader(Widget):
-    DEFAULT_CSS = """
-    AppHeader {
-        dock: top;
-        width: 100%;
-        height: 1;
-        background: $panel;
-        color: $foreground;
-    }
 
-    #app-header-title {
-        width: 100%;
-        content-align: center middle;
-        text-wrap: nowrap;
-        text-overflow: ellipsis;
-    }
-    """
+class DailyActivityChart(Static):
+    def __init__(self) -> None:
+        super().__init__("", id="stats-chart-daily", classes="stats-chart")
+        self._daily = []
+        self._column_start = 0
+        self._column_width = 1
+        self._bar_width = 1
 
-    def compose(self) -> ComposeResult:
-        yield Static(APP_TITLE, id="app-header-title")
-        yield HeaderClock()
+    def update_daily(self, daily, height=CHART_HEIGHT) -> None:
+        self._daily = list(daily or [])
+        self._set_geometry(height)
+        self.tooltip = None
+        self.update(daily_activity_chart(self._daily, height=height))
 
-    def on_click(self, event: Click) -> None:
-        event.stop()
+    def clear_daily(self) -> None:
+        self._daily = []
+        self.tooltip = None
 
+    def tooltip_for_day(self, index):
+        if index is None or index < 0 or index >= len(self._daily):
+            return None
+        row = self._daily[index]
+        day = row.get("day")
+        day_label = day.strftime("%b %d, %Y (%a)") if hasattr(day, "strftime") else str(day)
+        detected = int(row.get("detected") or 0)
+        purchased = int(row.get("purchased") or 0)
+        scans = int(row.get("scans") or 0)
+        rate = f"{round(purchased / detected * 100)}%" if detected else "0%"
+        return (
+            f"{day_label}\n"
+            f"Detected: {detected}\n"
+            f"Purchased: {purchased}\n"
+            f"Scans: {scans}\n"
+            f"Purchase rate: {rate}"
+        )
+
+    def on_mouse_move(self, event) -> None:
+        self.tooltip = self.tooltip_for_day(self._day_index_for_x(event.x))
+
+    def on_leave(self) -> None:
+        self.tooltip = None
+
+    def _set_geometry(self, height=CHART_HEIGHT) -> None:
+        if not self._daily:
+            self._column_start = 0
+            self._column_width = 1
+            self._bar_width = 1
+            return
+        bar_width, gap = daily_activity_column_layout(len(self._daily))
+        max_detected = max(int(row.get("detected") or 0) for row in self._daily)
+        # Must match daily_activity_chart's layout: the label width comes from the
+        # rounded axis scale (9 -> "10"), not the raw max.
+        self._column_start = daily_chart_label_width(max_detected, height) + 3
+        self._column_width = bar_width + gap
+        self._bar_width = bar_width
+
+    def _day_index_for_x(self, x):
+        relative_x = int(x) - self._column_start
+        if relative_x < 0 or not self._daily:
+            return None
+        index = relative_x // self._column_width
+        if index < 0 or index >= len(self._daily):
+            return None
+        if relative_x % self._column_width >= self._bar_width:
+            return None
+        return index
 
 
 class ModalAction(Static):
@@ -61,6 +104,20 @@ class LogFilterOption(Static):
     def __init__(self, mode: str, label: str) -> None:
         super().__init__(label, id=f"log-filter-{mode}", classes="log-filter-option")
         self.mode = mode
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
+class NavTab(Static):
+    class Pressed(Message):
+        def __init__(self, tab: "NavTab") -> None:
+            super().__init__()
+            self.tab = tab
+
+    def __init__(self, key: str, label: str) -> None:
+        super().__init__(label, id=f"tab-{key}", classes="nav-tab")
+        self.key = key
 
     def on_click(self) -> None:
         self.post_message(self.Pressed(self))
@@ -101,6 +158,45 @@ class DashboardTile(Static, can_focus=True):
         self.blur()
 
 
+class MonitorToggleTile(Static, can_focus=True):
+    BINDINGS = [
+        Binding("enter", "press", "Press", show=False),
+    ]
+
+    class Pressed(Message):
+        def __init__(self, tile: "MonitorToggleTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self) -> None:
+        super().__init__("", id="monitor-toggle", classes="toggle-start")
+
+    def focus_on_click(self) -> bool:
+        return False
+
+    def action_press(self) -> None:
+        self.post_message(self.Pressed(self))
+
+    def on_click(self) -> None:
+        self.action_press()
+        self.blur()
+
+
+class MonitorModeTile(Static):
+    class Pressed(Message):
+        def __init__(self, tile: "MonitorModeTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self, mode_key: str, title: str) -> None:
+        super().__init__("", id=f"monitor-mode-{mode_key}", classes="modal-info-tile modal-info-clickable")
+        self.mode_key = mode_key
+        self.border_title = title
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
 class PollingPresetTile(Static):
     class Pressed(Message):
         def __init__(self, preset: "PollingPresetTile") -> None:
@@ -132,5 +228,4 @@ class CredentialActionTile(Static):
 
 
 SteamSetupTile = CredentialActionTile
-
 

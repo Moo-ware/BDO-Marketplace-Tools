@@ -6,6 +6,42 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.3.0-beta - 2026-07-04
+
+### Added
+
+- Reworked the app shell from the old left sidebar into a top-tab layout with Dashboard, Logs, Inventory, Stats, and Settings access, plus a bottom status strip for current mode and spend cap.
+- Added a full Logs tab and moved the dashboard event log into a compact Activity tail. Logs now use one unified event stream with All, Notable, and Alerts filters, a 100-event buffer, coalesced repeats, unread alerts, run dividers, and calmer importance-based coloring.
+- Added SQLite-backed stats history in `stats.db` with lifetime totals, timestamped detection/purchase events, per-day scan coverage, schema versioning/migration, and 30-day Stats trend charts for daily activity, busiest days, and listing hours.
+- Added dashboard cockpit controls: compact chips, a large Start/Stop tile, running-state session stats, mascot/status polish, small animations, and a clearer distinction between idle and real fault states.
+- Added hover tooltips and visual polish to Stats charts, including exact daily values, rounded y-axis labels, monitored/offline day coverage, heatmap gradients, and calmer detected/purchased colors.
+- Added test-mode-only live buy diagnostics, including a confirmed live buy error probe and isolated `stats.test.db` chart-history writes for visual testing.
+
+### Changed
+
+- Modernized modals, App Settings, Inventory actions, and the top bar into the current flat text-action/chip design language.
+- Removed the persisted Stats range preference and made Daily Activity a permanent 30-day centerpiece, with secondary Busiest Days and Listing Hours charts below it.
+- Moved current-run stats out of the footer and into the dashboard welcome strip while keeping the global status bar focused on mode and cap.
+- Removed the old repo-local data migration path. Runtime data now reads only from the current per-user data directory or `BDO_DATA_DIR`; legacy in-repo `data/` is left untouched and ignored.
+- Updated the single-item test-buy target price to `92500` silver.
+- Settings schema is now `9` for the updated settings/log/stat preference shape.
+
+### Fixed
+
+- Moved stats database writes for detections, purchases, lifetime totals, and scan coverage onto serialized/background workers so stats persistence cannot delay monitor purchase attempts.
+- Recorded outfit detection history as availability episode starts instead of repeated scan sightings, with duplicate suppression, missing-scan grace, and retry-on-write-failure behavior.
+- Routed test-mode stats to `stats.test.db` and guarded against accidental writes to production `stats.db`.
+- Fixed chart load failures so they surface in the Stats page instead of failing silently.
+- Fixed browser-auth notice mojibake so injected setup overlays show normal punctuation.
+- Fixed purchase `resultCode=-16` so not-enough-silver failures are named clearly in the event log.
+- Hid page scrollbars while preserving scrolling, hid test controls on Stats so charts get full width, and removed the old Blank Browser HAR diagnostic.
+
+### Maintenance
+
+- Extracted browser-auth cookie, dialog, notice, and Playwright-import helpers into focused modules while preserving compatibility aliases.
+- Extracted the event-log engine into `services/event_log.py` and moved Textual CSS into `ui.styles`.
+- Removed dead diagnostics and unused UI code after the browser-auth and top-tab rewrites.
+
 ## 1.2.1-beta - 2026-06-22
 
 ### Added

@@ -1,14 +1,13 @@
 import asyncio
 import inspect
-import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from bdo_marketplace_tools.market.api_handler import GAME_TRADE_URL, TRADE_URL
-from bdo_marketplace_tools.storage.paths import (
-    STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
-    STEAM_MARKET_PROFILE_PATH,
-)
+from bdo_marketplace_tools.market import browser_cookies as _browser_cookies
+from bdo_marketplace_tools.market import browser_dialogs as _browser_dialogs
+from bdo_marketplace_tools.market import browser_notice as _browser_notice
+from bdo_marketplace_tools.market.api_handler import TRADE_URL
+from bdo_marketplace_tools.storage.paths import STEAM_MARKET_PROFILE_PATH
 
 
 AUTH_START_URL = f"{TRADE_URL}/"
@@ -17,15 +16,6 @@ STEAM_PROFILE_PREP_START_URL = BDO_SITE_BOOTSTRAP_URL
 STEAM_PROFILE_PREP_LOGIN_URL = "https://store.steampowered.com/login"
 STEAM_STORE_URL = "https://store.steampowered.com/"
 STEAM_COMMUNITY_URL = "https://steamcommunity.com/"
-MARKET_COOKIE_URLS = (
-    f"{TRADE_URL}/",
-    f"{GAME_TRADE_URL}/",
-)
-MARKET_COOKIE_HOSTS = tuple(urlparse(url).hostname for url in MARKET_COOKIE_URLS)
-STEAM_PROFILE_COOKIE_URLS = (
-    STEAM_STORE_URL,
-    STEAM_COMMUNITY_URL,
-)
 OTP_ROUTE_MARKERS = (
     "/en-us/Member/Login/CheckOtp",
     "/en-us/Member/Login/LoginOtpAuth",
@@ -33,9 +23,6 @@ OTP_ROUTE_MARKERS = (
     "/en-us/Member/SignIn/OTPAuthenticate",
 )
 OAUTH_CALLBACK_PATH = "/Pearlabyss/Oauth2CallBack"
-MARKET_SESSION_COOKIE_NAMES = {
-    "TradeAuth_Session",
-}
 DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS = 900
 DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS = 900
 STEAM_BROWSER_CHANNEL = "chrome"
@@ -99,408 +86,63 @@ PA_AUTO_LOGIN_SUBMITTED = "submitted"
 PA_AUTO_LOGIN_WAITING = "waiting"
 PA_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
 PA_AUTO_LOGIN_SKIPPED = "skipped"
-STEAM_LOGIN_COOKIE_NAMES = {
-    "steamLoginSecure",
-}
-# Cookie domains whose cookies are preserved when dumping everything else (test tooling): the full
-# Steam web session lives across these domains (steamLoginSecure, sessionid, steamMachineAuth, ...),
-# and keeping all of them avoids having to log back into Steam between re-auth test runs.
-STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES = (
-    "steampowered.com",
-    "steamcommunity.com",
-    "steam-chat.com",
-)
 STEAM_LOGGED_IN_SELECTORS = (
     "#account_pulldown",
     ".user_avatar",
 )
 PA_CREDENTIALS_LOGIN_KEY = "pa_credentials_login"
 PA_LOGIN_PROCESS_PATH = "/en-us/member/login/loginprocess"
-AUTH_DIALOG_VERIFICATION_REQUIRED = "verification_required"
-AUTH_DIALOG_INVALID_CREDENTIALS = "invalid_credentials"
-AUTH_DIALOG_MANUAL_ATTENTION = "manual_attention"
-AUTH_DIALOG_VERIFICATION_MARKERS = (
-    "please complete the verification",
-    "verification",
-    "captcha",
-)
-AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS = (
-    "please double-check your email and password",
-    "email and password",
-    "double-check",
-    "invalid",
-    "password",
-)
 
-# A purely cosmetic notice injected into the visible browser on EVERY auth pop-up (login / reauth,
-# Steam or PA). It dims + lightly blurs the whole page behind a frosted "Setting up your session"
-# card, making it obvious not to touch the page while the automation drives the login. The dim is a
-# `pointer-events:none` scrim, so it is a visual signal only and never blocks the automation's (or the
-# user's) clicks. add_init_script runs it at document start on every navigation (re-showing it each
-# page), and everything is `pointer-events:none`. The card flips to a red "manual action required"
-# state -- and the scrim lifts so the page is usable -- via _set_setup_notice_warning. NOTE: Patchright
-# runs add_init_script in an isolated world, so the flip must manipulate the shared DOM directly from
-# the main world; it cannot call a function defined here, which is why no window global is exposed.
-SETUP_NOTICE_SCRIPT = r"""
-(() => {
-  const ID = '__bdo_setup_notice__';
-  const SCRIM_ID = '__bdo_setup_scrim__';
-  const STYLE_ID = '__bdo_setup_notice_style__';
-  const SPIN_ICON = '<span style="box-sizing:border-box;width:18px;height:18px;border-radius:50%;' +
-    'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
-    'animation:__bdoSetupSpin 0.7s linear infinite;display:inline-block;"></span>';
-  const ensureStyle = () => {
-    if (document.getElementById(STYLE_ID)) return;
-    const st = document.createElement('style');
-    st.id = STYLE_ID;
-    st.textContent =
-      '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}' +
-      '@keyframes __bdoSetupGlow{0%,100%{box-shadow:0 0 0 1px rgba(255,145,60,.4),0 0 20px rgba(255,145,60,.16),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,145,60,.72),0 0 42px rgba(255,145,60,.4),0 16px 44px rgba(0,0,0,.55)}}' +
-      '@keyframes __bdoSetupGlowRed{0%,100%{box-shadow:0 0 0 1px rgba(255,95,85,.5),0 0 22px rgba(255,95,85,.2),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,95,85,.85),0 0 46px rgba(255,95,85,.46),0 16px 44px rgba(0,0,0,.55)}}';
-    (document.head || document.documentElement).appendChild(st);
-  };
-  const showSetup = () => {
-    if (!document.body) return;
-    ensureStyle();
-    let scrim = document.getElementById(SCRIM_ID);
-    if (!scrim) {
-      scrim = document.createElement('div');
-      scrim.id = SCRIM_ID;
-      scrim.setAttribute('style', [
-        'position:fixed','inset:0','z-index:2147483646','pointer-events:none',
-        'background:rgba(8,9,14,0.5)','backdrop-filter:blur(3px)','-webkit-backdrop-filter:blur(3px)',
-        'opacity:0','transition:opacity .35s ease'
-      ].join(';'));
-      document.body.appendChild(scrim);
-      requestAnimationFrame(() => { scrim.style.opacity = '1'; });
-    }
-    let card = document.getElementById(ID);
-    if (!card) {
-      card = document.createElement('div');
-      card.id = ID;
-      card.setAttribute('style', [
-        'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
-        'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-        'max-width:440px','width:calc(100% - 32px)','padding:15px 18px',
-        'border-radius:16px','border:1px solid rgba(255,145,60,0.4)',
-        'background:rgba(17,17,21,0.66)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
-        'color:#e6e3dc',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-        'animation:__bdoSetupGlow 2s ease-in-out infinite',
-        'opacity:0','transition:opacity .4s ease'
-      ].join(';'));
-      document.body.appendChild(card);
-      requestAnimationFrame(() => { card.style.opacity = '1'; });
-    }
-    card.innerHTML =
-      '<div style="display:flex;align-items:center;gap:13px;text-align:left;">' +
-        '<div style="width:36px;height:36px;border-radius:10px;background:rgba(255,145,60,0.18);' +
-          'display:flex;align-items:center;justify-content:center;flex:none;">' + SPIN_ICON + '</div>' +
-        '<div>' +
-          '<div style="font-size:15px;font-weight:600;color:#ffb37a;letter-spacing:.2px;">' +
-            'Setting up your session' +
-          '</div>' +
-          '<div style="font-size:12.5px;font-weight:400;color:#e6e3dc;opacity:.85;margin-top:2px;line-height:1.45;">' +
-            'The app is signing you in — please don’t click anything. It finishes on its own.' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-  };
-  if (document.body) showSetup();
-  else document.addEventListener('DOMContentLoaded', showSetup);
-})();
-"""
+# Keep these aliases in browser_auth so existing imports and test monkeypatch paths stay stable
+# while browser cookie/session filtering rules live in browser_cookies.py.
+MARKET_COOKIE_URLS = _browser_cookies.MARKET_COOKIE_URLS
+MARKET_COOKIE_HOSTS = _browser_cookies.MARKET_COOKIE_HOSTS
+STEAM_PROFILE_COOKIE_URLS = _browser_cookies.STEAM_PROFILE_COOKIE_URLS
+MARKET_SESSION_COOKIE_NAMES = _browser_cookies.MARKET_SESSION_COOKIE_NAMES
+STEAM_LOGIN_COOKIE_NAMES = _browser_cookies.STEAM_LOGIN_COOKIE_NAMES
+STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES = _browser_cookies.STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES
+_is_steam_auth_cookie = _browser_cookies._is_steam_auth_cookie
+_has_steam_login_cookie = _browser_cookies._has_steam_login_cookie
+filter_market_cookies = _browser_cookies.filter_market_cookies
+_domain_applies_to_market = _browser_cookies._domain_applies_to_market
+_has_market_session_cookie = _browser_cookies._has_market_session_cookie
+_market_session_cookie_values = _browser_cookies._market_session_cookie_values
+_has_fresh_market_session_cookie = _browser_cookies._has_fresh_market_session_cookie
+_market_cookie_capture_ready = _browser_cookies._market_cookie_capture_ready
 
-SETUP_NOTICE_CAPTCHA_MESSAGE = "Please complete verification in this window to continue."
-SETUP_NOTICE_MANUAL_LOGIN_MESSAGE = "Please log in manually in this window to continue."
-SETUP_NOTICE_INVALID_CREDENTIALS_MESSAGE = "Saved email/password were rejected. Update credentials in the app, then refresh again."
-SETUP_NOTICE_STEAM_LOGIN_MESSAGE = 'Log in to Steam, and check "Remember me" so you stay signed in.'
+# Keep these aliases in browser_auth so existing imports and test monkeypatch paths stay stable
+# while the browser dialog listener/classification implementation lives in browser_dialogs.py.
+AUTH_DIALOG_VERIFICATION_REQUIRED = _browser_dialogs.AUTH_DIALOG_VERIFICATION_REQUIRED
+AUTH_DIALOG_INVALID_CREDENTIALS = _browser_dialogs.AUTH_DIALOG_INVALID_CREDENTIALS
+AUTH_DIALOG_MANUAL_ATTENTION = _browser_dialogs.AUTH_DIALOG_MANUAL_ATTENTION
+AUTH_DIALOG_VERIFICATION_MARKERS = _browser_dialogs.AUTH_DIALOG_VERIFICATION_MARKERS
+AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS = _browser_dialogs.AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS
+_maybe_await = _browser_dialogs._maybe_await
+_new_auth_dialog_state = _browser_dialogs._new_auth_dialog_state
+_sanitize_dialog_message = _browser_dialogs._sanitize_dialog_message
+_classify_auth_dialog_message = _browser_dialogs._classify_auth_dialog_message
+_auth_dialog_status_message = _browser_dialogs._auth_dialog_status_message
+_record_auth_dialog = _browser_dialogs._record_auth_dialog
+_accept_or_dismiss_dialog = _browser_dialogs._accept_or_dismiss_dialog
+_handle_auth_dialog = _browser_dialogs._handle_auth_dialog
+_install_auth_dialog_page_handler = _browser_dialogs._install_auth_dialog_page_handler
+_install_auth_dialog_handlers = _browser_dialogs._install_auth_dialog_handlers
+_maybe_emit_auth_dialog_manual_attention = _browser_dialogs._maybe_emit_auth_dialog_manual_attention
 
-
-async def _inject_setup_notice(context):
-    # Best-effort: never let a cosmetic notice break the auth flow if the runtime lacks the API.
-    add_init_script = getattr(context, "add_init_script", None)
-    if not callable(add_init_script):
-        return
-    try:
-        await add_init_script(SETUP_NOTICE_SCRIPT)
-    except Exception:
-        pass
-
-
-# Self-contained main-world flip to the red "manual action required" state: it lifts the dim/blur
-# scrim (the page is now the user's to act on) and recolors the box. It manipulates the shared DOM
-# directly (find-or-create the box by id) rather than calling into SETUP_NOTICE_SCRIPT, which runs in
-# Patchright's isolated world and is therefore unreachable from page.evaluate.
-SETUP_NOTICE_WARN_SCRIPT = r"""
-(message) => {
-  const ID = '__bdo_setup_notice__';
-  const SCRIM_ID = '__bdo_setup_scrim__';
-  const STYLE_ID = '__bdo_setup_notice_style__';
-  if (!document.body) return;
-  if (!document.getElementById(STYLE_ID)) {
-    const st = document.createElement('style');
-    st.id = STYLE_ID;
-    st.textContent =
-      '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}' +
-      '@keyframes __bdoSetupGlow{0%,100%{box-shadow:0 0 0 1px rgba(255,145,60,.4),0 0 20px rgba(255,145,60,.16),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,145,60,.72),0 0 42px rgba(255,145,60,.4),0 16px 44px rgba(0,0,0,.55)}}' +
-      '@keyframes __bdoSetupGlowRed{0%,100%{box-shadow:0 0 0 1px rgba(255,95,85,.5),0 0 22px rgba(255,95,85,.2),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,95,85,.85),0 0 46px rgba(255,95,85,.46),0 16px 44px rgba(0,0,0,.55)}}';
-    (document.head || document.documentElement).appendChild(st);
-  }
-  const scrim = document.getElementById(SCRIM_ID);
-  if (scrim) scrim.remove();
-  let card = document.getElementById(ID);
-  if (!card) {
-    card = document.createElement('div');
-    card.id = ID;
-    document.body.appendChild(card);
-  }
-  card.setAttribute('style', [
-    'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
-    'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-    'max-width:440px','width:calc(100% - 32px)','padding:15px 18px',
-    'border-radius:16px','border:1px solid rgba(255,95,85,0.45)',
-    'background:rgba(22,14,14,0.68)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
-    'color:#ecdfdc',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-    'animation:__bdoSetupGlowRed 1.6s ease-in-out infinite','opacity:1'
-  ].join(';'));
-  var ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff6b5e" ' +
-    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
-    '<path d="M12 9v4"/><path d="M12 17h.01"/>' +
-    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>';
-  card.innerHTML =
-    '<div style="display:flex;align-items:center;gap:13px;text-align:left;">' +
-      '<div style="width:36px;height:36px;border-radius:10px;background:rgba(255,95,85,0.18);' +
-        'display:flex;align-items:center;justify-content:center;flex:none;">' + ICON + '</div>' +
-      '<div>' +
-        '<div style="font-size:15px;font-weight:600;color:#ff8a7e;letter-spacing:.2px;">Manual action required</div>' +
-        '<div style="font-size:12.5px;font-weight:400;color:#ecdfdc;opacity:.9;margin-top:2px;line-height:1.45;">' +
-        (message || 'Action is needed in this window to continue.') +
-        '</div>' +
-      '</div>' +
-    '</div>';
-}
-"""
-
-
-async def _set_setup_notice_warning(page, message):
-    # Flip the in-page notice to its "manual action required" state. Best-effort and never raises; the
-    # notice is cosmetic and must not affect the auth flow. Runs in the main world (see
-    # SETUP_NOTICE_WARN_SCRIPT) so it works regardless of the isolated world add_init_script uses.
-    evaluate = getattr(page, "evaluate", None)
-    if not callable(evaluate):
-        return
-    try:
-        await evaluate(SETUP_NOTICE_WARN_SCRIPT, message)
-    except Exception:
-        pass
-
-
-# Distinct state for "saved credentials were rejected". Unlike the captcha/OTP/Steam manual states,
-# the user must NOT log in on this page -- they fix the saved email/password in the app and refresh.
-# So this re-dims the page (recreating the scrim a prior warning flip may have removed) and shows a
-# calm amber "fix it in the app / safe to close" card instead of the red "act here" warning. Runs in
-# the main world via page.evaluate; cosmetic and pointer-events:none.
-SETUP_NOTICE_CREDENTIALS_SCRIPT = r"""
-() => {
-  const ID = '__bdo_setup_notice__';
-  const SCRIM_ID = '__bdo_setup_scrim__';
-  if (!document.body) return;
-  let scrim = document.getElementById(SCRIM_ID);
-  if (!scrim) {
-    scrim = document.createElement('div');
-    scrim.id = SCRIM_ID;
-    scrim.setAttribute('style', 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;background:rgba(8,9,14,0.5);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);');
-    document.body.appendChild(scrim);
-  }
-  let card = document.getElementById(ID);
-  if (!card) {
-    card = document.createElement('div');
-    card.id = ID;
-    document.body.appendChild(card);
-  }
-  card.setAttribute('style', [
-    'position:fixed','top:50%','left:50%','transform:translate(-50%,-50%)',
-    'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-    'width:calc(100% - 48px)','max-width:400px','padding:16px 18px',
-    'border-radius:16px','border:1px solid rgba(224,168,72,0.5)',
-    'background:rgba(20,16,12,0.74)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
-    'color:#e6e0d4','text-align:center',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-    'box-shadow:0 0 30px rgba(224,168,72,0.16),0 16px 44px rgba(0,0,0,0.5)','opacity:1'
-  ].join(';'));
-  var KEY = '<svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#e8b65a" ' +
-    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
-    '<circle cx="8" cy="16" r="3.2"/><path d="M10.3 13.7 19 5"/><path d="M16 8l2.6 2.6"/><path d="M4 4l16 16"/></svg>';
-  var CHECK = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#7eb88a" ' +
-    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
-    '<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/></svg>';
-  card.innerHTML =
-    '<div style="width:38px;height:38px;border-radius:11px;background:rgba(224,168,72,0.16);display:flex;align-items:center;justify-content:center;margin:0 auto 9px;">' + KEY + '</div>' +
-    '<div style="font-size:15px;font-weight:600;color:#f0c069;letter-spacing:.2px;">Wrong email or password</div>' +
-    '<div style="font-size:12.5px;color:#e6e0d4;opacity:.88;margin-top:5px;line-height:1.5;">Update your saved login in the app, then refresh the session. You don’t need to log in here.</div>' +
-    '<div style="display:inline-flex;align-items:center;gap:6px;margin-top:11px;padding:5px 11px;border-radius:20px;background:rgba(126,184,138,0.14);">' +
-      CHECK + '<span style="font-size:12px;font-weight:600;color:#8fce9c;">Safe to close this window</span>' +
-    '</div>';
-}
-"""
-
-
-async def _set_setup_notice_credentials_rejected(page):
-    # Best-effort, main-world (see SETUP_NOTICE_CREDENTIALS_SCRIPT). Never raises; the notice is
-    # cosmetic and must not affect the auth flow.
-    evaluate = getattr(page, "evaluate", None)
-    if not callable(evaluate):
-        return
-    try:
-        await evaluate(SETUP_NOTICE_CREDENTIALS_SCRIPT)
-    except Exception:
-        pass
-
-
-# Cosmetic guide that points at Steam's "Remember me" checkbox during the manual Steam-login step,
-# nudging the user to tick it (so the Steam session persists and re-auth can stay automatic). Runs in
-# the main world via page.evaluate; finds the checkbox by its visible "Remember me" label text + the
-# role=checkbox attribute (Steam's class names are build-hashed and change between releases, so they
-# are not reliable). pointer-events:none, so it never blocks the click; it repositions on a short
-# interval and self-hides once the box is ticked or is not on the page.
-STEAM_REMEMBER_ME_GUIDE_SCRIPT = r"""
-() => {
-  const RING_ID = '__bdo_remember_ring__';
-  const CALLOUT_ID = '__bdo_remember_callout__';
-  const ARROW_ID = '__bdo_remember_arrow__';
-  const STYLE_ID = '__bdo_remember_style__';
-  const BORDER = '1px solid rgba(255,145,60,0.42)';
-  const BG = 'rgba(17,17,21,0.78)';
-  if (!document.body) return;
-  if (!document.getElementById(STYLE_ID)) {
-    const st = document.createElement('style');
-    st.id = STYLE_ID;
-    st.textContent = '@keyframes __bdoRememberPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,145,60,.5),0 0 14px rgba(255,145,60,.35)}50%{box-shadow:0 0 0 7px rgba(255,145,60,0),0 0 22px rgba(255,145,60,.55)}}';
-    (document.head || document.documentElement).appendChild(st);
-  }
-  const findCheckbox = () => {
-    const boxes = document.querySelectorAll('[role="checkbox"]');
-    for (let i = 0; i < boxes.length; i++) {
-      const box = boxes[i];
-      let txt = '';
-      const lblId = box.getAttribute('aria-labelledby');
-      if (lblId) { const l = document.getElementById(lblId); if (l) txt = l.textContent || ''; }
-      if (!txt && box.parentElement) txt = box.parentElement.textContent || '';
-      if (/remember me/i.test(txt)) return box;
-    }
-    return null;
-  };
-  let ring = document.getElementById(RING_ID);
-  if (!ring) {
-    ring = document.createElement('div');
-    ring.id = RING_ID;
-    ring.setAttribute('style', 'position:fixed;z-index:2147483645;pointer-events:none;border:2px solid rgba(255,145,60,0.95);border-radius:5px;animation:__bdoRememberPulse 1.4s ease-in-out infinite;');
-    document.body.appendChild(ring);
-  }
-  let callout = document.getElementById(CALLOUT_ID);
-  if (!callout) {
-    callout = document.createElement('div');
-    callout.id = CALLOUT_ID;
-    callout.setAttribute('style',
-      'position:fixed;z-index:2147483645;pointer-events:none;max-width:230px;padding:8px 12px;' +
-      'border-radius:10px;border:' + BORDER + ';background:' + BG + ';' +
-      'backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 0 22px rgba(255,145,60,0.18);' +
-      "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;");
-    callout.innerHTML =
-      '<div id="' + ARROW_ID + '" style="position:absolute;width:10px;height:10px;background:' + BG + ';"></div>' +
-      '<div style="font-size:12.5px;font-weight:600;color:#ffb37a;letter-spacing:.2px;">Tick this to stay signed in</div>' +
-      '<div style="font-size:11px;color:#d7d4cd;opacity:.82;margin-top:1px;line-height:1.4;">so the app can re-login on its own</div>';
-    document.body.appendChild(callout);
-  }
-  const arrow = document.getElementById(ARROW_ID);
-  const hide = () => { ring.style.display = 'none'; callout.style.display = 'none'; };
-  const place = () => {
-    const cb = findCheckbox();
-    if (!cb) { hide(); return; }
-    if (cb.getAttribute('aria-checked') === 'true') {
-      hide();
-      if (window.__bdoRememberGuideInterval) { clearInterval(window.__bdoRememberGuideInterval); window.__bdoRememberGuideInterval = null; }
-      return;
-    }
-    const r = cb.getBoundingClientRect();
-    if (!r.width && !r.height) { hide(); return; }
-    ring.style.display = 'block';
-    callout.style.display = 'block';
-    ring.style.left = (r.left - 4) + 'px';
-    ring.style.top = (r.top - 4) + 'px';
-    ring.style.width = (r.width + 8) + 'px';
-    ring.style.height = (r.height + 8) + 'px';
-    const cw = callout.offsetWidth || 210;
-    const ch = callout.offsetHeight || 46;
-    if (r.right + 16 + cw <= window.innerWidth) {
-      callout.style.left = (r.right + 16) + 'px';
-      callout.style.top = (r.top + r.height / 2 - ch / 2) + 'px';
-      if (arrow) arrow.setAttribute('style', 'position:absolute;width:10px;height:10px;background:' + BG + ';left:-6px;top:50%;transform:translateY(-50%) rotate(45deg);border-left:' + BORDER + ';border-bottom:' + BORDER + ';');
-    } else {
-      callout.style.left = Math.max(8, r.left - 8) + 'px';
-      callout.style.top = (r.bottom + 14) + 'px';
-      if (arrow) arrow.setAttribute('style', 'position:absolute;width:10px;height:10px;background:' + BG + ';left:16px;top:-6px;transform:rotate(45deg);border-left:' + BORDER + ';border-top:' + BORDER + ';');
-    }
-  };
-  const start = findCheckbox();
-  const alreadyDone = start && start.getAttribute('aria-checked') === 'true';
-  place();
-  if (window.__bdoRememberGuideInterval) clearInterval(window.__bdoRememberGuideInterval);
-  if (!alreadyDone) window.__bdoRememberGuideInterval = setInterval(place, 400);
-}
-"""
-
-
-async def _show_steam_remember_me_guide(page):
-    # Best-effort cosmetic highlight pointing at Steam's "Remember me" checkbox. pointer-events:none so
-    # it never blocks the click; safe to call repeatedly from the Steam-login wait loop.
-    evaluate = getattr(page, "evaluate", None)
-    if not callable(evaluate):
-        return
-    try:
-        await evaluate(STEAM_REMEMBER_ME_GUIDE_SCRIPT)
-    except Exception:
-        pass
-
-
-async def _maybe_await(value):
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-def _new_auth_dialog_state():
-    return {
-        "attached_pages": set(),
-        "records": [],
-        "manual_attention": None,
-        "reported": set(),
-    }
-
-
-def _sanitize_dialog_message(message):
-    message = "" if message is None else str(message)
-    message = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", message)
-    message = re.sub(r"\s+", " ", message).strip()
-    return message[:300]
-
-
-def _classify_auth_dialog_message(message):
-    normalized = _sanitize_dialog_message(message).lower()
-    if not normalized:
-        return None
-    if any(marker in normalized for marker in AUTH_DIALOG_VERIFICATION_MARKERS):
-        return AUTH_DIALOG_VERIFICATION_REQUIRED
-    if any(marker in normalized for marker in AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS):
-        return AUTH_DIALOG_INVALID_CREDENTIALS
-    return None
-
-
-def _auth_dialog_status_message(category):
-    if category == AUTH_DIALOG_VERIFICATION_REQUIRED:
-        return "Pearl Abyss verification is required. Complete it manually in the browser."
-    if category == AUTH_DIALOG_INVALID_CREDENTIALS:
-        return "Pearl Abyss rejected the saved email/password. Update saved credentials before refreshing again."
-    return "Pearl Abyss login needs manual attention. Complete login manually in the browser."
+# Keep these aliases in browser_auth so existing imports and test monkeypatch paths stay stable
+# while the cosmetic browser-overlay implementation lives in browser_notice.py.
+SETUP_NOTICE_SCRIPT = _browser_notice.SETUP_NOTICE_SCRIPT
+SETUP_NOTICE_CAPTCHA_MESSAGE = _browser_notice.SETUP_NOTICE_CAPTCHA_MESSAGE
+SETUP_NOTICE_MANUAL_LOGIN_MESSAGE = _browser_notice.SETUP_NOTICE_MANUAL_LOGIN_MESSAGE
+SETUP_NOTICE_INVALID_CREDENTIALS_MESSAGE = _browser_notice.SETUP_NOTICE_INVALID_CREDENTIALS_MESSAGE
+SETUP_NOTICE_STEAM_LOGIN_MESSAGE = _browser_notice.SETUP_NOTICE_STEAM_LOGIN_MESSAGE
+SETUP_NOTICE_WARN_SCRIPT = _browser_notice.SETUP_NOTICE_WARN_SCRIPT
+SETUP_NOTICE_CREDENTIALS_SCRIPT = _browser_notice.SETUP_NOTICE_CREDENTIALS_SCRIPT
+STEAM_REMEMBER_ME_GUIDE_SCRIPT = _browser_notice.STEAM_REMEMBER_ME_GUIDE_SCRIPT
+_inject_setup_notice = _browser_notice._inject_setup_notice
+_set_setup_notice_warning = _browser_notice._set_setup_notice_warning
+_set_setup_notice_credentials_rejected = _browser_notice._set_setup_notice_credentials_rejected
+_show_steam_remember_me_guide = _browser_notice._show_steam_remember_me_guide
 
 
 def _auth_dialog_notice_message(category):
@@ -511,112 +153,20 @@ def _auth_dialog_notice_message(category):
     return SETUP_NOTICE_MANUAL_LOGIN_MESSAGE
 
 
-def _record_auth_dialog(dialog_state, message, dialog_type=None):
-    sanitized = _sanitize_dialog_message(message)
-    category = _classify_auth_dialog_message(sanitized)
-    record = {
-        "message": sanitized,
-        "type": "" if dialog_type is None else str(dialog_type),
-        "category": category or AUTH_DIALOG_MANUAL_ATTENTION,
-    }
-    dialog_state["records"].append(record)
-    if category is not None:
-        dialog_state["manual_attention"] = record
-    return record
-
-
-async def _accept_or_dismiss_dialog(dialog):
-    accept = getattr(dialog, "accept", None)
-    if callable(accept):
-        try:
-            await _maybe_await(accept())
-            return
-        except Exception:
-            pass
-
-    dismiss = getattr(dialog, "dismiss", None)
-    if callable(dismiss):
-        try:
-            await _maybe_await(dismiss())
-        except Exception:
-            pass
-
-
-async def _handle_auth_dialog(dialog, dialog_state):
-    message = getattr(dialog, "message", "")
-    if callable(message):
-        try:
-            message = message()
-        except Exception:
-            message = ""
-    dialog_type = getattr(dialog, "type", "")
-    if callable(dialog_type):
-        try:
-            dialog_type = dialog_type()
-        except Exception:
-            dialog_type = ""
-    _record_auth_dialog(dialog_state, message, dialog_type)
-    await _accept_or_dismiss_dialog(dialog)
-
-
-def _install_auth_dialog_page_handler(page, dialog_state):
-    if page is None:
-        return
-    page_id = id(page)
-    if page_id in dialog_state["attached_pages"]:
-        return
-    page_on = getattr(page, "on", None)
-    if not callable(page_on):
-        return
-
-    def _on_dialog(dialog):
-        asyncio.ensure_future(_handle_auth_dialog(dialog, dialog_state))
-
-    try:
-        page_on("dialog", _on_dialog)
-    except Exception:
-        return
-    dialog_state["attached_pages"].add(page_id)
-
-
-def _install_auth_dialog_handlers(context, dialog_state):
-    for page in getattr(context, "pages", []) or []:
-        _install_auth_dialog_page_handler(page, dialog_state)
-
-    if dialog_state.get("context_attached"):
-        return
-
-    context_on = getattr(context, "on", None)
-    if not callable(context_on):
-        return
-
-    def _on_page(page):
-        _install_auth_dialog_page_handler(page, dialog_state)
-
-    try:
-        context_on("page", _on_page)
-    except Exception:
-        return
-    dialog_state["context_attached"] = True
-
-
-async def _maybe_emit_auth_dialog_manual_attention(dialog_state, status_callback=None):
-    record = (dialog_state or {}).get("manual_attention")
-    if not record:
-        return False
-    key = (record.get("category"), record.get("message"))
-    if key not in dialog_state["reported"]:
-        dialog_state["reported"].add(key)
-        await _emit_status(status_callback, _auth_dialog_status_message(record.get("category")), "warning")
-    return True
-
-
 class BrowserAuthError(RuntimeError):
     pass
 
 
 class BrowserAuthUnavailable(BrowserAuthError):
     pass
+
+
+def _import_async_playwright(unavailable_message):
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime
+        raise BrowserAuthUnavailable(unavailable_message) from exc
+    return async_playwright
 
 
 async def acquire_market_cookies(
@@ -633,22 +183,23 @@ async def acquire_market_cookies(
     handle_pa_cookie_consent=False,
     pa_cookie_consent_callback=None,
     account_label="Steam Account",
+    announce_opening=True,
 ):
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError as exc:  # pragma: no cover - depends on optional runtime
-        raise BrowserAuthUnavailable(
-            "Patchright is not installed. Install requirements, then run `patchright install chromium`."
-        ) from exc
+    async_playwright = _import_async_playwright(
+        "Patchright is not installed. Install requirements, then run `patchright install chromium`."
+    )
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    opening_message = f"Opening {account_label} browser in Chrome. Complete login manually."
-    if auto_steam_login:
-        opening_message = f"Opening {account_label} browser in Chrome for automatic re-authentication."
-    elif auto_pa_login:
-        opening_message = f"Opening {account_label} browser in Chrome. Saved credentials will be submitted."
-    await _emit_status(status_callback, opening_message, "info")
+    # Callers that already announced the refresh (the PA flow) pass announce_opening=False
+    # so one refresh doesn't produce two near-identical "opening browser" lines.
+    if announce_opening:
+        opening_message = f"Opening {account_label} browser in Chrome. Complete login manually."
+        if auto_steam_login:
+            opening_message = f"Opening {account_label} browser in Chrome for automatic re-authentication."
+        elif auto_pa_login:
+            opening_message = f"Opening {account_label} browser in Chrome. Saved credentials will be submitted."
+        await _emit_status(status_callback, opening_message, "info")
 
     context = None
     try:
@@ -702,18 +253,15 @@ async def prepare_steam_browser_profile(
     steam_login_url=STEAM_PROFILE_PREP_LOGIN_URL,
     timeout_seconds=DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS,
 ):
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError as exc:  # pragma: no cover - depends on optional runtime
-        raise BrowserAuthUnavailable(
-            "Patchright is not installed. Install requirements before opening the Steam setup browser."
-        ) from exc
+    async_playwright = _import_async_playwright(
+        "Patchright is not installed. Install requirements before opening the Steam setup browser."
+    )
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
     await _emit_status(
         status_callback,
-        "Opening initial Steam browser setup in Chrome. The window will close automatically when setup is saved.",
+        "Starting initial Steam browser setup in Chrome.",
         "info",
     )
 
@@ -737,7 +285,7 @@ async def prepare_steam_browser_profile(
 
             await _emit_status(
                 status_callback,
-                "Opening Steam login. Complete Steam login in the browser; the window will close once detected.",
+                "Complete the Steam login in the browser; the window closes by itself once login is detected.",
                 "info",
             )
             try:
@@ -757,54 +305,13 @@ async def prepare_steam_browser_profile(
                 pass
 
 
-async def open_blank_steam_browser_diagnostic(
-    status_callback=None,
-    *,
-    profile_path=STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
-):
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError as exc:  # pragma: no cover - depends on optional runtime
-        raise BrowserAuthUnavailable(
-            "Patchright is not installed. Install requirements before opening the diagnostic browser."
-        ) from exc
-
-    profile_path = Path(profile_path)
-    profile_path.mkdir(parents=True, exist_ok=True)
-    await _emit_status(
-        status_callback,
-        "Opening blank Chrome diagnostic browser. Navigate manually and close it when HAR capture is done.",
-        "info",
-    )
-
-    context = None
-    try:
-        async with async_playwright() as playwright:
-            context = await _launch_persistent_chrome_context(playwright, profile_path)
-            if not context.pages:
-                await context.new_page()
-
-            await _wait_for_all_pages_closed(context)
-    except Exception as exc:
-        raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
-    finally:
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-
-
 async def clear_steam_browser_profile_cookies(
     *,
     profile_path=STEAM_MARKET_PROFILE_PATH,
 ):
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError as exc:  # pragma: no cover - depends on optional runtime
-        raise BrowserAuthUnavailable(
-            "Patchright is not installed. Install requirements before clearing browser cookies."
-        ) from exc
+    async_playwright = _import_async_playwright(
+        "Patchright is not installed. Install requirements before clearing browser cookies."
+    )
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
@@ -830,18 +337,6 @@ async def clear_steam_browser_profile_cookies(
                 pass
 
 
-def _is_steam_auth_cookie(cookie):
-    if not isinstance(cookie, dict):
-        return False
-    domain = (cookie.get("domain") or "").lstrip(".").lower()
-    if not domain:
-        return False
-    return any(
-        domain == suffix or domain.endswith("." + suffix)
-        for suffix in STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES
-    )
-
-
 async def clear_market_cookies_keep_steam_login(
     *,
     profile_path=STEAM_MARKET_PROFILE_PATH,
@@ -852,12 +347,9 @@ async def clear_market_cookies_keep_steam_login(
     Pearl Abyss session, and the Cookiebot consent cookie, so the next re-auth runs the full
     cookie-box + Steam-button flow without a Steam re-login. Returns the number of cookies cleared.
     """
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError as exc:  # pragma: no cover - depends on optional runtime
-        raise BrowserAuthUnavailable(
-            "Patchright is not installed. Install requirements before clearing browser cookies."
-        ) from exc
+    async_playwright = _import_async_playwright(
+        "Patchright is not installed. Install requirements before clearing browser cookies."
+    )
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
@@ -1074,7 +566,7 @@ async def _wait_for_market_cookies(
                 pass
         await _emit_status(
             status_callback,
-            "Marketplace session cookies captured; validating session.",
+            "Session cookies captured; validating.",
             "info",
         )
         return captured_at_callback[0]
@@ -1150,11 +642,6 @@ async def _launch_persistent_chrome_context(playwright, profile_path):
     )
 
 
-async def _wait_for_all_pages_closed(context):
-    while any(not _page_is_closed(page) for page in context.pages):
-        await asyncio.sleep(1)
-
-
 async def _wait_for_cookie_consent_manual_completion(page, context):
     while True:
         pages = [open_page for open_page in context.pages if not _page_is_closed(open_page)]
@@ -1192,15 +679,6 @@ async def _wait_for_steam_profile_login(context, status_callback, timeout_second
         await asyncio.sleep(STEAM_PROFILE_SETUP_POLL_SECONDS)
 
     raise BrowserAuthError("Steam setup timed out before Steam login was detected.")
-
-
-def _has_steam_login_cookie(cookies):
-    for cookie in cookies or []:
-        if not isinstance(cookie, dict):
-            continue
-        if cookie.get("name") in STEAM_LOGIN_COOKIE_NAMES:
-            return True
-    return False
 
 
 async def _steam_store_logged_in_dom_ready(page):
@@ -1701,80 +1179,6 @@ async def _cookiebot_dialog_hidden(page):
         return True
     except Exception:
         return False
-
-
-def filter_market_cookies(cookies):
-    filtered = []
-    for cookie in cookies or []:
-        if not isinstance(cookie, dict):
-            continue
-
-        domain = cookie.get("domain") or ""
-        if not domain or not _domain_applies_to_market(domain):
-            continue
-
-        filtered.append(
-            {
-                "name": cookie.get("name"),
-                "value": cookie.get("value"),
-                "domain": domain,
-                "path": cookie.get("path") or "/",
-                "secure": bool(cookie.get("secure")),
-                "expires": cookie.get("expires"),
-            }
-        )
-    return filtered
-
-
-def _domain_applies_to_market(domain):
-    normalized = domain.lstrip(".").lower()
-    for host in MARKET_COOKIE_HOSTS:
-        if host == normalized or normalized == "naeu.playblackdesert.com":
-            return True
-    return False
-
-
-def _has_market_session_cookie(cookies):
-    return any(cookie.get("name") in MARKET_SESSION_COOKIE_NAMES for cookie in cookies or [])
-
-
-def _market_session_cookie_values(cookies):
-    values = set()
-    for cookie in cookies or []:
-        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
-            value = cookie.get("value")
-            if value:
-                values.add(value)
-    return values
-
-
-def _has_fresh_market_session_cookie(cookies, baseline_session_values):
-    for cookie in cookies or []:
-        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
-            value = cookie.get("value")
-            if value and value not in baseline_session_values:
-                return True
-    return False
-
-
-def _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
-    if not _has_market_session_cookie(cookies):
-        return False
-
-    # Fast path: an auth flow happened and a *new* marketplace session cookie was issued. This
-    # fires the moment login completes (the cookie is set on the OAuth callback) instead of
-    # waiting for the heavy market page to load, and it can never trip on a stale pre-login
-    # cookie because the value must differ from the pre-login baseline.
-    if (auth_flow_seen or callback_seen) and _has_fresh_market_session_cookie(cookies, baseline_session_values):
-        return True
-
-    # Saved browser session was still valid: the market loaded with no auth detour, so the
-    # existing session cookie is the live one. An expired profile would have redirected to the
-    # login page first (auth_flow_seen), so this never captures a stale session.
-    if market_active and not auth_flow_seen:
-        return True
-
-    return False
 
 
 def _classify_url(url):

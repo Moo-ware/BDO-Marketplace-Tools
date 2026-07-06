@@ -6,7 +6,6 @@ import colorama
 
 from bdo_marketplace_tools.market.api_handler import APIHandler
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
-from bdo_marketplace_tools.storage.migration import migrate_legacy_data_dir
 from bdo_marketplace_tools.ui.app import MarketplaceToolsApp
 
 
@@ -30,16 +29,9 @@ def env_test_mode():
 
 async def run_app(test_mode=False):
     colorama.init()
-    # Move any pre-AppData data folder into the per-user data dir before anything reads it.
-    data_migrated = migrate_legacy_data_dir()
     API = APIHandler()
     task_manager = BackgroundTasks(API, test_mode_enabled=test_mode)
     launch_mode = "test" if test_mode else "live"
-    if data_migrated:
-        task_manager.add_event(
-            "Existing data moved to your user data folder; the old copy was kept as a backup.",
-            "info",
-        )
 
     if test_mode:
         API.login_status = False

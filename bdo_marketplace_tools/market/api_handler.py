@@ -2,11 +2,11 @@ import asyncio
 import json
 import random
 import stat
-from urllib.parse import urlparse
 
 import requests
 
 from bdo_marketplace_tools.market.decoder import unpack
+from bdo_marketplace_tools.ui.display import highlight, highlight_silver
 from bdo_marketplace_tools.storage.app_settings import (
     PA_CREDENTIALS_MODE,
     STEAM_BROWSER_MODE,
@@ -55,31 +55,45 @@ PURCHASE_RESULT_REASONS = {
     30: "an identical order already exists",
     34: "item was unavailable or would create a duplicate pre-order",
     -14: "price mismatch",
+    -16: "not enough silver for the order",
     2000: "login session expired",
 }
 
 
+def _format_silver_amount(price):
+    try:
+        return f"{int(price):,}"
+    except (TypeError, ValueError):
+        return str(price)
+
+
+def _item_and_price(item_id, price):
+    return f"{highlight(item_id)} at {highlight_silver(_format_silver_amount(price))} silver"
+
+
 def purchase_result_message(result_code, item_id, price):
     if result_code == 0:
-        return f"Purchase request succeeded for {item_id} at {price} silver."
+        return f"Purchase request succeeded for {_item_and_price(item_id, price)}."
 
     reason = PURCHASE_RESULT_REASONS.get(result_code)
     if reason:
-        return f"Purchase failed for {item_id} at {price} silver: {reason}."
-    return f"Purchase failed for {item_id} at {price} silver: resultCode {result_code}."
+        return f"Purchase failed for {_item_and_price(item_id, price)}: {reason}."
+    return f"Purchase failed for {_item_and_price(item_id, price)}: resultCode {result_code}."
 
 
 def purchase_success_message(item_id, actual_price, submitted_price=None):
     if submitted_price is not None and int(submitted_price) != int(actual_price):
+        # The submitted buyPrice is a ceiling; the marketplace fills at the real
+        # listing price. "Bid up to" tells the reader the ceiling was not what was paid.
         return (
-            f"Purchase request succeeded for {item_id} at {actual_price} silver "
-            f"(submitted up to {submitted_price})."
+            f"Purchase request succeeded for {_item_and_price(item_id, actual_price)} "
+            f"(bid up to {_format_silver_amount(submitted_price)})."
         )
     return purchase_result_message(0, item_id, actual_price)
 
 
 def purchase_preorder_message(item_id, price):
-    return f"Purchase request placed a pre-order for {item_id} at {price} silver; no stock was bought."
+    return f"Purchase request placed a pre-order for {_item_and_price(item_id, price)}; no stock was bought."
 
 
 def marketplace_silver_balance(wallet_response):
@@ -191,18 +205,6 @@ class APIHandler:
             raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
         return data
 
-    def _extract_cookie_dict(self, response=None):
-        cookies = {}
-        cookies.update(self.session.cookies.get_dict())
-
-        if response is not None:
-            request_cookies = getattr(response.request, "_cookies", None)
-            if request_cookies is not None:
-                cookies.update(request_cookies.get_dict())
-            cookies.update(response.cookies.get_dict())
-
-        return cookies
-
     async def check_stock(self):
         url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)
@@ -282,7 +284,10 @@ class APIHandler:
         self.login_status = False
         return False
 
-    async def buy_item(self, buy_list, purchase_delay_bounds=None):
+    async def buy_item(self, buy_list, purchase_delay_bounds=None, *, on_purchase=None):
+        # on_purchase: optional synchronous observer called with each purchase_record the
+        # moment that item is secured (before the inter-buy delay). Cosmetic only — it is
+        # exception-isolated and must never influence purchasing, retries, or timing.
         url = f"{self._game_trade_url()}/GameTradeMarket/BuyItem"
         headers = self._market_headers(
             f"{self._trade_url()}/",
@@ -389,6 +394,11 @@ class APIHandler:
                     "result_code": result_code,
                 }
                 summary["purchase_records"].append(purchase_record)
+                if on_purchase is not None:
+                    try:
+                        on_purchase(purchase_record)
+                    except Exception:
+                        pass  # observer failures must never affect the purchase flow
                 summary["events"].append(
                     {
                         "level": "success",
@@ -661,14 +671,6 @@ class APIHandler:
             jar.set_cookie(requests.cookies.create_cookie(**kwargs))
 
         self.session.cookies.update(jar)
-
-    def import_browser_cookies(self, cookies):
-        new_session = self._session_from_browser_cookies(cookies)
-        if not new_session.cookies:
-            return 0
-
-        self.session = new_session
-        return len(new_session.cookies)
 
     async def validate_and_save_imported_session(self, cookies):
         previous_session = self.session

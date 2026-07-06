@@ -1,12 +1,11 @@
 import asyncio
-import os
 import random
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from bdo_marketplace_tools.market.api_handler import (
-    DEFAULT_PURCHASE_DELAY_BOUNDS,
     MarketplaceAPIError,
 )
 from bdo_marketplace_tools.market.browser_auth import (
@@ -15,11 +14,15 @@ from bdo_marketplace_tools.market.browser_auth import (
     acquire_market_cookies,
     clear_market_cookies_keep_steam_login,
     clear_steam_browser_profile_cookies,
-    open_blank_steam_browser_diagnostic,
     prepare_steam_browser_profile,
 )
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
-from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from bdo_marketplace_tools.market.test_mode import (
+    LIVE_BUY_ERROR_TEST_TARGET,
+    SINGLE_ITEM_TEST_TARGET,
+    check_single_item_stock,
+    live_buy_error_test_listing,
+)
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
     STEAM_BROWSER_MODE,
@@ -28,7 +31,6 @@ from bdo_marketplace_tools.storage.app_settings import (
     default_app_settings,
     load_browser_cache_cleanup_threshold_mb,
     load_account_mode,
-    load_last_seen_update_version,
     load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
@@ -40,8 +42,6 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
-    save_event_log_view,
-    save_last_seen_update_version,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -59,16 +59,44 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
     measure_all_browser_profile_storage,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
-from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
-from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH, STEAM_MARKET_PROFILE_PATH
-from bdo_marketplace_tools.ui.display import APP_TITLE, EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.storage import stats_db
+from bdo_marketplace_tools.storage.paths import (
+    LOCAL_STATS_PATH,
+    PA_MARKET_PROFILE_PATH,
+    STATS_DB_PATH,
+    STEAM_MARKET_PROFILE_PATH,
+    TEST_STATS_DB_PATH,
+)
+from bdo_marketplace_tools.services.event_log import EventLog
+from bdo_marketplace_tools.ui.display import (
+    APP_TITLE,
+    format_duration,
+    highlight,
+    highlight_brand,
+)
 from bdo_marketplace_tools.version import APP_VERSION
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
-DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
+DEFAULT_LOCAL_DATA = stats_db.DEFAULT_LIFETIME_STATS
+_DEFAULT_STATS_PATH = object()
+_DEFAULT_LEGACY_STATS_PATH = object()
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
+DEBUG_MULTI_OUTFIT_INITIAL_LISTING = [["debug-premium-outfit-a", "2", "2020000000"]]
+DEBUG_MULTI_OUTFIT_JOINED_LISTING = [
+    ["debug-premium-outfit-a", "2", "2020000000"],
+    ["debug-premium-outfit-b", "1", "2020000000"],
+]
+DEBUG_BUNDLED_OUTFIT_LISTING = [["debug-premium-outfit", "8", "2020000000"]]
+DEBUG_BUNDLED_PURCHASE_TICK_SECONDS = 5.0
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
-EVENT_LOG_LIMIT = 20
+# Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
+SCAN_COVERAGE_FLUSH_THRESHOLD = 12
+STATS_WRITE_RETRY_LIMIT = 2
+STATS_WRITE_RETRY_DELAY_SECONDS = 0.1
+# A listing is considered the same availability episode until it has been absent from a
+# couple of successful scans. This avoids counting one visible bundle again on every poll,
+# while still splitting real disappear/reappear cycles.
+DETECTION_EPISODE_MISSED_SCAN_LIMIT = 2
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
 BROWSER_VERIFICATION_MARKERS = (
     "browser verification",
@@ -78,24 +106,37 @@ BROWSER_VERIFICATION_MARKERS = (
 BROWSER_STORAGE_SUMMARY_CACHE_SECONDS = 5
 
 
-def _load_local_data():
-    return load_local_stats(path=LOCAL_DATA_PATH)
+def _same_file_path(left, right):
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
 
-def _create_default_local_data():
-    save_local_stats(DEFAULT_LOCAL_DATA, include_timestamp=False, path=LOCAL_DATA_PATH)
+def _load_local_data(path=_DEFAULT_STATS_PATH, legacy_json_path=_DEFAULT_LEGACY_STATS_PATH):
+    if path is _DEFAULT_STATS_PATH:
+        path = STATS_DB_PATH
+    if legacy_json_path is _DEFAULT_LEGACY_STATS_PATH:
+        legacy_json_path = LOCAL_DATA_PATH
+    return stats_db.load_lifetime_stats(path=path, legacy_json_path=legacy_json_path)
 
 
-def _save_local_data(data):
-    save_local_stats(data, path=LOCAL_DATA_PATH)
+def _save_local_data(data, path=_DEFAULT_STATS_PATH):
+    if path is _DEFAULT_STATS_PATH:
+        path = STATS_DB_PATH
+    stats_db.save_lifetime_stats(
+        data["successful_purchases"],
+        data["silver_spent"],
+        path=path,
+    )
 
 
 class BackgroundTasks:
     def __init__(self, api_handler, test_mode_enabled=False, persist_ui_settings=True):
-        local_data = _load_local_data()
         self.api_handler = api_handler
         self.test_mode_enabled = bool(test_mode_enabled)
         self.persist_ui_settings = bool(persist_ui_settings)
+        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
+        local_data = _load_local_data(path=self.stats_db_path, legacy_json_path=self.legacy_stats_path)
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
@@ -133,11 +174,7 @@ class BackgroundTasks:
             if self.persist_ui_settings
             else default_app_settings()["maintenance"]["browser_cache_cleanup_threshold_mb"]
         )
-        self.events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.core_events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
-        self.event_log_view = ui_settings.get("event_log_view", "core")
-        self.unseen_event_channels = set()
+        self.event_log = EventLog()
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
@@ -146,6 +183,12 @@ class BackgroundTasks:
         self.session_detected_outfits = 0
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
+        # Live per-item purchase ticks for the UI celebration: bumped the moment each item
+        # in a buy list is secured (api_handler on_purchase observer), while the official
+        # session totals above still commit once per batch in record_purchase_summary.
+        # Cosmetic mirror only — never used for stats, history, or spend-cap math.
+        self.purchase_progress_count = 0
+        self.purchase_progress_silver = 0
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = False
         self.purchase_in_progress = False
@@ -155,11 +198,16 @@ class BackgroundTasks:
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
+        # Bumped whenever stats.db gains new history rows; the Stats view uses it to
+        # re-render trend charts only when there is actually something new to draw.
+        self.stats_history_revision = 0
+        self._pending_scan_counts = {}
+        self._pending_scan_count_total = 0
+        self._pending_stats_writes = deque()
+        self._stats_writer_task = None
+        self._active_detection_episodes = {}
         self.update_check_on_startup = (
             load_update_check_on_startup() if self.persist_ui_settings else True
-        )
-        self.last_seen_update_version = (
-            load_last_seen_update_version() if self.persist_ui_settings else None
         )
         self.available_update_version = None
         self.update_check_completed = False
@@ -168,17 +216,219 @@ class BackgroundTasks:
         self._browser_storage_summary_at = 0.0
 
     def reload_lifetime_stats(self):
-        local_data = _load_local_data()
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        # While lifetime/history writes are still queued, the in-memory counters are
+        # ahead of disk; reloading now would clobber them with stale totals.
+        if self._pending_stats_writes or (
+            self._stats_writer_task is not None and not self._stats_writer_task.done()
+        ):
+            return
+        local_data = _load_local_data(path=self.stats_db_path, legacy_json_path=self.legacy_stats_path)
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
 
-    def save_local_data(self):
-        _save_local_data(
+    def set_test_mode_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.test_mode_enabled:
+            return self.test_mode_enabled
+        self.test_mode_enabled = enabled
+        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
+        self._assert_stats_db_path_allowed(self.stats_db_path)
+        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
+        self.reload_lifetime_stats()
+        return self.test_mode_enabled
+
+    def _assert_stats_db_path_allowed(self, path, *, require_explicit=False):
+        if not self.test_mode_enabled:
+            return
+        if path is None:
+            if require_explicit:
+                raise RuntimeError("Test mode stats writes require an explicit stats DB path.")
+            return
+        if _same_file_path(path, STATS_DB_PATH):
+            raise RuntimeError("Test mode cannot use the production stats DB.")
+
+    async def save_local_data(self):
+        # Lifetime totals go through the same serialized writer as history rows: one
+        # write path, no concurrent connections, and a failure degrades to a logged
+        # warning instead of an exception on the purchase path. The totals snapshot
+        # is captured here at enqueue time and self-heals on the next save because
+        # the upsert writes absolute values.
+        self._enqueue_stats_write(
+            "lifetime totals",
+            _save_local_data,
             {
                 "successful_purchases": self.lifetime_successful_purchases,
                 "silver_spent": self.lifetime_silver_spent,
+            },
+            path=self.stats_db_path,
+            bump_revision=False,
+        )
+
+    def _start_stats_writer(self):
+        if self._stats_writer_task is not None and not self._stats_writer_task.done():
+            return True
+        try:
+            self._stats_writer_task = asyncio.create_task(self._drain_stats_writes())
+        except RuntimeError:
+            self._stats_writer_task = None
+            return False
+        return True
+
+    def _enqueue_stats_write(self, label, func, *args, bump_revision=True, **kwargs):
+        self._assert_stats_db_path_allowed(kwargs.get("path"), require_explicit=True)
+        self._pending_stats_writes.append(
+            {
+                "label": label,
+                "func": func,
+                "args": args,
+                "kwargs": kwargs,
+                "bump_revision": bump_revision,
             }
         )
+        return self._start_stats_writer()
+
+    async def _drain_stats_writes(self):
+        try:
+            while self._pending_stats_writes:
+                job = self._pending_stats_writes.popleft()
+                written = await self._run_stats_write(job)
+                if written and job["bump_revision"]:
+                    self.stats_history_revision += 1
+        finally:
+            self._stats_writer_task = None
+            if self._pending_stats_writes:
+                self._start_stats_writer()
+
+    async def _run_stats_write(self, job):
+        last_error = None
+        for attempt in range(STATS_WRITE_RETRY_LIMIT + 1):
+            try:
+                await asyncio.to_thread(job["func"], *job["args"], **job["kwargs"])
+                return True
+            except Exception as exc:
+                last_error = exc
+                if attempt < STATS_WRITE_RETRY_LIMIT:
+                    await asyncio.sleep(STATS_WRITE_RETRY_DELAY_SECONDS * (attempt + 1))
+        detail = str(last_error).strip() or last_error.__class__.__name__
+        self.add_event(f"Stats write failed for {job['label']}: {detail}", "warning")
+        return False
+
+    async def flush_stats_writes(self):
+        flushed = False
+        while True:
+            if self._pending_stats_writes:
+                self._start_stats_writer()
+            task = self._stats_writer_task
+            if task is None or task.done() or task is asyncio.current_task():
+                return flushed
+            flushed = True
+            await task
+
+    def _episode_start_rows(self, buy_list):
+        current_rows = {}
+        for item in buy_list or []:
+            try:
+                item_id, stock, price = item[0], item[1], item[2]
+                stock_count = int(stock)
+            except (IndexError, TypeError, ValueError):
+                continue
+
+            if stock_count <= 0:
+                continue
+
+            item_key = str(item_id)
+            if item_key in current_rows:
+                current_rows[item_key][1] = str(int(current_rows[item_key][1]) + stock_count)
+            else:
+                current_rows[item_key] = [item_key, str(stock_count), str(price)]
+
+        episode_start_rows = []
+        for item_key, row in current_rows.items():
+            episode = self._active_detection_episodes.get(item_key)
+            if episode is None:
+                episode_start_rows.append(row)
+                self._active_detection_episodes[item_key] = {"missed_scans": 0}
+            else:
+                episode["missed_scans"] = 0
+
+        for item_key in list(self._active_detection_episodes):
+            if item_key in current_rows:
+                continue
+            missed_scans = int(self._active_detection_episodes[item_key].get("missed_scans", 0)) + 1
+            if missed_scans >= DETECTION_EPISODE_MISSED_SCAN_LIMIT:
+                del self._active_detection_episodes[item_key]
+            else:
+                self._active_detection_episodes[item_key]["missed_scans"] = missed_scans
+
+        return episode_start_rows
+
+    async def _record_detection_history(self, buy_list):
+        # Keep episode state on the monitor path so repeated polls cannot enqueue
+        # duplicate detections, but leave SQLite work to the background writer.
+        # Returns the newly started episode quantity so the session counter can
+        # stay on the same episode-based scale as stats.db.
+        episode_start_rows = self._episode_start_rows(buy_list)
+        if not episode_start_rows:
+            return 0
+        new_episode_count = sum(int(row[1]) for row in episode_start_rows)
+        detected_at = datetime.now().timestamp()
+        rows = [list(row) for row in episode_start_rows]
+        self._enqueue_stats_write(
+            "detection history",
+            stats_db.record_detection_events,
+            rows,
+            at=detected_at,
+            path=self.stats_db_path,
+        )
+        return new_episode_count
+
+    async def _record_purchase_history(self, purchase_records):
+        records = [dict(record) for record in purchase_records or []]
+        if not records:
+            return False
+        purchased_at = datetime.now().timestamp()
+        return self._enqueue_stats_write(
+            "purchase history",
+            stats_db.record_purchase_events,
+            records,
+            at=purchased_at,
+            path=self.stats_db_path,
+        )
+
+    async def _record_scan_coverage(self):
+        day = datetime.now().date().isoformat()
+        self._pending_scan_counts[day] = self._pending_scan_counts.get(day, 0) + 1
+        self._pending_scan_count_total += 1
+        if (
+            self._pending_scan_count_total >= SCAN_COVERAGE_FLUSH_THRESHOLD
+            or len(self._pending_scan_counts) > 1
+        ):
+            return await self.flush_scan_coverage(wait=False)
+        return False
+
+    async def flush_scan_coverage(self, wait=True):
+        pending, self._pending_scan_counts = self._pending_scan_counts, {}
+        self._pending_scan_count_total = 0
+        if not pending:
+            return False
+        enqueued = self._enqueue_stats_write(
+            "scan coverage",
+            stats_db.add_daily_coverage,
+            dict(pending),
+            path=self.stats_db_path,
+        )
+        if wait:
+            await self.flush_stats_writes()
+        return enqueued
+
+    def _schedule_scan_coverage_flush(self):
+        if not self._pending_scan_counts:
+            return
+        try:
+            asyncio.create_task(self.flush_scan_coverage(wait=False))
+        except RuntimeError:
+            pass
 
     def browser_storage_summary(self, *, force=False):
         now = time.time()
@@ -230,7 +480,7 @@ class BackgroundTasks:
         self.invalidate_browser_storage_summary()
         if result.removed_anything:
             self.add_event(
-                f"Cleaned {format_storage_size(result.removed_bytes)} of disposable "
+                f"Cleaned {highlight(format_storage_size(result.removed_bytes))} of disposable "
                 f"{account_label} browser cache before opening Chrome.",
                 "info",
             )
@@ -258,7 +508,7 @@ class BackgroundTasks:
         failed_paths = sum(len(result.failed_paths) for result in results)
         if removed_bytes:
             self.add_event(
-                f"Cleaned {format_storage_size(removed_bytes)} of disposable browser cache.",
+                f"Cleaned {highlight(format_storage_size(removed_bytes))} of disposable browser cache.",
                 "info",
             )
         elif not failed_paths:
@@ -274,38 +524,23 @@ class BackgroundTasks:
             "results": results,
         }
 
-    def add_event(self, message, level="info", channel="core"):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        style = EVENT_LEVEL_COLORS.get(level, EVENT_LEVEL_COLORS["info"])
-        event = f"[dim]{timestamp}[/dim] [{style}]{message}[/{style}]"
-        normalized_channel = str(channel or "core").strip().lower()
-        if normalized_channel not in {"core", "ui"}:
-            normalized_channel = "core"
-        self.events.append(event)
-        if normalized_channel == "ui":
-            self.ui_events.append(event)
-        else:
-            self.core_events.append(event)
-        if normalized_channel != self.event_log_view:
-            self.unseen_event_channels.add(normalized_channel)
+    # Event log delegates: storage, rendering, and the classification policy live in
+    # services.event_log; these keep the call sites and tests on one façade.
+    def add_event(self, message, level="info", notable=False, divider=None):
+        self.event_log.add(message, level, notable=notable, divider=divider)
 
-    def events_for_channel(self, channel):
-        if str(channel or "").strip().lower() == "ui":
-            return tuple(self.ui_events)
-        return tuple(self.core_events)
+    @property
+    def events(self):
+        return self.event_log.plain_events
 
-    def has_unseen_events(self, channel):
-        return str(channel or "").strip().lower() in self.unseen_event_channels
+    def events_for_filter(self, log_filter="all", dividers=False):
+        return self.event_log.rendered_for_filter(log_filter, dividers=dividers)
 
-    def set_event_log_view(self, view):
-        normalized = str(view or "core").strip().lower()
-        if normalized not in {"core", "ui"}:
-            raise ValueError("Unknown event log view.")
-        self.event_log_view = normalized
-        if self.persist_ui_settings:
-            self.event_log_view = save_event_log_view(normalized)
-        self.unseen_event_channels.discard(self.event_log_view)
-        return self.event_log_view
+    def has_unseen_alerts(self):
+        return self.event_log.has_unseen_alerts()
+
+    def mark_alerts_seen(self):
+        self.event_log.mark_alerts_seen()
 
     def set_update_check_on_startup(self, enabled):
         self.update_check_on_startup = bool(enabled)
@@ -325,7 +560,7 @@ class BackgroundTasks:
         if not manual:
             # Always record the running version at startup so the log shows the check ran,
             # even when the remote lookup is skipped (test mode or disabled).
-            self.add_event(f"{APP_TITLE} v{APP_VERSION}.", "info")
+            self.add_event(f"{APP_TITLE} {highlight(f'v{APP_VERSION}')}.", "info", notable=True)
         if not manual and (self.test_mode_enabled or not self.update_check_on_startup):
             return None
         if self.update_check_in_progress:
@@ -348,33 +583,24 @@ class BackgroundTasks:
                 self.add_event(
                     f"You are on the latest version ({result.current_version}).",
                     "info",
-                    channel="ui",
+                    notable=True,
                 )
         elif manual:  # error, surfaced only for an explicit user-initiated check
             self.add_event(
                 "Could not check for updates. Check your connection and try again.",
                 "warning",
-                channel="ui",
             )
         return result
 
     def _announce_available_update(self, latest_version, manual=False):
         message = (
-            f"Update available: version {latest_version} (you have {APP_VERSION}). "
+            f"Update available: version {highlight(latest_version)} (you have {APP_VERSION}). "
             f"Download it from {RELEASES_URL}"
         )
         if manual:
-            self.add_event(message, "warning", channel="ui")
+            self.add_event(message, "warning", notable=True)
             return
-        # Startup nudge: announce a given version once so launches are not spammed.
-        if latest_version != self.last_seen_update_version:
-            self.add_event(message, "warning")
-            self._remember_seen_update_version(latest_version)
-
-    def _remember_seen_update_version(self, version):
-        self.last_seen_update_version = version
-        if self.persist_ui_settings:
-            self.last_seen_update_version = save_last_seen_update_version(version)
+        self.add_event(message, "warning", notable=True)
 
     def current_delay_label(self):
         if self.delay == "custom":
@@ -403,10 +629,6 @@ class BackgroundTasks:
     def purchase_delay_range(self):
         low, high = self.purchase_delay_bounds
         return f"{self._format_seconds(low)}-{self._format_seconds(high)}s"
-
-    def recommended_delay_label(self):
-        label, (low, high) = self.delay_choices["3"]
-        return f"{label} ({low}-{high}s)"
 
     def set_custom_delay_range(self, low, high):
         low = int(low)
@@ -466,6 +688,7 @@ class BackgroundTasks:
         self.add_event(
             f"{reason} Buy mode paused; it will resume automatically once the session is refreshed.",
             "warning",
+            notable=True,
         )
         return True
 
@@ -474,7 +697,7 @@ class BackgroundTasks:
             return False
         # set_purchase_submission_enabled(True) clears buy_mode_resume_pending.
         self.set_purchase_submission_enabled(True)
-        self.add_event("Marketplace session refreshed; buy mode resumed.", "success")
+        self.add_event("Marketplace session refreshed; buy mode resumed.", "success", notable=True)
         return True
 
     def _persist_polling_settings(self):
@@ -620,7 +843,11 @@ class BackgroundTasks:
         else:
             self.api_handler.login_status = False
         self._set_saved_session_last_known_valid(False)
-        self.add_event(f"{reason}. Marketplace session cleared. Refresh Session before buying.", "warning")
+        self.add_event(
+            f"{reason}. Marketplace session cleared. Refresh Session before buying.",
+            "warning",
+            notable=True,
+        )
 
     def monitor_status_label(self):
         if self.single_item_test_checker_enabled:
@@ -645,11 +872,20 @@ class BackgroundTasks:
             self.checker_enabled = True
             return False
 
+        self._active_detection_episodes = {}
         self.checker_stop_requested = False
         self.checker_started_at = time.monotonic()
         self.checker_task = asyncio.create_task(self.checker())
         self.checker_task.add_done_callback(self._handle_checker_done)
         self.checker_enabled = True
+        mode = self.monitor_mode_label()
+        mode_markup = highlight_brand(mode) if self.purchase_submission_enabled else highlight(mode)
+        self.add_event(
+            f"Monitor started — {mode_markup}.",
+            "info",
+            notable=True,
+            divider=f"monitor started · {mode.lower()}",
+        )
         return True
 
     async def start_single_item_test_checker(self, allow_purchase=False):
@@ -682,11 +918,14 @@ class BackgroundTasks:
         if exc is not None:
             self.add_event(f"Monitor stopped after an unexpected error: {exc}", "error")
 
+        should_flush_pending_coverage = not self.checker_stop_requested
         self.checker_enabled = False
         self.checker_stop_requested = False
         self.checker_started_at = None
         if self.checker_task is task:
             self.checker_task = None
+        if should_flush_pending_coverage:
+            self._schedule_scan_coverage_flush()
 
     def _handle_single_item_test_checker_done(self, task):
         if task.cancelled():
@@ -720,6 +959,10 @@ class BackgroundTasks:
         self.checker_stop_requested = False
         self.checker_started_at = None
         self.checker_task = None
+        await self.flush_scan_coverage()
+        await self.flush_stats_writes()
+        if was_running:
+            self.add_event("Monitor stopped.", "info", notable=True, divider="monitor stopped")
         return was_running
 
     async def stop_single_item_test_checker(self):
@@ -735,6 +978,7 @@ class BackgroundTasks:
         self.single_item_test_purchase_enabled = False
         self.single_item_test_checker_started_at = None
         self.single_item_test_checker_task = None
+        await self.flush_stats_writes()
         return was_running
 
     def start_login_status_checker(self):
@@ -755,6 +999,7 @@ class BackgroundTasks:
             while not self.checker_stop_requested:
                 try:
                     buy_list = await self.api_handler.check_stock()
+                    await self._record_scan_coverage()
                     await self.process_detected_outfits(buy_list)
                     self.consecutive_cycle_errors = 0
                 except Exception as exc:
@@ -810,20 +1055,45 @@ class BackgroundTasks:
         return random.uniform(low * multiplier, high * multiplier)
 
     async def process_detected_outfits(self, buy_list, allow_purchase=None, item_noun="outfit", adjust_pricing=True):
+        new_episode_count = await self._record_detection_history(buy_list)
+
         if not buy_list:
             return
 
+        # The session counter tracks new availability episodes (same scale as the
+        # stats.db history); buying always operates on the full list.
         detected_count = self._detected_outfit_count(buy_list)
-        self.session_detected_outfits += detected_count
+        self.session_detected_outfits += new_episode_count
         purchase_enabled = self.purchase_submission_enabled if allow_purchase is None else allow_purchase
-        detected_label = f"{detected_count} available {self._pluralize(item_noun, detected_count)}"
+        # The total is summed stock across distinct listings, so "4 -> 5" is ambiguous
+        # on its own: spell out the listing count whenever more than one item id is in
+        # the scan, and how much of the total is genuinely new.
+        distinct_listings = len({str(item[0]) for item in buy_list})
+        if distinct_listings > 1:
+            detected_label = (
+                f"{detected_count} available across {distinct_listings} "
+                f"{self._pluralize(item_noun, distinct_listings)}"
+            )
+        else:
+            detected_label = f"{detected_count} available {self._pluralize(item_noun, detected_count)}"
+        if new_episode_count != detected_count:
+            detected_label = f"{detected_label} ({new_episode_count} new)"
         subject = item_noun[:1].upper() + item_noun[1:]
 
         if purchase_enabled:
-            self.add_event(f"{subject} detected: {detected_label}. Attempting purchase.", "success")
+            # Buy mode logs every scan because a purchase attempt follows; the
+            # "(N new)" suffix keeps the log on the same episode scale as the
+            # Detected counter.
+            self.add_event(
+                f"{subject} detected: {highlight(detected_label)}. Attempting purchase.",
+                "success",
+                notable=True,
+            )
             await self.buy_item(buy_list, adjust_pricing=adjust_pricing)
-        else:
-            self.add_event(f"{subject} detected: {detected_label}.", "success")
+        elif new_episode_count > 0:
+            # Watch-only logs once per episode start; repeat sightings of the same
+            # lingering listings would otherwise fill the event log every poll.
+            self.add_event(f"{subject} detected: {highlight(detected_label)}.", "success", notable=True)
 
     def _detected_outfit_count(self, buy_list):
         return sum(int(item[1]) for item in buy_list)
@@ -837,19 +1107,118 @@ class BackgroundTasks:
         if not self.test_mode_enabled:
             return False
 
+        self._active_detection_episodes.clear()
         await self.process_detected_outfits(DEBUG_OUTFIT_LISTING, allow_purchase=False)
+        return True
+
+    async def debug_fake_multi_outfit_detection(self):
+        if not self.test_mode_enabled:
+            return False
+
+        self._active_detection_episodes.clear()
+        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_INITIAL_LISTING, allow_purchase=False)
+        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_JOINED_LISTING, allow_purchase=False)
         return True
 
     async def debug_simulate_purchase_success(self):
         if not self.test_mode_enabled:
             return False
 
+        self._active_detection_episodes.clear()
+        new_episode_count = await self._record_detection_history(DEBUG_OUTFIT_LISTING)
         detected_count = self._detected_outfit_count(DEBUG_OUTFIT_LISTING)
-        self.session_detected_outfits += detected_count
-        self.add_event(f"Outfit detected: {detected_count} available outfits. Simulating purchase.", "success")
+        self.session_detected_outfits += new_episode_count
+        self.add_event(
+            f"Outfit detected: {highlight(detected_count)} available outfits. Simulating purchase.",
+            "success",
+            notable=True,
+        )
 
         adjusted_buy_list = await self.adjust_prices(DEBUG_OUTFIT_LISTING)
-        self.record_purchase_summary(self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded"))
+        await self.record_purchase_summary(
+            self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded")
+        )
+        return True
+
+    async def debug_simulate_bundled_purchase_success(self, progress_callback=None):
+        if not self.test_mode_enabled:
+            return False
+
+        self._active_detection_episodes.clear()
+        new_episode_count = await self._record_detection_history(DEBUG_BUNDLED_OUTFIT_LISTING)
+        detected_count = self._detected_outfit_count(DEBUG_BUNDLED_OUTFIT_LISTING)
+        self.session_detected_outfits += new_episode_count
+        self.add_event(
+            f"Outfit detected: {highlight(detected_count)} available outfits in one bundled buy list.",
+            "success",
+            notable=True,
+        )
+
+        adjusted_buy_list = await self.adjust_prices(DEBUG_BUNDLED_OUTFIT_LISTING)
+        item_id, stock, price = adjusted_buy_list[0]
+        purchase_records = []
+        self._sync_purchase_progress_to_committed()
+        self.purchase_in_progress = True
+        try:
+            stock_count = int(stock)
+            for index in range(stock_count):
+                record = {
+                    "item_id": item_id,
+                    "price": int(price),
+                    "count": 1,
+                    "result_code": 0,
+                }
+                purchase_records.append(record)
+                self._note_purchase_progress(record)
+                if progress_callback is not None:
+                    try:
+                        progress_callback()
+                    except Exception:
+                        pass
+                if index < stock_count - 1:
+                    await asyncio.sleep(DEBUG_BUNDLED_PURCHASE_TICK_SECONDS)
+
+            await self.record_purchase_summary(
+                {
+                    "purchase_records": purchase_records,
+                    "events": [
+                        {
+                            "level": "success",
+                            "message": f"Simulated bundled buy list succeeded for {len(purchase_records)} outfits.",
+                        }
+                    ],
+                }
+            )
+        finally:
+            self.purchase_in_progress = False
+            self._complete_pending_auth_reset_if_ready()
+        return True
+
+    async def debug_run_live_buy_error_probe(self):
+        if not self.test_mode_enabled:
+            return False
+
+        if self.simulated_session_enabled:
+            self.add_event("Live buy error probe requires a real marketplace session; disable test session first.", "warning")
+            return False
+
+        if not getattr(self.api_handler, "login_status", False):
+            self.add_event("Live buy error probe requires an online marketplace session.", "warning")
+            return False
+
+        target = LIVE_BUY_ERROR_TEST_TARGET
+        buy_list = live_buy_error_test_listing(target)
+        self._active_detection_episodes.clear()
+        self.add_event(
+            f"Live buy error probe submitting item {target['main_key']} at {target['max_buy_price']} silver.",
+            "warning",
+        )
+        await self.process_detected_outfits(
+            buy_list,
+            allow_purchase=True,
+            item_noun="live buy probe",
+            adjust_pricing=False,
+        )
         return True
 
     def debug_invalidate_marketplace_session(self):
@@ -904,19 +1273,6 @@ class BackgroundTasks:
             self.debug_force_purchase_session_expired = False
         return result
 
-    async def debug_open_blank_browser_diagnostic(self):
-        if not self.test_mode_enabled:
-            return False
-
-        try:
-            await open_blank_steam_browser_diagnostic(status_callback=self._browser_auth_status)
-        except BrowserAuthError as exc:
-            self.add_event(f"Blank browser diagnostic failed: {exc}", "error")
-            return False
-
-        self.add_event("Blank browser diagnostic closed.", "info")
-        return True
-
     def reset_steam_initial_setup_status(self):
         """Mark Steam initial setup incomplete and clear the one-time consent flag.
 
@@ -936,13 +1292,13 @@ class BackgroundTasks:
 
         return self.reset_steam_initial_setup_status()
 
-    async def debug_dump_cookies_keep_steam_login(self):
+    async def debug_clear_market_cookies_keep_steam_login(self):
         if not self.test_mode_enabled:
             return False
 
         if not self.uses_steam_browser_session():
             self.add_event(
-                "Dump cookies (keep Steam login) is only available in Steam Account mode.",
+                "Clear cookies (keep Steam login) is only available in Steam Account mode.",
                 "warning",
             )
             return False
@@ -950,7 +1306,7 @@ class BackgroundTasks:
         try:
             cleared_count = await clear_market_cookies_keep_steam_login(profile_path=STEAM_MARKET_PROFILE_PATH)
         except BrowserAuthError as exc:
-            self.add_event(f"Test cookie dump failed: {exc}", "error")
+            self.add_event(f"Test cookie clear failed: {exc}", "error")
             return False
 
         # Re-arm the re-auth flow so the next refresh runs the full cookie-box + Steam-button path,
@@ -988,7 +1344,8 @@ class BackgroundTasks:
             self._set_pa_browser_profile_prepared(False)
         self.invalidate_browser_storage_summary()
         self.add_event(
-            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile ({cleared_count} cookies).",
+            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile "
+            f"({highlight(cleared_count)} cookies).",
             "warning",
         )
         return True
@@ -1030,16 +1387,20 @@ class BackgroundTasks:
 
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(True)
         self.steam_auto_reauth_enabled = True
-        self.add_event("Initial Steam browser setup saved. Refresh Session can now open the market login.", "success")
+        self.add_event(
+            "Initial Steam browser setup saved. Refresh Session can now open the market login.",
+            "success",
+            notable=True,
+        )
         return True
 
     async def _recover_purchase_session_for_retry(self, *, force_browser_refresh=False):
-        self.add_event("Login session expired. Attempting to re-authenticate.", "warning")
+        self.add_event("Login session expired. Attempting to re-authenticate.", "warning", notable=True)
 
         if self.uses_steam_browser_session():
             refreshed = await self.refresh_browser_session(force_refresh=force_browser_refresh)
             if refreshed:
-                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
                 return True
 
             # Pause and arm auto-resume (PA path does the same just below): otherwise buy mode stays
@@ -1051,7 +1412,7 @@ class BackgroundTasks:
 
         if await self.refresh_pa_browser_session(force_refresh=force_browser_refresh):
             self._set_saved_session_last_known_valid(True)
-            self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+            self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
             return True
 
         self._set_saved_session_last_known_valid(False)
@@ -1096,7 +1457,24 @@ class BackgroundTasks:
             ],
         }
 
+    def _note_purchase_progress(self, purchase_record):
+        # Synchronous, exception-isolated observer invoked from the buy loop per secured
+        # item. Plain integer bumps only — the buy path's timing is untouched. Both values
+        # compute before either counter moves, so a malformed record is an atomic no-op.
+        try:
+            count = purchase_record_count([purchase_record])
+            silver = purchase_record_spend([purchase_record])
+        except Exception:
+            return
+        self.purchase_progress_count += count
+        self.purchase_progress_silver += silver
+
+    def _sync_purchase_progress_to_committed(self):
+        self.purchase_progress_count = max(self.purchase_progress_count, self.session_successful_purchases)
+        self.purchase_progress_silver = max(self.purchase_progress_silver, self.session_silver_spent)
+
     async def buy_item(self, buy_list, adjust_pricing=True):
+        self._sync_purchase_progress_to_committed()
         self.purchase_in_progress = True
         if adjust_pricing:
             updated_buy_list = await self.adjust_prices(buy_list)
@@ -1106,17 +1484,21 @@ class BackgroundTasks:
             capped_buy_list = self._apply_spend_cap(updated_buy_list)
 
             if not capped_buy_list:
-                self.add_event("Purchase skipped: spend cap would be exceeded.", "warning")
+                self.add_event("Purchase skipped: spend cap would be exceeded.", "warning", notable=True)
                 return
 
             if self.simulated_session_enabled:
-                self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
+                simulated_summary = self._simulated_purchase_summary(capped_buy_list)
+                for record in simulated_summary.get("purchase_records", []):
+                    self._note_purchase_progress(record)
+                await self.record_purchase_summary(simulated_summary)
                 return
 
             try:
                 summary = await self.api_handler.buy_item(
                     capped_buy_list,
                     purchase_delay_bounds=self.purchase_delay_bounds,
+                    on_purchase=self._note_purchase_progress,
                 )
             except MarketplaceAPIError as exc:
                 if not self.uses_steam_browser_session() and self._requires_browser_verification(exc):
@@ -1135,6 +1517,7 @@ class BackgroundTasks:
                         summary = await self.api_handler.buy_item(
                             capped_buy_list,
                             purchase_delay_bounds=self.purchase_delay_bounds,
+                            on_purchase=self._note_purchase_progress,
                         )
                     except MarketplaceAPIError as exc:
                         if self._requires_browser_verification(exc):
@@ -1151,12 +1534,13 @@ class BackgroundTasks:
                         summary = await self.api_handler.buy_item(
                             capped_buy_list,
                             purchase_delay_bounds=self.purchase_delay_bounds,
+                            on_purchase=self._note_purchase_progress,
                         )
                     except MarketplaceAPIError as exc:
                         self.add_event(f"Purchase retry failed: {exc}", "error")
                         return
 
-            self.record_purchase_summary(summary)
+            await self.record_purchase_summary(summary)
         finally:
             self.purchase_in_progress = False
             self._complete_pending_auth_reset_if_ready()
@@ -1203,7 +1587,7 @@ class BackgroundTasks:
     def _normalize_buy_list(self, buy_list):
         return [[str(item_id), str(stock), str(price)] for item_id, stock, price in buy_list]
 
-    def record_purchase_summary(self, summary):
+    async def record_purchase_summary(self, summary):
         purchase_records = summary.get("purchase_records", [])
         purchased_count = purchase_record_count(purchase_records)
         silver_spent = purchase_record_spend(purchase_records)
@@ -1211,19 +1595,28 @@ class BackgroundTasks:
         if purchased_count > 0 or silver_spent > 0:
             self.session_successful_purchases += purchased_count
             self.session_silver_spent += silver_spent
+            # Episode dedup can suppress a re-detection that is then bought (fast
+            # relist), so keep the session invariant detected >= purchased instead
+            # of letting the success rate climb past 100%.
+            if self.session_successful_purchases > self.session_detected_outfits:
+                self.session_detected_outfits = self.session_successful_purchases
             self.lifetime_successful_purchases += purchased_count
             self.lifetime_silver_spent += silver_spent
-            self.save_local_data()
+            # History first: the purchase event row is the valuable record, so it
+            # must be queued before anything else on this path can fail.
+            await self._record_purchase_history(purchase_records)
+            await self.save_local_data()
 
         summary_events = summary.get("events", [])
         for event in summary_events:
+            # Purchase outcomes are always notable: they are the reason the app runs.
             if isinstance(event, dict):
-                self.add_event(event.get("message", ""), event.get("level", "info"))
+                self.add_event(event.get("message", ""), event.get("level", "info"), notable=True)
             else:
-                self.add_event(event, "success" if "succeeded" in event else "warning")
+                self.add_event(event, "success" if "succeeded" in event else "warning", notable=True)
 
         if purchased_count == 0 and not summary_events:
-            self.add_event("Purchase attempt completed without a successful request.", "warning")
+            self.add_event("Purchase attempt completed without a successful request.", "warning", notable=True)
 
     def _apply_spend_cap(self, buy_list):
         if self.max_spend is None:
@@ -1250,7 +1643,7 @@ class BackgroundTasks:
     async def adjust_prices(self, buy_list):
         modified_list, fallback_items = apply_price_rules(buy_list)
         if fallback_items:
-            self.add_event(f"Fallback pricing applied to {len(fallback_items)} outfit listings.", "warning")
+            self.add_event(f"Fallback pricing applied to {highlight(len(fallback_items))} outfit listings.", "warning")
         return modified_list
 
     async def login(self):
@@ -1267,6 +1660,7 @@ class BackgroundTasks:
             self._set_saved_session_last_known_valid(True)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
+            # Routine check outcome (nothing changed) — stays out of the Activity tail.
             self.add_event("Existing marketplace session is valid.", "success")
             self.start_login_status_checker()
             self.resume_buy_mode_after_refresh()
@@ -1345,22 +1739,18 @@ class BackgroundTasks:
             if credential_error:
                 details.append(f"Saved credentials unavailable: {credential_error}.")
             if auto_submit_credentials:
-                details.append("Opening Pearl Abyss Account browser session; saved credentials will be submitted automatically.")
+                details.append("Refreshing session — opening the Pearl Abyss browser; saved credentials will be submitted.")
             else:
-                details.append("Opening Pearl Abyss Account browser session for manual login.")
-            self.add_event(" ".join(details), "warning")
+                details.append("Refreshing session — opening the Pearl Abyss browser for manual login.")
+            # A routine refresh is a notable info line; it only escalates to a warning when
+            # it carries an actual failure detail (session check / login / credential error).
+            opening_level = "warning" if len(details) > 1 else "info"
+            self.add_event(" ".join(details), opening_level, notable=True)
 
             try:
                 bootstrap_url = None
                 if not self.pa_browser_profile_prepared:
                     bootstrap_url = BDO_SITE_BOOTSTRAP_URL
-
-                # DIAGNOSTIC (temporary): set BDO_PA_SKIP_BOOTSTRAP=1 to skip the fresh-start bootstrap
-                # detour and test whether it is what makes the PA login submission bounce back. Off by
-                # default, so normal behavior and the test suite are unchanged. Remove once diagnosed.
-                if bootstrap_url and os.environ.get("BDO_PA_SKIP_BOOTSTRAP"):
-                    bootstrap_url = None
-                    self.add_event("DIAGNOSTIC: skipping fresh-start bootstrap for this PA refresh.", "warning")
 
                 if cleanup_browser_cache:
                     await self._clean_browser_cache_before_auth(PA_MARKET_PROFILE_PATH, "Pearl Abyss Account")
@@ -1374,6 +1764,7 @@ class BackgroundTasks:
                     profile_path=PA_MARKET_PROFILE_PATH,
                     bootstrap_url=bootstrap_url,
                     account_label="Pearl Abyss Account",
+                    announce_opening=False,
                 )
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
@@ -1394,7 +1785,7 @@ class BackgroundTasks:
                 self._set_pa_browser_profile_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.start_login_status_checker()
-                self.add_event("Pearl Abyss Account browser session validated and saved.", "success")
+                self.add_event("Pearl Abyss Account session validated and saved.", "success", notable=True)
                 self.resume_buy_mode_after_refresh()
                 return True
 
@@ -1433,6 +1824,7 @@ class BackgroundTasks:
                 self.add_event(
                     f"Session check failed: {session_check_error}. Opening Steam Account browser session.",
                     "warning",
+                    notable=True,
                 )
 
             try:
@@ -1471,7 +1863,7 @@ class BackgroundTasks:
                     self._set_steam_pa_cookie_consent_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.steam_auto_reauth_enabled = True
-                self.add_event("Steam Account session validated and saved.", "success")
+                self.add_event("Steam Account session validated and saved.", "success", notable=True)
                 self.start_login_status_checker()
                 self.resume_buy_mode_after_refresh()
                 return True
@@ -1487,15 +1879,18 @@ class BackgroundTasks:
     async def initial_login_check(self):
         if not self.saved_session_last_known_valid:
             self.api_handler.login_status = False
+            # A fresh start with no saved session is the normal logged-out state, not a
+            # fault — routine dim info, the negative twin of "session is valid". It stays in
+            # the full log (guidance to refresh) but off the tail and out of the Alerts filter.
             if self.uses_steam_browser_session():
                 self.add_event(
                     "No previously validated Steam Account session is saved. Refresh Session to open the login browser.",
-                    "warning",
+                    "info",
                 )
             else:
                 self.add_event(
                     "No previously validated marketplace session is saved. Refresh Session to open the login browser.",
-                    "warning",
+                    "info",
                 )
             return
 
@@ -1518,6 +1913,7 @@ class BackgroundTasks:
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
+            # Routine startup check outcome (nothing changed) — stays out of the Activity tail.
             self.add_event("Saved marketplace session is valid.", "success")
         else:
             self.api_handler.login_status = False
@@ -1575,7 +1971,7 @@ class BackgroundTasks:
             if self.steam_auto_reauth_available():
                 self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
                 if await self.refresh_browser_session(auto_steam_login=True):
-                    self.add_event("Session expired. Re-authentication successful.", "success")
+                    self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
                     return True
 
             # Mirror the PA path below: pause AND arm auto-resume so buy mode comes back on its own
@@ -1590,7 +1986,7 @@ class BackgroundTasks:
 
         self.add_event("Session expired. Attempting Pearl Abyss Account browser re-authentication.", "warning")
         if await self.refresh_pa_browser_session():
-            self.add_event("Session expired. Re-authentication successful.", "success")
+            self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
             return True
 
         self._set_saved_session_last_known_valid(False)

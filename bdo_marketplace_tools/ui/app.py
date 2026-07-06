@@ -1,5 +1,5 @@
-import asyncio
 import random
+import time
 from typing import Optional
 
 from rich.align import Align
@@ -10,35 +10,36 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, Label, ListItem, ListView, RichLog, Select, Static, Switch
+from textual.widgets import Button, Input, Label, RichLog, Select, Static
 
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
-from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
-from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS, PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.market.test_mode import LIVE_BUY_ERROR_TEST_TARGET, SINGLE_ITEM_TEST_TARGET
+from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.storage.browser_profile_cache import (
     format_storage_size,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL
-from bdo_marketplace_tools.version import SETTINGS_SCHEMA_VERSION
+from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, SETTINGS_SCHEMA_VERSION
 from bdo_marketplace_tools.ui.display import (
-    APP_CHANNEL,
     APP_TITLE,
-    APP_VERSION,
     COLOR_BRAND,
-    COLOR_CAUTION,
     COLOR_ERROR,
+    COLOR_GOLD,
     COLOR_INFO,
-    COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
     format_compact_number,
     format_compact_silver,
     format_percent,
+    highlight,
+    highlight_brand,
+    highlight_silver,
     mask_email,
 )
 from bdo_marketplace_tools.ui.modals import (
     BuyDelayModal,
+    ConfirmLiveTestBuyScreen,
     ConfirmBuyModeScreen,
     CredentialsModal,
     DashboardModalScreen,
@@ -49,13 +50,31 @@ from bdo_marketplace_tools.ui.modals import (
     SessionRefreshConfirmScreen,
     SpendCapModal,
 )
-from bdo_marketplace_tools.ui.theme import BANNER_ART, DEFAULT_THEME, STATUS_DOT, STATUS_STYLES, TEST_LOG_MESSAGES
+from bdo_marketplace_tools.ui.styles import APP_CSS
+from bdo_marketplace_tools.ui.theme import (
+    BANNER_ART,
+    BANNER_BLINK_ART,
+    BANNER_STAR_ART,
+    DEFAULT_THEME,
+    IDLE_DOT,
+    MASCOT_ZZZ_TRAIL,
+    RUNNING_QUIPS,
+    STATUS_DOT,
+    STATUS_STYLES,
+    TEST_LOG_MESSAGES,
+    rate_spectrum_style,
+)
+from bdo_marketplace_tools.storage import stats_db
+from bdo_marketplace_tools.ui.charts import hour_heatmap_chart, weekday_chart
 from bdo_marketplace_tools.ui.widgets import (
-    AppHeader,
     CredentialActionTile,
+    DailyActivityChart,
     DashboardTile,
     LogFilterOption,
     ModalAction,
+    MonitorModeTile,
+    MonitorToggleTile,
+    NavTab,
     PollingPresetTile,
     SteamSetupTile,
 )
@@ -63,407 +82,12 @@ from bdo_marketplace_tools.ui.widgets import (
 
 class MarketplaceToolsApp(App[None]):
     TITLE = APP_TITLE
-    CSS = """
-    Screen {
-        background: #101010;
-    }
-
-    #shell {
-        height: 1fr;
-    }
-
-    #sidebar {
-        width: 23;
-        min-width: 20;
-        background: #171717;
-        border-right: solid __COLOR_BRAND__;
-        padding: 1 1 0 1;
-    }
-
-    #brand {
-        color: __COLOR_BRAND__;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    #banner {
-        height: 12;
-        color: __COLOR_BRAND__;
-        text-style: bold;
-        overflow: hidden;
-        margin-bottom: 1;
-    }
-
-    #nav {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    #sidebar-spacer {
-        height: 1fr;
-    }
-
-    #build-info {
-        height: 1;
-        color: __COLOR_TEXT_MUTED__;
-        text-style: dim;
-    }
-
-    #test-controls {
-        height: 1fr;
-        min-height: 6;
-        margin-top: 1;
-        overflow-y: auto;
-    }
-
-    #test-controls Button {
-        width: 100%;
-        min-width: 0;
-        margin: 0;
-        text-align: left;
-        content-align: left middle;
-    }
-
-    #main {
-        width: 1fr;
-        padding: 0 2;
-    }
-
-    .screen-heading {
-        text-style: bold;
-        color: __COLOR_BRAND__;
-        margin-bottom: 1;
-    }
-
-    .panel {
-        border: round #3a3a3a;
-        padding: 1;
-        margin-bottom: 1;
-    }
-
-    .settings-panel {
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        padding: 1;
-        margin-bottom: 1;
-    }
-
-    .settings-note {
-        color: __COLOR_TEXT_MUTED__;
-        margin-bottom: 1;
-    }
-
-    #settings-about {
-        margin-bottom: 0;
-    }
-
-    #settings-cache-threshold-input {
-        width: 8;
-        height: 3;
-        margin-right: 1;
-        border: round #d8d3c8;
-        background: transparent;
-        color: #d8d3c8;
-        padding: 0 1;
-    }
-
-    #settings-cache-threshold-input:focus {
-        border: round #d8d3c8;
-        background: transparent;
-        color: #d8d3c8;
-    }
-
-    #settings-cache-threshold-input > .input--cursor {
-        background: #d8d3c8;
-        color: #111111;
-    }
-
-    #settings-cache-threshold-input > .input--placeholder {
-        color: __COLOR_TEXT_MUTED__;
-    }
-
-    .row {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    .row > Label {
-        width: 18;
-        text-style: bold;
-    }
-
-    #dashboard-panel {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    #dashboard-tiles {
-        height: 8;
-    }
-
-    #dashboard-action-tiles {
-        width: 1fr;
-        height: 8;
-        margin-right: 1;
-    }
-
-    #dashboard-info-tiles {
-        width: 21;
-        height: 8;
-    }
-
-    .dashboard-tile-row {
-        height: 4;
-    }
-
-    .dashboard-tile-column {
-        width: 1fr;
-        height: 8;
-    }
-
-    .dashboard-tile {
-        width: 1fr;
-        height: 4;
-        min-width: 10;
-        margin-right: 1;
-        padding: 0 1;
-        content-align: center middle;
-        border-title-align: center;
-    }
-
-    .tile-clickable {
-        border: round #d8d3c8;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        color: #d8d3c8;
-    }
-
-    .tile-clickable:hover {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
-    }
-
-    .tile-clickable:focus {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
-    }
-
-    .tile-muted {
-        border: round #2b2b2b;
-        border-title-color: #777777;
-        border-title-style: bold;
-        color: #777777;
-    }
-
-    #event-log {
-        height: 1fr;
-        min-height: 6;
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        scrollbar-size-vertical: 1;
-        scrollbar-size-horizontal: 1;
-        scrollbar-color: #343434;
-        scrollbar-color-hover: #4a4a4a;
-        scrollbar-color-active: #5f5f5f;
-        scrollbar-background: #111111;
-        scrollbar-background-hover: #111111;
-        scrollbar-background-active: #111111;
-        scrollbar-corner-color: #111111;
-    }
-
-    #event-log-toolbar {
-        height: 1;
-        margin-bottom: 0;
-        align-horizontal: right;
-    }
-
-    #log-filter-separator {
-        width: auto;
-        margin: 0 1;
-        content-align: center middle;
-        color: #777777;
-    }
-
-    .log-filter-option {
-        width: auto;
-        height: 1;
-        content-align: center middle;
-        color: __COLOR_TEXT_MUTED__;
-        background: transparent;
-    }
-
-    .log-filter-option:hover {
-        color: __COLOR_BRAND__;
-    }
-
-    .log-filter-selected {
-        color: __COLOR_BRAND__;
-        text-style: bold;
-    }
-
-    #stats-actions,
-    #wallet-actions {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    .wip-note {
-        border: round #3a3a3a;
-        border-title-color: __COLOR_BRAND__;
-        color: __COLOR_TEXT_MUTED__;
-        padding: 0 1;
-        margin: 1 0 1 0;
-    }
-
-    .modal-action-tile {
-        width: 18;
-        height: 3;
-        margin-right: 1;
-        content-align: center middle;
-        border: round #d8d3c8;
-        color: #d8d3c8;
-        background: transparent;
-    }
-
-    .modal-action-tile:hover {
-        border: round __COLOR_BRAND__;
-        color: __COLOR_BRAND__;
-        background: transparent;
-    }
-
-    .modal-action-destructive {
-        border: round __COLOR_ERROR__;
-        color: __COLOR_ERROR__;
-    }
-
-    .modal-action-destructive:hover {
-        border: round __COLOR_ERROR__;
-        color: #f2c0c0;
-        background: transparent;
-    }
-
-    .action-card {
-        height: auto;
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        padding: 0 1;
-        margin-bottom: 1;
-    }
-
-    #settings-update-card, #settings-storage-card {
-        margin-bottom: 0;
-    }
-
-    .action-card-info {
-        width: 1fr;
-        height: 3;
-        content-align: left middle;
-    }
-
-    .action-card-line {
-        width: 1fr;
-        height: 1;
-        content-align: left middle;
-        margin-bottom: 1;
-    }
-
-    .action-card-spacer {
-        width: 1fr;
-        height: 1;
-    }
-
-    #settings-storage-card, #settings-danger-card {
-        padding: 1 1;
-    }
-
-    .danger-card {
-        border: round __COLOR_ERROR__;
-        border-title-color: __COLOR_ERROR__;
-    }
-
-    .cache-controls-row, .danger-actions-row {
-        height: 3;
-    }
-
-    .cache-inline-label {
-        width: auto;
-        height: 3;
-        content-align: center middle;
-        color: __COLOR_TEXT_MUTED__;
-        margin-right: 1;
-    }
-
-    .modal-action-compact {
-        width: auto;
-        min-width: 10;
-        padding: 0 2;
-    }
-
-    .settings-section-title {
-        color: __COLOR_BRAND__;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    #settings-status {
-        color: __COLOR_TEXT_MUTED__;
-        min-height: 1;
-        margin-top: 0;
-        margin-bottom: 1;
-    }
-
-    .stats-section-title {
-        color: __COLOR_BRAND__;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    .stats-row {
-        height: 4;
-        margin-bottom: 1;
-    }
-
-    .stats-tile {
-        width: 1fr;
-        height: 4;
-        min-width: 12;
-        margin-right: 1;
-        padding: 0 1;
-        content-align: center middle;
-        border: round #3a3a3a;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
-        border-title-align: center;
-    }
-
-    #content {
-        height: 1fr;
-        overflow-y: auto;
-        scrollbar-size-vertical: 1;
-        scrollbar-size-horizontal: 1;
-        scrollbar-color: #343434;
-        scrollbar-color-hover: #4a4a4a;
-        scrollbar-color-active: #5f5f5f;
-        scrollbar-background: #101010;
-        scrollbar-background-hover: #101010;
-        scrollbar-background-active: #101010;
-        scrollbar-corner-color: #101010;
-    }
-
-    Input, Select {
-        width: 60;
-    }
-
-    Button {
-        margin-right: 1;
-    }
-    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_TEXT_MUTED__", COLOR_TEXT_MUTED).replace("__COLOR_ERROR__", COLOR_ERROR)
+    CSS = APP_CSS
+    TOOLTIP_DELAY = 0.05
 
     BINDINGS = [
         Binding("escape", "show_dashboard", "Dashboard"),
+        Binding("space", "toggle_monitor", "Start/Stop", show=False),
         Binding("q", "quit_app", "Quit"),
         Binding("ctrl+c", "quit_app", "Quit", show=False),
     ]
@@ -481,11 +105,22 @@ class MarketplaceToolsApp(App[None]):
     }
 
     NUMBER_NAV = {
-        "1": "settings",
+        "1": "dashboard",
         "2": "wallet",
         "3": "stats",
-        "4": "exit",
+        "4": "logs",
+        "s": "settings",
+        "5": "exit",
     }
+
+    TAB_ITEMS = [
+        ("dashboard", "Dashboard"),
+        ("wallet", "Inventory"),
+        ("stats", "Stats"),
+        ("logs", "Logs"),
+    ]
+
+    ACTIVITY_TAIL_LINES = 4
 
     def __init__(self, task_manager, api_handler, launch_mode: str = "live") -> None:
         super().__init__()
@@ -493,27 +128,68 @@ class MarketplaceToolsApp(App[None]):
         self.task_manager = task_manager
         self.api_handler = api_handler
         self.launch_mode = launch_mode
-        self.task_manager.test_mode_enabled = self.is_test_mode
+        self.task_manager.set_test_mode_enabled(self.is_test_mode)
         self.current_view = "dashboard"
         self.status_message = ""
-        self.event_log_mode = self.task_manager.event_log_view
-        self._rendered_events: tuple[str, ...] | None = None
+        self.log_filter = "all"
+        self._stats_trends_key: tuple[int, int] | None = None
+        self._stats_trends_error_key: tuple[int, int] | None = None
+        self._rendered_events: tuple | None = None
+        self._rendered_tail: tuple | None = None
         self._dashboard_snapshot: tuple[str, ...] | None = None
         self._syncing_controls = False
+        # Cosmetic animations (pulse/blink/quips); tests turn this off for determinism.
+        self.animations_enabled = True
+        self._pulse_index = 0
+        self._quip_index = 0
+        self._mascot_blinking = False
+        self._mascot_celebrating = False
+        # Easter egg: the mascot flashes star-eyes when a buy lands, and a ✦ badge joins its
+        # chatter line per session buy. None means "not yet baselined" — the first refresh
+        # adopts the current count so a loaded/seeded total never fires the flash; only a
+        # genuine increase does.
+        self._celebrated_purchases = None
+        # Strip set piece (footer flash -> coins+price -> spent count-up) on a buy. Rides the
+        # same trigger as the mascot star-eyes; its own flag keeps the 1s footer refresh from
+        # stomping the frames. The frames read the live purchase-progress ticks, so the coins
+        # frame holds and counts up while a buy list is still being processed, and buys that
+        # land mid-animation fold in automatically.
+        self._footer_celebrating = False
+        self._reward_spent = 0
+        self._roll_from = 0
+        self._roll_to = 0
+        self._roll_step = 0
+        self._celebration_from_count = 0
+        self._coins_ticks = 0
+        self._zzz_step = 0
+        self._zzz_gap = 0
+        self._idle_peek_countdown = 1
 
     def compose(self) -> ComposeResult:
-        yield AppHeader(id="app-header")
-        with Horizontal(id="shell"):
-            with Vertical(id="sidebar"):
-                yield Static(APP_TITLE, id="brand")
-                yield ListView(
-                    *[
-                        ListItem(Label(label), id=f"nav-{key}")
-                        for key, label in self.NAV_ITEMS
-                    ],
-                    id="nav",
-                )
-                if self.is_test_mode:
+        with Horizontal(id="topbar"):
+            yield Static(APP_TITLE, id="brand")
+            yield Static("│", id="topbar-brand-divider")
+            with Horizontal(id="tabs"):
+                for key, label in self.TAB_ITEMS:
+                    yield NavTab(key, label)
+            yield Static("", id="topbar-spacer")
+            yield NavTab("settings", "Settings")
+            yield Static("│", id="topbar-settings-divider")
+            yield Static("", id="header-session")
+            yield Static(f"v{APP_VERSION}", id="build-info")
+        with Vertical(id="main"):
+            with Vertical(id="welcome-card"):
+                yield Static(BANNER_ART, id="banner")
+                # Chatter and the ✦ tally share one row: the chatter is a full-width centered
+                # Static, and the badges are an auto-width overlay docked to that row's right
+                # edge — so buys never nudge the centered chatter.
+                with Horizontal(id="greeting-row"):
+                    yield Static("", id="welcome-greeting")
+                    yield Static("", id="buy-badges")
+                yield Static("", id="welcome-footer")
+            if self.is_test_mode:
+                with Horizontal(id="body"):
+                    yield Container(id="content")
                     with VerticalScroll(id="test-controls"):
                         yield Button("Add Test Log", id="add-test-log", compact=True)
                         yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
@@ -521,22 +197,22 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Expire Session", id="expire-test-session", compact=True)
                         yield Button("Run Session Check", id="run-session-check", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
-                        yield Button("Blank Browser", id="open-blank-browser", compact=True)
                         yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
                         yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
-                        yield Button("Clear (Keep Steam)", id="dump-cookies-keep-steam", compact=True)
+                        yield Button("Clear (Keep Steam)", id="clear-cookies-keep-steam", compact=True)
                         yield Button("Start Test Scan", id="start-test-monitor", compact=True)
                         yield Button("Start Test Buy", id="start-test-buy", compact=True)
+                        yield Button("Live 2.9B Buy", id="live-buy-error-probe", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
                         yield Button("Fake Detection", id="fake-detection", compact=True)
+                        yield Button("Fake Multi Detect", id="fake-multi-detection", compact=True)
                         yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
-                else:
-                    yield Static("", id="sidebar-spacer")
-                yield Static(f"v{APP_VERSION}", id="build-info")
-            with Vertical(id="main"):
-                yield Static(BANNER_ART, id="banner")
-                yield Static("", id="screen-title", classes="screen-heading")
+                        yield Button("Fake Bundle x8", id="fake-bundled-buy", compact=True)
+            else:
                 yield Container(id="content")
+        with Horizontal(id="statusbar"):
+            yield Static("", id="status-keys")
+            yield Static("", id="status-state")
 
     @property
     def is_test_mode(self) -> bool:
@@ -547,9 +223,12 @@ class MarketplaceToolsApp(App[None]):
         return bool(getattr(self.task_manager, "simulated_session_enabled", False))
 
     async def on_mount(self) -> None:
-        self.query_one("#nav", ListView).index = 0
         await self.show_view("dashboard")
         self.set_interval(1, self.refresh_live_widgets)
+        self.set_interval(0.12, self.advance_running_pulse)
+        self.set_interval(4.0, self.blink_mascot)
+        self.set_interval(30.0, self.advance_running_quip)
+        self.set_interval(0.8, self.advance_mascot_zzz)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
 
     def on_resize(self, event) -> None:
@@ -559,6 +238,7 @@ class MarketplaceToolsApp(App[None]):
         await self.task_manager.stop_checker()
         await self.task_manager.stop_single_item_test_checker()
         await self.task_manager.stop_login_status_checker()
+        await self.task_manager.flush_stats_writes()
         self.api_handler.save_session()
 
     async def on_key(self, event) -> None:
@@ -569,10 +249,13 @@ class MarketplaceToolsApp(App[None]):
             event.stop()
             await self.handle_nav(target)
 
-    async def on_list_view_selected(self, event: ListView.Selected) -> None:
-        item_id = event.item.id or ""
-        if item_id.startswith("nav-"):
-            await self.handle_nav(item_id.removeprefix("nav-"))
+    async def on_nav_tab_pressed(self, event: NavTab.Pressed) -> None:
+        event.stop()
+        await self.handle_nav(event.tab.key)
+
+    async def on_monitor_toggle_tile_pressed(self, event: MonitorToggleTile.Pressed) -> None:
+        event.stop()
+        await self.toggle_monitor_from_dashboard()
 
     async def handle_nav(self, target: str) -> None:
         if target == "login":
@@ -610,7 +293,8 @@ class MarketplaceToolsApp(App[None]):
 
         was_running = await self.task_manager.stop_checker()
         if was_running:
-            self.set_status("Monitor stopped.", "info")
+            # stop_checker logs the notable "Monitor stopped" event; status bar only here.
+            self.set_status("Monitor stopped.")
         else:
             self.set_status("Monitor already stopped.", "info")
         self.refresh_live_widgets()
@@ -622,55 +306,59 @@ class MarketplaceToolsApp(App[None]):
         content = self.query_one("#content", Container)
         await content.remove_children()
 
-        title = self.VIEW_TITLES.get(view_name, dict(self.NAV_ITEMS).get(view_name, "Dashboard"))
-        self.query_one("#screen-title", Static).update(title)
         self.update_chrome_visibility()
+        self.update_test_controls_visibility()
 
         if view_name == "dashboard":
             dashboard_tiles = Horizontal(
-                Horizontal(
-                    Vertical(
-                        DashboardTile("monitor", "Monitor"),
-                        DashboardTile("session", "Session"),
-                        id="dashboard-monitor-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    Vertical(
-                        DashboardTile("spent", "Spent"),
-                        DashboardTile("credentials", "Credentials"),
-                        id="dashboard-account-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    Vertical(
-                        DashboardTile("polling", "Polling"),
-                        DashboardTile("buy-delay", "Buy Delay"),
-                        id="dashboard-delay-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    id="dashboard-action-tiles",
-                ),
                 Vertical(
-                    DashboardTile("success", "Success Rate", interactive=False),
-                    DashboardTile("runtime", "Runtime", interactive=False),
-                    id="dashboard-info-tiles",
+                    Horizontal(
+                        DashboardTile("session", "Session"),
+                        DashboardTile("spent", "Spent"),
+                        DashboardTile("buy-delay", "Buy Delay"),
+                        id="dashboard-primary-tiles",
+                        classes="dashboard-tile-row",
+                    ),
+                    Horizontal(
+                        DashboardTile("monitor", "Mode"),
+                        DashboardTile("polling", "Polling"),
+                        DashboardTile("credentials", "Credentials"),
+                        id="dashboard-secondary-tiles",
+                        classes="dashboard-tile-row",
+                    ),
+                    id="dashboard-tiles",
                 ),
-                id="dashboard-tiles",
+                MonitorToggleTile(),
+                id="dashboard-deck",
             )
             dashboard_panel = Vertical(id="dashboard-panel")
-            event_log = RichLog(id="event-log", markup=True, highlight=False, wrap=True)
-            event_log.border_title = "Event Log"
-            event_toolbar = Horizontal(
-                LogFilterOption("core", "Core logs"),
-                Static("/", id="log-filter-separator"),
-                LogFilterOption("ui", "UI logs"),
-                id="event-log-toolbar",
+            activity_header = Horizontal(
+                Static("Activity", id="activity-title"),
+                Static("full log → Logs", id="activity-hint"),
+                id="activity-header",
             )
             await content.mount(dashboard_panel)
             await dashboard_panel.mount(dashboard_tiles)
-            await content.mount(event_toolbar)
-            await content.mount(event_log)
+            await content.mount(activity_header)
+            await content.mount(Static("", id="activity-tail"))
             self._dashboard_snapshot = None
+            self._rendered_tail = None
+        elif view_name == "logs":
+            event_log = RichLog(id="event-log", markup=True, highlight=False, wrap=True)
+            event_toolbar = Horizontal(
+                Static("Event Log", id="event-log-title"),
+                LogFilterOption("all", "All"),
+                Static("·", classes="log-filter-separator"),
+                LogFilterOption("notable", "Notable"),
+                Static("·", classes="log-filter-separator"),
+                LogFilterOption("alerts", "Alerts"),
+                id="event-log-toolbar",
+            )
+            await content.mount(event_toolbar)
+            await content.mount(Static("", id="event-log-rule"))
+            await content.mount(event_log)
             self._rendered_events = None
+            self.task_manager.mark_alerts_seen()
         elif view_name == "credentials":
             await self.mount_credentials(content)
         elif view_name == "settings":
@@ -683,10 +371,18 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
         self.refresh_layout_density()
 
+    def update_test_controls_visibility(self) -> None:
+        if not self.is_test_mode:
+            return
+        try:
+            self.query_one("#test-controls").display = self.current_view != "stats"
+        except Exception:
+            pass
+
     def set_status(self, message: str, level: str | None = None) -> None:
         self.status_message = message
         if message and level:
-            self.task_manager.add_event(message, level, channel="ui")
+            self.task_manager.add_event(message, level)
         self.refresh_live_widgets()
 
     def on_click(self, event) -> None:
@@ -747,24 +443,14 @@ class MarketplaceToolsApp(App[None]):
             return "Password Needed", mask_email(email), "warning", email, password
         return "Not Set", "No account configured", "error", email, password
 
-    def delay_options(self) -> list[tuple[str, str]]:
-        options = [
-            (f"{label} ({low}-{high}s)", key)
-            for key, (label, (low, high)) in self.task_manager.delay_choices.items()
-        ]
-        options.append((f"Custom ({self.task_manager.current_delay_range()})", "custom"))
-        return options
-
     def session_status_state(self) -> tuple[str, str, str]:
         if self.is_simulated_session:
             return "TEST", "Simulated auth", "warning"
-        if self.task_manager.uses_steam_browser_session():
-            if self.api_handler.login_status:
-                return "ONLINE", "Authenticated", "success"
-            return "OFFLINE", "Refresh required", "error"
         if self.api_handler.login_status:
             return "ONLINE", "Authenticated", "success"
-        return "OFFLINE", "Refresh required", "error"
+        # Offline while the monitor runs is a real fault; offline at rest is just "not started yet".
+        level = "error" if self.task_manager.monitor_running() else "idle"
+        return "OFFLINE", "Refresh required", level
 
     def session_account_label(self) -> str:
         if self.is_simulated_session:
@@ -774,6 +460,12 @@ class MarketplaceToolsApp(App[None]):
         if self.api_handler.email:
             return mask_email(self.api_handler.email)
         return "No account configured"
+
+    def spend_cap_short_label(self) -> str:
+        cap = self.task_manager.max_spend
+        if cap is None or cap <= 0:
+            return "∞"
+        return format_compact_number(cap)
 
     def dashboard_snapshot(self) -> tuple[str, ...]:
         credential_status, credential_detail, credential_level, _, _ = self.credential_state()
@@ -788,7 +480,7 @@ class MarketplaceToolsApp(App[None]):
             f"{self.task_manager.session_successful_purchases}/"
             f"{self.task_manager.session_detected_outfits} bought this session"
         )
-        spend_detail = f"Cap: {format_compact_silver(self.task_manager.max_spend)} this session"
+        spend_detail = f"Cap: {self.spend_cap_short_label()} this session"
 
         return (
             credential_status,
@@ -809,8 +501,9 @@ class MarketplaceToolsApp(App[None]):
 
     def status_text(self, value: str, level: str, show_dot: bool = True) -> Text:
         text = Text()
+        dot = IDLE_DOT if level == "idle" else STATUS_DOT
         if show_dot:
-            text.append(f"{STATUS_DOT} ", style=STATUS_STYLES[level])
+            text.append(f"{dot} ", style=STATUS_STYLES[level])
         text.append(value, style=STATUS_STYLES[level])
         return text
 
@@ -825,25 +518,33 @@ class MarketplaceToolsApp(App[None]):
             delay_label,
             delay_range,
             purchase_delay_range,
-            purchase_rate,
-            purchase_detail,
+            _purchase_rate,
+            _purchase_detail,
             silver_spent,
             spend_detail,
-            runtime,
+            _runtime,
         ) = snapshot
 
-        purchase_tile_detail = purchase_detail.replace(" this session", "")
         spend_tile_detail = spend_detail.replace(" this session", "")
         credential_tile_detail = "No account" if credential_detail == "No account configured" else credential_detail
-        monitor_level = "success" if self.task_manager.monitor_running() else "error"
+        # The chip shows the selected mode (run state lives on the toggle/strip/info bar);
+        # green when the mode can spend silver, neutral when it only watches.
+        buying = (
+            self.task_manager.purchase_submission_enabled
+            or self.task_manager.single_item_test_purchase_enabled
+        )
+        # Non-idle level flags buy mode; refresh_dashboard_tiles renders it as an amber
+        # warning triangle (caution: spends silver) with neutral text, rather than coloring
+        # the whole label — keeps the dashboard's color count down. Watch-only stays idle.
+        mode_level = "orange" if buying else "idle"
         _session_label, session_detail, session_level = self.session_status_state()
 
         return [
-            ("monitor", monitor_status, mode, monitor_level, True),
+            ("monitor", mode, monitor_status, mode_level, True),
             ("spent", silver_spent, spend_tile_detail, "info", False),
             ("polling", delay_label, delay_range, "info", False),
             ("buy-delay", purchase_delay_range, "Between buys", "info", False),
-            ("credentials", credential_status, credential_tile_detail, credential_level, True),
+            ("credentials", credential_status, credential_tile_detail, credential_level, False),
             (
                 "session",
                 login_status,
@@ -851,104 +552,95 @@ class MarketplaceToolsApp(App[None]):
                 session_level,
                 True,
             ),
-            ("success", purchase_rate, purchase_tile_detail, self.purchase_rate_level(), False),
-            ("runtime", runtime, "Active session", "muted", False),
         ]
 
-    def tile_renderable(
-        self,
-        value: str,
-        detail: str,
-        level: str,
-        show_dot: bool,
-        muted: bool = False,
-        subdued: bool = False,
-    ) -> RenderableType:
-        body = Table.grid(expand=True)
-        body.add_column(justify="center")
-        if subdued and level != "info":
-            value_text = self.status_text(value, level, show_dot=show_dot)
-            detail_style = "#5f5f5f"
-        elif subdued:
-            value_text = Text()
-            if show_dot:
-                value_text.append(f"{STATUS_DOT} ", style="#8f8f8f")
-            value_text.append(value, style="#9a9a9a")
-            detail_style = "#5f5f5f"
-        elif muted and level == "muted":
-            value_text = Text(value, style="dim #aaaaaa")
-            detail_style = "#777777"
-        else:
-            value_text = self.status_text(value, level, show_dot=show_dot)
-            detail_style = "dim"
-        body.add_row(value_text)
-        body.add_row(Text(detail, style=detail_style))
-        return Align.center(body, vertical="middle")
-
     def refresh_dashboard_tiles(self, snapshot: tuple[str, ...]) -> None:
+        tm = self.task_manager
         for tile_key, value, detail, level, show_dot in self.dashboard_tile_data(snapshot):
             tile = self.query_one(f"#tile-{tile_key}", DashboardTile)
-            tile.update(self.tile_renderable(value, detail, level, show_dot, muted=not tile.interactive))
+            muted = not tile.interactive
+            if tile_key == "spent":
+                cap_text = self.spend_cap_short_label()
+                spent_text = format_compact_number(tm.session_silver_spent)
+                if spent_text == "0":
+                    spent_text = "0B"
+                value_text = Text(spent_text, style=STATUS_STYLES["info"])
+                value_text.append(f" / {cap_text}", style="#777777")
+            elif tile_key == "monitor":
+                # Buy mode wears a small amber warning triangle (caution: this mode spends
+                # silver) with neutral white text; watch-only rests as the plain idle ○.
+                if level == "idle":
+                    value_text = self.status_text(value, "idle", show_dot=show_dot)
+                else:
+                    value_text = Text("▲ ", style=STATUS_STYLES["orange"])
+                    value_text.append(value, style=STATUS_STYLES["info"])
+            elif level == "muted":
+                value_text = Text(value, style="dim #aaaaaa")
+            else:
+                value_text = self.status_text(value, level, show_dot=show_dot)
+            tile.update(self.dashboard_chip(str(tile.border_title), value_text, muted))
+        self.refresh_monitor_toggle()
 
-    def status_table(self, snapshot: tuple[str, ...] | None = None) -> Group:
-        snapshot = snapshot or self.dashboard_snapshot()
-        (
-            credential_status,
-            credential_detail,
-            credential_level,
-            login_status,
-            _monitor_status,
-            _mode,
-            delay_label,
-            delay_range,
-            purchase_delay_range,
-            _purchase_rate,
-            _purchase_detail,
-            _silver_spent,
-            _spend_detail,
-            _runtime,
-        ) = snapshot
+    def refresh_monitor_toggle(self) -> None:
+        try:
+            toggle = self.query_one("#monitor-toggle", MonitorToggleTile)
+        except Exception:
+            return
 
-        details = Table.grid(expand=True)
-        details.add_column("Label", style="bold", no_wrap=True, width=13)
-        details.add_column("Arrow", style="dim", no_wrap=True, width=3)
-        details.add_column("Value", no_wrap=True, width=20)
-        details.add_column("Detail", style="dim", no_wrap=True, overflow="ellipsis")
-        details.add_row("Credentials", "->", self.status_text(credential_status, credential_level), credential_detail)
-        details.add_row(
-            "Session",
-            "->",
-            self.status_text(login_status, self.session_status_state()[2]),
-            self.session_status_state()[1],
-        )
-        details.add_row("Polling", "->", self.status_text(delay_label, "info", show_dot=False), delay_range)
-        details.add_row("Buy Delay", "->", self.status_text(purchase_delay_range, "info", show_dot=False), "Between buys")
+        running = self.task_manager.monitor_running()
+        toggle.set_class(running, "toggle-stop")
+        toggle.set_class(not running, "toggle-start")
+        body = Table.grid(expand=True)
+        body.add_column(justify="center")
+        if running:
+            body.add_row(Text("■ STOP", style=f"bold {COLOR_ERROR}"))
+            body.add_row(Text(self.short_runtime_label(), style="#8f5555"))
+        else:
+            body.add_row(Text("▶ START", style=f"bold {COLOR_BRAND}"))
+            body.add_row(Text("space", style="#a06a35"))
+        toggle.update(Align.center(body, vertical="middle"))
 
-        return Group(details)
+    def dashboard_chip(self, title: str, value_text: Text, muted: bool) -> RenderableType:
+        label_text = Text(title, style="#6f6f6f" if muted else "bold #8f8f8f")
+        body = Table.grid(expand=True)
+        if muted:
+            body.add_column(justify="center")
+            body.add_row(label_text)
+            body.add_row(value_text)
+        else:
+            body.add_column(justify="left", ratio=1)
+            body.add_column(justify="right")
+            body.add_row(label_text, Text("›", style="#7a7a7a"))
+            body.add_row(value_text, Text(""))
+        return body
 
-    def purchase_rate_level(self) -> str:
-        detected = self.task_manager.session_detected_outfits
+    def purchase_rate_style(self, bought: int | None = None, detected: int | None = None) -> str:
+        # Continuous red->green ramp so the rate color climbs smoothly with the hit rate.
+        if detected is None:
+            detected = self.task_manager.session_detected_outfits
+        if bought is None:
+            bought = self.task_manager.session_successful_purchases
         if detected <= 0:
-            return "error"
-
-        percentage = (self.task_manager.session_successful_purchases / detected) * 100
-        if percentage >= 80:
-            return "success"
-        if percentage >= 50:
-            return "warning"
-        if percentage >= 25:
-            return "orange"
-        return "error"
+            return STATUS_STYLES["idle"]
+        return rate_spectrum_style(bought / detected)
 
     def refresh_live_widgets(self) -> None:
+        self.refresh_chrome_status()
+        self.refresh_logs_tab_badge()
         if self.current_view == "dashboard":
             try:
                 snapshot = self.dashboard_snapshot()
                 if snapshot != self._dashboard_snapshot:
                     self.refresh_dashboard_tiles(snapshot)
                     self._dashboard_snapshot = snapshot
-                self.sync_event_log()
+                self.sync_activity_tail()
                 self.refresh_modal_summaries()
+            except Exception:
+                pass
+        elif self.current_view == "logs":
+            try:
+                self.task_manager.mark_alerts_seen()
+                self.sync_event_log()
             except Exception:
                 pass
         elif self.current_view == "credentials":
@@ -958,60 +650,565 @@ class MarketplaceToolsApp(App[None]):
         elif self.current_view == "stats":
             self.refresh_stats()
 
+    def short_runtime_label(self) -> str:
+        label = self.task_manager.runtime_label()
+        if label.startswith("00:") and len(label) == 8:
+            return label[3:]
+        return label
+
+    RUNNING_PULSE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    # The Zzz builds quickly (one z per ~0.8s tick) then rests blank for this many ticks
+    # before the next set — a long pause between sleep breaths (~5s at the 0.8s tick).
+    ZZZ_GAP_TICKS = 6
+
+    def refresh_chrome_status(self) -> None:
+        tm = self.task_manager
+        running = tm.monitor_running()
+        try:
+            session_label, _detail, session_level = self.session_status_state()
+            session_text = Text()
+            session_style = STATUS_STYLES.get(session_level, f"bold {COLOR_TEXT_MUTED}")
+            session_dot = IDLE_DOT if session_level == "idle" else STATUS_DOT
+            session_text.append(f"{session_dot} ", style=session_style)
+            session_text.append(session_label, style=session_style)
+            self.query_one("#header-session", Static).update(session_text)
+        except Exception:
+            pass
+
+        try:
+            bar = Text()
+            # The bottom status bar uses the header's "│" line divider (dim #3a3a3a),
+            # not the strip's brighter dot.
+            separator = "  │  "
+            buying = tm.purchase_submission_enabled
+            bar.append(
+                f"{STATUS_DOT} " if buying else f"{IDLE_DOT} ",
+                style=STATUS_STYLES["success"] if buying else "#777777",
+            )
+            bar.append(tm.monitor_mode_label(), style="#8f8f8f")
+            bar.append(separator, style="#3a3a3a")
+            bar.append("cap ", style="#6f6f6f")
+            bar.append(self.spend_cap_short_label(), style="#d8d3c8")
+            # Session stats live on the welcome-card footer while running; the runtime
+            # lives on the STOP button. The status bar stays mode + cap on every tab.
+            self.query_one("#status-keys", Static).update(bar)
+        except Exception:
+            pass
+
+        try:
+            quit_hint = Text()
+            quit_hint.append("q ", style="#6f6f6f")
+            quit_hint.append("quit", style="#8f8f8f")
+            self.query_one("#status-state", Static).update(quit_hint)
+        except Exception:
+            pass
+
+        try:
+            card = self.query_one("#welcome-card", Vertical)
+            card.display = self.current_view == "dashboard"
+            card.set_class(not self.should_show_banner(), "-compact")
+            self.query_one("#banner", Static).display = self.should_show_banner()
+            self.refresh_mascot_rest()
+            self.sync_purchase_reward()
+        except Exception:
+            pass
+        self.refresh_welcome_footer(running)
+
+    def observed_purchase_totals(self) -> tuple[int, int]:
+        # Live view of session buys: per-item progress ticks lead during a buy list; the
+        # committed session totals catch up (and cover paths that never tick, like Fake Buy
+        # Success). max() of the two is monotonic within a session, so nothing fires twice.
+        tm = self.task_manager
+        return (
+            max(tm.session_successful_purchases, tm.purchase_progress_count),
+            max(tm.session_silver_spent, tm.purchase_progress_silver),
+        )
+
+    def sync_purchase_reward(self) -> None:
+        # Watches the observed buy totals; on a genuine increase the mascot flashes
+        # star-eyes and the strip plays its set piece. The ✦ tally is a bottom-right overlay.
+        count, spent = self.observed_purchase_totals()
+        if self._celebrated_purchases is None or count < self._celebrated_purchases:
+            # Baseline / session reset — adopt the totals silently, no reaction.
+            self._celebrated_purchases = count
+            self._reward_spent = spent
+        elif count > self._celebrated_purchases:
+            gained = count - self._celebrated_purchases
+            roll_from = self._reward_spent
+            self._celebrated_purchases = count
+            self._reward_spent = spent
+            self.celebrate_purchase()
+            self.celebrate_purchase_strip(gained, roll_from, spent)
+        try:
+            badges = self.render_buy_badges()
+            self.query_one("#buy-badges", Static).update(badges if badges is not None else Text(""))
+        except Exception:
+            pass
+
+    def celebrate_purchase(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        try:
+            banner = self.query_one("#banner", Static)
+        except Exception:
+            return
+        if not banner.display:
+            return
+        self._mascot_celebrating = True
+        banner.update(BANNER_STAR_ART)
+        self.set_timer(1.2, self._end_mascot_celebrate)
+
+    def _end_mascot_celebrate(self) -> None:
+        self._mascot_celebrating = False
+        try:
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
+        except Exception:
+            pass
+
+    # ── Strip set piece: flash -> coins+price -> spent count-up, on a buy ────────────
+    STRIP_FLASH_SECONDS = 0.9
+    STRIP_COINS_TICK = 0.2  # coins-frame refresh cadence while it live-counts the batch
+    STRIP_COINS_MIN_TICKS = 6  # minimum coins-frame time (~1.2s) even for a single instant buy
+    STRIP_ROLL_STEPS = 12
+    STRIP_ROLL_INTERVAL = 0.12  # ~1.4s of count-up so the roll reads, not flickers
+    STRIP_ROLL_SETTLE_SECONDS = 1.5  # hold the final spent value before restoring the live strip
+
+    def celebrate_purchase_strip(self, gained: int, roll_from: int, roll_to: int) -> None:
+        # Cosmetic and UI-thread only — the buy loop never waits on this. Fires whenever the
+        # mascot does (any buy: live, Start Test Buy, or Fake Buy Success), so it isn't gated
+        # on the monitor running; it just settles to whichever strip (running/idle) is current.
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if self._footer_celebrating:
+            # Frames render from the live observed totals, so a buy landing mid-animation
+            # folds in on the next frame tick — nothing to restart or retarget by hand.
+            return
+        observed_count, _observed_spent = self.observed_purchase_totals()
+        self._roll_from = roll_from
+        self._celebration_from_count = observed_count - max(1, gained)
+        self._footer_celebrating = True
+        self._show_strip_flash()
+
+    def _set_strip(self, footer: Text) -> None:
+        try:
+            self.query_one("#welcome-greeting", Static).update(Text("Nice grab!", style=f"bold {COLOR_GOLD}"))
+            self.query_one("#welcome-footer", Static).update(footer)
+        except Exception:
+            pass
+
+    def _show_strip_flash(self) -> None:
+        self._set_strip(Text("✦ ✦ ✦   BOUGHT   ✦ ✦ ✦", style=f"bold {COLOR_GOLD}"))
+        self.set_timer(self.STRIP_FLASH_SECONDS, self._show_strip_coins)
+
+    def _render_strip_coins(self) -> None:
+        observed_count, observed_spent = self.observed_purchase_totals()
+        gained = max(1, observed_count - self._celebration_from_count)
+        noun = "outfit" if gained == 1 else "outfits"
+        spent = max(0, observed_spent - self._roll_from)  # silver on this batch = the price
+        footer = Text("◍ ◍ ◍  ", style=COLOR_GOLD)
+        footer.append(f"{gained} {noun} secured", style="#d8d3c8")
+        footer.append("  ·  ", style=COLOR_TEXT_MUTED)
+        footer.append(f"{spent:,}", style=f"bold {COLOR_GOLD}")
+        footer.append(" silver", style="#6f6f6f")
+        self._set_strip(footer)
+
+    def _show_strip_coins(self) -> None:
+        self._coins_ticks = 0
+        self._render_strip_coins()
+        self.set_timer(self.STRIP_COINS_TICK, self._advance_strip_coins)
+
+    def _advance_strip_coins(self) -> None:
+        if not self._footer_celebrating:
+            return
+        self._render_strip_coins()
+        self._coins_ticks += 1
+        # Hold the coins frame while the buy list is still being processed — each secured
+        # item ticks the count/silver up live — then move on once the batch is done (with a
+        # minimum frame time so a single instant buy still reads).
+        if self.task_manager.purchase_in_progress or self._coins_ticks < self.STRIP_COINS_MIN_TICKS:
+            self.set_timer(self.STRIP_COINS_TICK, self._advance_strip_coins)
+            return
+        self._roll_step = 0
+        self._advance_strip_rollup()
+
+    def _advance_strip_rollup(self) -> None:
+        # Retarget to the live total each step so the roll always converges on the truth,
+        # even if another buy lands mid-roll (observed totals are monotonic in-session).
+        _count, self._roll_to = self.observed_purchase_totals()
+        steps = self.STRIP_ROLL_STEPS
+        fraction = self._roll_step / steps
+        value = round(self._roll_from + (self._roll_to - self._roll_from) * fraction)
+        footer = Text("spent ", style="#6f6f6f")
+        footer.append(format_compact_number(value), style=f"bold {COLOR_GOLD}")
+        footer.append(f" of {self.spend_cap_short_label()}", style="#6f6f6f")
+        self._set_strip(footer)
+        if self._roll_step < steps:
+            self._roll_step += 1
+            self.set_timer(self.STRIP_ROLL_INTERVAL, self._advance_strip_rollup)
+        else:
+            self.set_timer(self.STRIP_ROLL_SETTLE_SECONDS, self._end_strip_celebration)
+
+    def _end_strip_celebration(self) -> None:
+        self._footer_celebrating = False
+        # Re-baseline on the observed totals (more buys may have landed during the set
+        # piece and were folded in live — they must not fire a second celebration).
+        self._celebrated_purchases, self._reward_spent = self.observed_purchase_totals()
+        self._quip_index = 0
+        self.refresh_welcome_footer(self.task_manager.monitor_running())
+
+    # One ✦ badge per session buy, trailing the mascot's chatter (newest a shade brighter).
+    # Individual stars up to the cap, then a compact "✦ ×N" so a long session can't overrun
+    # the centered line.
+    BUY_BADGE_STAR = "✦"
+    # Kept short so the right-aligned strip never reaches the centered footer stats, even at
+    # the 96-col minimum width; past the cap it collapses to a compact "✦ ×N".
+    BUY_BADGE_CAP = 6
+
+    def render_buy_badges(self) -> Text | None:
+        count = self.task_manager.session_successful_purchases
+        if count <= 0:
+            return None
+        badges = Text()
+        if count <= self.BUY_BADGE_CAP:
+            for index in range(count):
+                if index:
+                    badges.append(" ")
+                # Right-aligned, the row grows leftward, so the newest star lands on the
+                # left — brighten it (index 0) rather than the rightmost.
+                style = "#ffd9a8" if index == 0 else COLOR_BRAND
+                badges.append(self.BUY_BADGE_STAR, style=style)
+        else:
+            badges.append(self.BUY_BADGE_STAR, style=COLOR_BRAND)
+            badges.append(f" ×{count}", style="#ffd9a8")
+        return badges
+
+    def time_greeting(self) -> str:
+        hour = time.localtime().tm_hour
+        if 5 <= hour < 12:
+            return "Good morning!"
+        if 12 <= hour < 17:
+            return "Good afternoon!"
+        if 17 <= hour < 22:
+            return "Good evening!"
+        return "Up late?"
+
+    def refresh_welcome_footer(self, running: bool) -> None:
+        # Two rows: the mascot's chatter/greeting sits centered right under the art, and the
+        # live state (running/idle · lifetime record) sits on the footer line below it.
+        if self._footer_celebrating:
+            # The strip set piece owns both rows until it settles.
+            return
+        try:
+            tm = self.task_manager
+            pool = self.chatter_pool(running)
+            chatter_line = pool[self._quip_index % len(pool)]
+            # The chatter stays centered on its own line, so accumulating badges never nudge
+            # it — the ✦ tally lives in its own bottom-right overlay (see sync_purchase_reward).
+            self.query_one("#welcome-greeting", Static).update(
+                Text(chatter_line, style="bold #d8d3c8")
+            )
+
+            footer = Text()
+            # One consistent divider dot everywhere in the strip, at a single bright tone,
+            # so idle and running read the same (no dim/bright mismatch).
+            sep = "  ·  "
+            sep_style = COLOR_TEXT_MUTED
+            if running:
+                # Running: the strip carries the session — bought, rate, and spend read
+                # against the cap. Idle keeps the lifetime record.
+                frame = self.RUNNING_PULSE_FRAMES[self._pulse_index]
+                footer.append(f"{frame} ", style=COLOR_BRAND)
+                footer.append("Running", style=STATUS_STYLES["success"])
+                detected = tm.session_detected_outfits
+                bought = tm.session_successful_purchases
+                footer.append(sep, style=sep_style)
+                footer.append("bought ", style="#6f6f6f")
+                # Bought is the number that matters, so the "seen" denominator recedes to
+                # gray — bought wins by contrast without adding weight or color.
+                footer.append(str(bought), style="#d8d3c8" if detected else "#6f6f6f")
+                footer.append(" of ", style="#6f6f6f")
+                footer.append(str(detected), style="#8f8f8f" if detected else "#6f6f6f")
+                footer.append(" seen", style="#6f6f6f")
+                # The rate joins only after the first detection: 0% of nothing is noise.
+                if detected > 0:
+                    footer.append(" (", style="#6f6f6f")
+                    footer.append(
+                        format_percent(bought, detected),
+                        style=self.purchase_rate_style(bought, detected),
+                    )
+                    footer.append(")", style="#6f6f6f")
+                footer.append(sep, style=sep_style)
+                footer.append("spent ", style="#6f6f6f")
+                spent = tm.session_silver_spent
+                # Session silver in the same gold as the idle lifetime figures.
+                footer.append(
+                    format_compact_number(spent),
+                    style=COLOR_GOLD if spent else "#6f6f6f",
+                )
+                footer.append(f" of {self.spend_cap_short_label()}", style="#6f6f6f")
+            else:
+                footer.append(f"{IDLE_DOT} Idle", style="#777777")
+                footer.append(sep, style=sep_style)
+                footer.append(f"{tm.lifetime_successful_purchases:,}", style=COLOR_GOLD)
+                footer.append(" outfits", style=COLOR_TEXT_MUTED)
+                footer.append(sep, style=sep_style)
+                footer.append(format_compact_number(tm.lifetime_silver_spent), style=COLOR_GOLD)
+                footer.append(" silver all-time", style=COLOR_TEXT_MUTED)
+            self.query_one("#welcome-footer", Static).update(footer)
+        except Exception:
+            pass
+
+    def advance_running_pulse(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if not self.task_manager.monitor_running():
+            return
+        self._pulse_index = (self._pulse_index + 1) % len(self.RUNNING_PULSE_FRAMES)
+        self.refresh_welcome_footer(True)
+
+    def chatter_pool(self, running: bool) -> list[str]:
+        # Running: the eager quips rotate. Idle: just the live time-of-day greeting (the
+        # mascot's sleep is shown by the Zzz trail, not chatter).
+        if running:
+            return list(RUNNING_QUIPS)
+        return [self.time_greeting()]
+
+    def advance_running_quip(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        # The mascot chatters in both states now — eager while running, dozy while idle.
+        running = self.task_manager.monitor_running()
+        pool = self.chatter_pool(running)
+        if len(pool) < 2:
+            return
+        current = self._quip_index % len(pool)
+        # Random pick, but never the same line twice in a row.
+        choices = [i for i in range(len(pool)) if i != current]
+        self._quip_index = random.choice(choices)
+        self.refresh_welcome_footer(running)
+
+    def mascot_rest_frame(self) -> str:
+        # The mascot's resting face IS the monitor state: eyes open (awake) while running,
+        # eyes closed + a rising "Zzz" while idle (dozing) — so starting the bot visibly
+        # wakes it. With animations off (tests), the plain logo stays neutral.
+        if not self.animations_enabled:
+            return BANNER_ART
+        if self.task_manager.monitor_running():
+            return BANNER_ART
+        return self._augment_zzz(BANNER_BLINK_ART)
+
+    def _augment_zzz(self, base_art: str) -> str:
+        # Overlay the first _zzz_step cells of the trail onto blank cells of the banner
+        # grid (overwrites spaces in place, so total width never changes → no shift).
+        if self._zzz_step <= 0:
+            return base_art
+        rows = [list(line) for line in base_art.split("\n")]
+        for row, col, char in MASCOT_ZZZ_TRAIL[: self._zzz_step]:
+            if row < len(rows) and col < len(rows[row]):
+                rows[row][col] = char
+        return "\n".join("".join(row) for row in rows)
+
+    def advance_mascot_zzz(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if self.task_manager.monitor_running():
+            return
+        # Freeze the sleep clock while a drowsy peek owns the banner. Otherwise the step
+        # would advance under the blink guard (unpainted), swallowing z-reveals — most
+        # visibly the final Z — and making the cadence look random.
+        if self._mascot_blinking or self._mascot_celebrating:
+            return
+        # A set builds quickly (z -> z -> z), then the empty step lingers ZZZ_GAP_TICKS
+        # ticks so there's a long blank pause before the next set begins.
+        if self._zzz_step == 0:
+            self._zzz_gap += 1
+            if self._zzz_gap < self.ZZZ_GAP_TICKS:
+                return
+            self._zzz_gap = 0
+        self._zzz_step = (self._zzz_step + 1) % (len(MASCOT_ZZZ_TRAIL) + 1)
+        self.refresh_mascot_rest()
+
+    def refresh_mascot_rest(self) -> None:
+        if self._mascot_blinking or self._mascot_celebrating:
+            return
+        try:
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
+        except Exception:
+            pass
+
+    def blink_mascot(self) -> None:
+        if not self.animations_enabled or self.current_view != "dashboard":
+            return
+        if self._mascot_celebrating:
+            return  # a buy celebration owns the banner; don't blink over the stars
+        try:
+            banner = self.query_one("#banner", Static)
+        except Exception:
+            return
+        if not banner.display:
+            return
+        # Awake: a quick alert blink (eyes close briefly). Dozing: a slow drowsy peek
+        # (eyes crack open briefly). The rest frame is the opposite in each state.
+        running = self.task_manager.monitor_running()
+        if not running:
+            # The idle peek shares the 4s blink timer but should be rare — skip most
+            # ticks so the sleeping eyes only crack open every ~8-12s.
+            if self._idle_peek_countdown > 0:
+                self._idle_peek_countdown -= 1
+                return
+            self._idle_peek_countdown = random.randint(1, 2)
+        self._mascot_blinking = True
+        if running:
+            banner.update(BANNER_BLINK_ART)
+            self.set_timer(0.15, self._end_mascot_blink)
+        else:
+            # Drowsy peek: eyes crack open but the Zzz stays — still dozing. Held long
+            # (~1.35s) so the idle wake reads as a slow, sleepy stir.
+            banner.update(self._augment_zzz(BANNER_ART))
+            self.set_timer(1.35, self._end_mascot_blink)
+
+    def _end_mascot_blink(self) -> None:
+        self._mascot_blinking = False
+        if self._mascot_celebrating:
+            return  # a buy landed mid-blink; leave the stars for the celebration timer
+        try:
+            self.query_one("#banner", Static).update(self.mascot_rest_frame())
+        except Exception:
+            pass
+
     def should_show_banner(self) -> bool:
         size = self.size
-        return self.current_view == "dashboard" and size.width >= 96 and size.height >= 34
+        # The mascot is the app's identity, so it stays visible far longer than before —
+        # the activity tail yields its rows first (see activity_tail_lines). Only once the
+        # window is too short for even a 2-line tail does the 12-row banner give way.
+        return self.current_view == "dashboard" and size.width >= 96 and size.height >= 30
+
+    def activity_tail_lines(self) -> int:
+        # Priority order when the window shrinks vertically: keep the mascot, sacrifice the
+        # tail. So while the banner is shown the tail steps down 4 -> 2 to free rows. Once
+        # the banner is hidden (very short windows) the card frees ~14 rows and the tail
+        # returns to full height.
+        if not self.should_show_banner():
+            return self.ACTIVITY_TAIL_LINES
+        height = self.size.height
+        if height >= 34:
+            return 4
+        if height >= 32:
+            return 3
+        return 2
 
     def refresh_layout_density(self) -> None:
         try:
-            self.query_one("#banner", Static).display = self.should_show_banner()
+            self.refresh_chrome_status()
             self.update_chrome_visibility()
+        except Exception:
+            pass
+        try:
+            self.sync_activity_tail()
         except Exception:
             pass
 
     def update_chrome_visibility(self) -> None:
-        title = self.query_one("#screen-title", Static)
-        title.display = self.current_view != "dashboard"
+        for key in ("settings", *[item_key for item_key, _label in self.TAB_ITEMS]):
+            try:
+                tab = self.query_one(f"#tab-{key}", NavTab)
+            except Exception:
+                continue
+            tab.set_class(key == self.current_view, "nav-tab-active")
+
+    def sync_activity_tail(self) -> None:
+        lines = self.activity_tail_lines()
+        events = tuple(self.task_manager.events_for_filter("notable"))[-lines:]
+        # The line count is part of the signature so a resize re-slices even when the
+        # event stream itself hasn't changed.
+        signature = (lines, events)
+        if signature == self._rendered_tail:
+            return
+
+        tail = self.query_one("#activity-tail", Static)
+        tail.styles.height = lines
+        if events:
+            text = Text()
+            for index, event in enumerate(events):
+                if index:
+                    text.append("\n")
+                text.append_text(Text.from_markup(event))
+            tail.update(text)
+        else:
+            tail.update(Text("No activity yet.", style=COLOR_TEXT_MUTED))
+        self._rendered_tail = signature
+
+    def refresh_logs_tab_badge(self) -> None:
+        try:
+            tab = self.query_one("#tab-logs", NavTab)
+        except Exception:
+            return
+        show_dot = self.current_view != "logs" and self.task_manager.has_unseen_alerts()
+        if getattr(tab, "_alert_dot", None) == show_dot:
+            return
+        tab._alert_dot = show_dot
+        if show_dot:
+            label = Text("Logs")
+            label.append(" ●", style=COLOR_BRAND)
+            tab.update(label)
+        else:
+            tab.update("Logs")
+
+    LOG_FILTER_LABELS = {"all": "All", "notable": "Notable", "alerts": "Alerts"}
+    LOG_FILTER_EMPTY = {
+        "all": "No events yet.",
+        "notable": "No notable events yet.",
+        "alerts": "No warnings or errors yet.",
+    }
 
     def sync_event_log(self) -> None:
         self.refresh_event_log_filter_controls()
-        events = tuple(self.task_manager.events_for_channel(self.event_log_mode))
-        if events == self._rendered_events:
+        events = tuple(self.task_manager.events_for_filter(self.log_filter, dividers=True))
+        # The active filter is part of the signature so switching chips re-renders even
+        # when the underlying stream hasn't changed.
+        signature = (self.log_filter, events)
+        if signature == self._rendered_events:
             return
 
+        self.refresh_event_log_title(len(events))
         log = self.query_one("#event-log", RichLog)
-        log.border_title = f"Event Log - {self.event_log_label()}"
-        log.clear()
-        if events:
-            for event in events:
+        previous_filter, previous_events = self._rendered_events or (None, ())
+        if (
+            previous_filter == self.log_filter
+            and previous_events
+            and len(events) > len(previous_events)
+            and events[: len(previous_events)] == previous_events
+        ):
+            # Pure additions: append so the reader's scroll position isn't yanked to the
+            # bottom every time the monitor logs. Anything else (filter switch, a coalesce
+            # counter mutating the last line, buffer eviction) falls back to a full redraw.
+            for event in events[len(previous_events):]:
                 log.write(event)
         else:
-            log.write(f"No {self.event_log_label().lower()} events yet.")
-        self._rendered_events = events
+            log.clear()
+            if events:
+                for event in events:
+                    log.write(event)
+            else:
+                log.write(self.LOG_FILTER_EMPTY[self.log_filter])
+        self._rendered_events = signature
 
-    def event_log_label(self) -> str:
-        return "UI" if self.event_log_mode == "ui" else "Core"
+    def refresh_event_log_title(self, count: int) -> None:
+        try:
+            title = self.query_one("#event-log-title", Static)
+        except Exception:
+            return
+        text = Text("Event Log", style="bold #8f8f8f")
+        text.append(f"  ·  {count} {'event' if count == 1 else 'events'}", style="#5a5a5a")
+        title.update(text)
 
     def refresh_event_log_filter_controls(self) -> None:
-        labels = {"core": "Core logs", "ui": "UI logs"}
-        for mode, label in labels.items():
+        for mode in self.LOG_FILTER_LABELS:
             try:
                 option = self.query_one(f"#log-filter-{mode}", LogFilterOption)
             except Exception:
                 continue
-            is_active = mode == self.event_log_mode
-            option.set_class(is_active, "log-filter-selected")
-            # Show an unread dot on the tab you are NOT viewing when a log lands there.
-            has_dot = (not is_active) and self.task_manager.has_unseen_events(mode)
-            if getattr(option, "_unread_dot", False) == has_dot:
-                continue
-            option._unread_dot = has_dot
-            if has_dot:
-                text = Text(label)
-                text.append(" ●", style=COLOR_BRAND)
-                option.update(text)
-            else:
-                option.update(label)
+            option.set_class(mode == self.log_filter, "log-filter-selected")
 
     async def mount_credentials(self, content: Container) -> None:
         _, _, _, email, _ = self.credential_state()
@@ -1043,16 +1240,24 @@ class MarketplaceToolsApp(App[None]):
         except Exception:
             return
 
+        # border_title is no longer rendered (flat chips) but tests and callers rely on it.
         tile.border_title = title
-        tile.update(
-            self.tile_renderable(
-                value,
-                detail,
-                level,
-                show_dot=show_dot,
-                subdued="modal-info-muted" in tile.classes,
-            )
-        )
+        clickable = "modal-info-clickable" in tile.classes
+        label_text = Text(title, style="bold #8f8f8f")
+        value_text = self.status_text(value, level, show_dot=show_dot)
+        body = Table.grid(expand=True)
+        if clickable:
+            body.add_column(justify="left", ratio=1)
+            body.add_column(justify="right")
+            body.add_row(label_text, Text("›", style="#7a7a7a"))
+            body.add_row(value_text, Text(""))
+            body.add_row(Text(detail, style="#6f6f6f"), Text(""))
+        else:
+            body.add_column(justify="left")
+            body.add_row(label_text)
+            body.add_row(value_text)
+            body.add_row(Text(detail, style="#6f6f6f"))
+        tile.update(body)
 
     def modal_custom_delay_bounds(self) -> tuple[int, int] | None:
         try:
@@ -1092,7 +1297,12 @@ class MarketplaceToolsApp(App[None]):
             else:
                 tile.remove_class("preset-selected")
             detail = "Recommended" if key == "2" else ""
-            tile.update(self.tile_renderable(f"{low}-{high}s", detail, "orange" if selected else "info", False))
+            body = Table.grid(expand=True)
+            body.add_column(justify="center")
+            body.add_row(Text(str(tile.border_title), style=f"bold {COLOR_BRAND}" if selected else "bold #8f8f8f"))
+            body.add_row(Text(f"{low}-{high}s", style="#c98a50" if selected else "#d8d3c8"))
+            body.add_row(Text(detail, style="#a06a35" if selected else "#6f6f6f"))
+            tile.update(body)
 
     def refresh_credentials_summary(self) -> None:
         try:
@@ -1205,46 +1415,47 @@ class MarketplaceToolsApp(App[None]):
             pass
 
     async def mount_settings(self, content: Container) -> None:
-        await content.mount(Static(id="settings-about", classes="settings-note"))
+        await content.mount(Static(id="settings-identity"))
 
-        await content.mount(
-            Horizontal(
-                Static(id="settings-account", classes="stats-tile"),
-                Static(id="settings-session", classes="stats-tile"),
-                classes="stats-row",
-            )
+        about_card = Vertical(
+            Static(id="settings-about-facts", classes="action-card-line-tight"),
+            id="settings-about-card",
+            classes="action-card",
         )
+        await content.mount(about_card)
+        about_card.border_title = "About"
 
-        await content.mount(
-            Horizontal(
-                Static(id="settings-update", classes="action-card-info"),
-                ModalAction("Check Now", "settings-check-update", extra_classes="modal-action-compact"),
-                ModalAction("Startup: On", "settings-toggle-update-startup", extra_classes="modal-action-compact"),
-                id="settings-update-card",
-                classes="action-card",
-            )
+        update_card = Horizontal(
+            Static(id="settings-update", classes="action-card-info"),
+            ModalAction("Check Now", "settings-check-update", extra_classes="modal-action-compact"),
+            ModalAction("Startup: On", "settings-toggle-update-startup", extra_classes="modal-action-compact"),
+            id="settings-update-card",
+            classes="action-card",
         )
+        await content.mount(update_card)
+        update_card.border_title = "Updates"
 
-        await content.mount(
-            Vertical(
-                Static(id="settings-storage-facts", classes="action-card-line"),
-                Horizontal(
-                    Label("Auto-clean at", classes="cache-inline-label"),
-                    Input(
-                        value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
-                        type="integer",
-                        id="settings-cache-threshold-input",
-                    ),
-                    Label("MiB", classes="cache-inline-label"),
-                    Static(classes="action-card-spacer"),
-                    ModalAction("Save", "settings-save-cache-limit", extra_classes="modal-action-compact"),
-                    ModalAction("Clean now", "settings-clean-cache", extra_classes="modal-action-compact"),
-                    classes="cache-controls-row",
+        storage_card = Vertical(
+            Static(id="settings-storage-facts", classes="action-card-line"),
+            Horizontal(
+                Label("Auto-clean at", classes="cache-inline-label"),
+                Input(
+                    value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
+                    type="integer",
+                    id="settings-cache-threshold-input",
+                    select_on_focus=False,
                 ),
-                id="settings-storage-card",
-                classes="action-card",
-            )
+                Label("MiB", classes="cache-inline-label"),
+                Static(classes="action-card-spacer"),
+                ModalAction("Save", "settings-save-cache-limit", extra_classes="modal-action-compact"),
+                ModalAction("Clean now", "settings-clean-cache", extra_classes="modal-action-compact"),
+                classes="cache-controls-row",
+            ),
+            id="settings-storage-card",
+            classes="action-card",
         )
+        await content.mount(storage_card)
+        storage_card.border_title = "Storage"
         await content.mount(Static("", id="settings-status"))
 
         await content.mount(
@@ -1281,54 +1492,51 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_settings_summary(self) -> None:
         try:
-            about = self.query_one("#settings-about", Static)
+            identity = self.query_one("#settings-identity", Static)
         except Exception:
             return
 
         tm = self.task_manager
-        steam_mode = tm.uses_steam_browser_session()
-        session_label, session_detail, session_level = self.session_status_state()
 
-        about_text = Text()
-        about_text.append("Marketplace Tools", style=COLOR_INFO)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(f"v{APP_VERSION} ({APP_CHANNEL})", style=COLOR_TEXT_MUTED)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(f"schema v{SETTINGS_SCHEMA_VERSION}", style=COLOR_TEXT_MUTED)
-        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
-        about_text.append(self.launch_mode, style=COLOR_WARNING if self.is_test_mode else COLOR_TEXT_MUTED)
-        about.update(about_text)
+        # Identity header: product name left, version right-aligned.
+        header = Table.grid(expand=True)
+        header.add_column(justify="left")
+        header.add_column(justify="right")
+        header.add_row(
+            Text("Marketplace Tools", style=f"bold {COLOR_BRAND}"),
+            Text(f"v{APP_VERSION}", style=COLOR_INFO),
+        )
+        identity.update(header)
 
-        self.refresh_info_tile(
-            "settings-account",
-            "Account",
-            "Steam" if steam_mode else "Pearl Abyss",
-            tm.account_mode_detail(),
-        )
-        self.refresh_info_tile(
-            "settings-session",
-            "Session",
-            session_label,
-            session_detail,
-            session_level,
-            True,
-        )
+        # About facts: the build metadata, laid out as labeled facts rather than a jargon dump.
+        facts = Text()
+        for index, (label, value, value_style) in enumerate(
+            (
+                ("channel", str(APP_CHANNEL).lower(), COLOR_INFO),
+                ("schema", str(SETTINGS_SCHEMA_VERSION), COLOR_INFO),
+                ("mode", self.launch_mode, STATUS_STYLES["warning"] if self.is_test_mode else COLOR_INFO),
+            )
+        ):
+            if index:
+                facts.append("      ")
+            facts.append(f"{label}  ", style="#6f6f6f")
+            facts.append(value, style=value_style)
+        try:
+            self.query_one("#settings-about-facts", Static).update(facts)
+        except Exception:
+            pass
 
         update_line = Text()
-        update_line.append("Update", style=f"bold {COLOR_TEXT_MUTED}")
-        update_line.append("   ")
         if tm.available_update_version:
-            update_line.append(f"v{tm.available_update_version}", style=STATUS_STYLES["warning"])
-            update_detail = "New version available"
+            update_line.append("▲ ", style=STATUS_STYLES["warning"])
+            update_line.append(f"v{tm.available_update_version} available", style=STATUS_STYLES["warning"])
+            update_line.append(f"   ·   you have v{APP_VERSION}", style=COLOR_TEXT_MUTED)
         elif tm.update_check_completed:
             update_line.append("✓ ", style=STATUS_STYLES["success"])
             update_line.append("Up to date", style=STATUS_STYLES["success"])
-            update_detail = f"v{APP_VERSION}"
+            update_line.append(f"   ·   latest is v{APP_VERSION}", style=COLOR_TEXT_MUTED)
         else:
-            update_line.append("Unknown", style=STATUS_STYLES["info"])
-            update_detail = "Not checked yet"
-        update_line.append("   ·   ", style=COLOR_TEXT_MUTED)
-        update_line.append(update_detail, style=COLOR_TEXT_MUTED)
+            update_line.append("Not checked yet", style=COLOR_TEXT_MUTED)
         try:
             self.query_one("#settings-update", Static).update(update_line)
         except Exception:
@@ -1342,8 +1550,6 @@ class MarketplaceToolsApp(App[None]):
 
         storage = tm.browser_storage_summary()
         storage_line = Text()
-        storage_line.append("Storage", style=f"bold {COLOR_TEXT_MUTED}")
-        storage_line.append("   ")
         storage_line.append(f"{format_storage_size(storage.total_bytes)} used", style=COLOR_INFO)
         storage_line.append("   ·   ", style=COLOR_TEXT_MUTED)
         storage_line.append(
@@ -1397,37 +1603,31 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_monitor_summary(self) -> None:
         try:
-            self.query_visible_one("#monitor-summary")
+            self.query_visible_one("#monitor-mode-options")
         except Exception:
             return
 
-        self.refresh_modal_tile(
-            "monitor-status-tile",
-            "Status",
-            self.task_manager.monitor_status_label(),
-            "Monitor",
-            "success" if self.task_manager.monitor_running() else "error",
-            True,
+        buying = self.task_manager.purchase_submission_enabled
+        mode_tiles = (
+            ("watch", "Detect and log only", not buying),
+            ("buy", "Auto-buys detections", buying),
         )
-        self.refresh_modal_tile(
-            "monitor-mode-tile",
-            "Mode",
-            self.task_manager.monitor_mode_label(),
-            "Purchase behavior",
-        )
-        self.refresh_modal_tile(
-            "monitor-session-tile",
-            "Session",
-            self.session_status_state()[0].title(),
-            self.session_status_state()[1],
-            self.session_status_state()[2],
-            True,
-        )
-        try:
-            self.query_visible_one("#modal-start-monitor", Button).disabled = self.task_manager.monitor_running()
-            self.query_visible_one("#modal-stop-monitor", Button).disabled = not self.task_manager.monitor_running()
-        except Exception:
-            pass
+        for key, detail, selected in mode_tiles:
+            try:
+                tile = self.query_visible_one(f"#monitor-mode-{key}", MonitorModeTile)
+            except Exception:
+                continue
+            tile.set_class(selected, "preset-selected")
+            body = Table.grid(expand=True)
+            body.add_column(justify="left")
+            body.add_row(
+                Text(str(tile.border_title), style=f"bold {COLOR_BRAND}" if selected else "bold #8f8f8f")
+            )
+            body.add_row(Text(detail, style="#a06a35" if selected else "#6f6f6f"))
+            body.add_row(
+                Text(f"{STATUS_DOT} Active", style=STATUS_STYLES["success"]) if selected else Text("")
+            )
+            tile.update(body)
 
     def refresh_session_summary(self) -> None:
         try:
@@ -1438,7 +1638,7 @@ class MarketplaceToolsApp(App[None]):
         account = self.session_account_label()
         self.refresh_modal_tile("session-account-tile", "Account", account, self.task_manager.account_mode_label())
         try:
-            credentials_row = self.query_visible_one("#session-credentials-row")
+            self.query_visible_one("#session-credentials-row")
             refresh_button = self.query_visible_one("#refresh-session", Button)
         except Exception:
             return
@@ -1495,77 +1695,114 @@ class MarketplaceToolsApp(App[None]):
         await content.mount(Static("Inventory data has not been loaded yet.", id="wallet-output", classes="panel"))
 
     async def mount_stats(self, content: Container) -> None:
-        await content.mount(Static("This Session", classes="stats-section-title"))
         await content.mount(
             Horizontal(
-                Static(id="stats-session-detected", classes="stats-tile"),
-                Static(id="stats-session-purchases", classes="stats-tile"),
-                Static(id="stats-session-rate", classes="stats-tile"),
-                Static(id="stats-session-spent", classes="stats-tile"),
-                classes="stats-row",
+                Static(id="stats-session-detected", classes="stats-chip"),
+                Static(id="stats-session-purchases", classes="stats-chip"),
+                Static(id="stats-session-rate", classes="stats-chip"),
+                Static(id="stats-session-spent", classes="stats-chip"),
+                classes="stats-chip-row",
             )
         )
-        await content.mount(Static("Lifetime", classes="stats-section-title"))
-        await content.mount(Static(id="stats-lifetime-list", classes="settings-config"))
+        await content.mount(
+            Static("Daily activity · 30 days", id="stats-trends-title", classes="stats-chart-title")
+        )
+        await content.mount(DailyActivityChart())
+        await content.mount(
+            Horizontal(
+                Vertical(
+                    Static("Busiest days", classes="stats-chart-title"),
+                    Static(id="stats-chart-weekday", classes="stats-chart"),
+                    id="stats-col-weekday",
+                    classes="stats-chart-column",
+                ),
+                Vertical(
+                    Static("Listing hours", classes="stats-chart-title"),
+                    Static(id="stats-chart-hours", classes="stats-chart"),
+                    id="stats-col-hours",
+                    classes="stats-chart-column",
+                ),
+                id="stats-chart-row",
+            )
+        )
+        self._stats_trends_key = None
         self.refresh_stats()
 
-    def refresh_info_tile(
-        self,
-        tile_id: str,
-        title: str,
-        value: str,
-        detail: str,
-        level: str = "info",
-        show_dot: bool = False,
-    ) -> None:
-        try:
-            tile = self.query_one(f"#{tile_id}", Static)
-        except Exception:
-            return
-
-        tile.border_title = title
-        tile.update(self.tile_renderable(value, detail, level, show_dot=show_dot))
-
     def refresh_stats(self) -> None:
-        self.task_manager.reload_lifetime_stats()
-        self.refresh_info_tile(
-            "stats-session-detected",
-            "Detected",
-            str(self.task_manager.session_detected_outfits),
-            "Outfits found",
+        tm = self.task_manager
+        tm.reload_lifetime_stats()
+        detected = tm.session_detected_outfits
+        bought = tm.session_successful_purchases
+
+        detected_value = Text(str(detected), style=STATUS_STYLES["info"])
+        detected_value.append(" this session", style="#6f6f6f")
+
+        bought_value = Text(str(bought), style=STATUS_STYLES["success" if bought else "info"])
+        bought_value.append(
+            f" · {format_compact_number(tm.lifetime_successful_purchases)} lifetime", style="#6f6f6f"
         )
-        self.refresh_info_tile(
-            "stats-session-purchases",
-            "Bought",
-            str(self.task_manager.session_successful_purchases),
-            "This session",
-            "success" if self.task_manager.session_successful_purchases else "info",
+
+        rate_value = Text(format_percent(bought, detected), style=self.purchase_rate_style(bought, detected))
+        rate_value.append(f" · {bought}/{detected}", style="#6f6f6f")
+
+        spent_value = Text(format_compact_number(tm.session_silver_spent), style=STATUS_STYLES["info"])
+        spent_value.append(
+            f" · {format_compact_number(tm.lifetime_silver_spent)} lifetime", style="#6f6f6f"
         )
-        self.refresh_info_tile(
-            "stats-session-rate",
-            "Success Rate",
-            format_percent(
-                self.task_manager.session_successful_purchases,
-                self.task_manager.session_detected_outfits,
-            ),
-            f"{self.task_manager.session_successful_purchases}/{self.task_manager.session_detected_outfits} bought",
-            self.purchase_rate_level(),
-        )
-        self.refresh_info_tile(
-            "stats-session-spent",
-            "Silver Spent",
-            format_compact_silver(self.task_manager.session_silver_spent),
-            "This session",
-        )
-        lifetime = Table.grid(padding=(0, 2))
-        lifetime.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
-        lifetime.add_column()
-        lifetime.add_row("Bought", format_compact_number(self.task_manager.lifetime_successful_purchases))
-        lifetime.add_row("Spent", format_compact_silver(self.task_manager.lifetime_silver_spent))
+
+        for chip_id, title, value_text in (
+            ("stats-session-detected", "Detected", detected_value),
+            ("stats-session-purchases", "Bought", bought_value),
+            ("stats-session-rate", "Success Rate", rate_value),
+            ("stats-session-spent", "Silver Spent", spent_value),
+        ):
+            body = Table.grid(expand=True)
+            body.add_column(justify="left")
+            body.add_row(Text(title, style="bold #8f8f8f"))
+            body.add_row(value_text)
+            try:
+                self.query_one(f"#{chip_id}", Static).update(body)
+            except Exception:
+                pass
+        self.refresh_stats_trends()
+
+    def refresh_stats_trends(self) -> None:
+        # Trend queries only rerun when new history landed; the 1-second stats
+        # refresh otherwise leaves the charts alone.
+        key = self.task_manager.stats_history_revision
+        if key == self._stats_trends_key:
+            return
         try:
-            self.query_one("#stats-lifetime-list", Static).update(lifetime)
+            trends = stats_db.load_trends(30, path=self.task_manager.stats_db_path)
+        except Exception as exc:
+            self.show_stats_trends_error(exc, key)
+            return
+        try:
+            self.query_one("#stats-chart-daily", DailyActivityChart).update_daily(trends["daily"])
+            self.query_one("#stats-chart-weekday", Static).update(weekday_chart(trends["weekday"]))
+            self.query_one("#stats-chart-hours", Static).update(hour_heatmap_chart(trends["hourly"]))
+        except Exception as exc:
+            self.show_stats_trends_error(exc, key)
+            return
+        self._stats_trends_key = key
+        self._stats_trends_error_key = None
+
+    def show_stats_trends_error(self, exc: Exception, key: int) -> None:
+        message = Text("Stats charts unavailable", style=STATUS_STYLES["warning"])
+        try:
+            self.query_one("#stats-chart-daily", DailyActivityChart).clear_daily()
         except Exception:
             pass
+        for chart_id in ("stats-chart-daily", "stats-chart-weekday", "stats-chart-hours"):
+            try:
+                self.query_one(f"#{chart_id}", Static).update(message)
+            except Exception:
+                pass
+        if self._stats_trends_error_key == key:
+            return
+        detail = str(exc).strip() or exc.__class__.__name__
+        self.task_manager.add_event(f"Stats charts failed to load: {detail}", "warning")
+        self._stats_trends_error_key = key
 
     def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
         handled = {
@@ -1622,14 +1859,9 @@ class MarketplaceToolsApp(App[None]):
     def on_log_filter_option_pressed(self, event: LogFilterOption.Pressed) -> None:
         event.stop()
         event.option.blur()
-        if event.option.mode == self.event_log_mode:
+        if event.option.mode == self.log_filter or event.option.mode not in self.LOG_FILTER_LABELS:
             return
-        try:
-            self.event_log_mode = self.task_manager.set_event_log_view(event.option.mode)
-        except ValueError:
-            return
-        self._rendered_events = None
-        self.refresh_event_log_filter_controls()
+        self.log_filter = event.option.mode
         self.sync_event_log()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1656,11 +1888,6 @@ class MarketplaceToolsApp(App[None]):
             if self.save_buy_delay_settings():
                 self.refresh_modal_summaries()
                 self.close_active_dashboard_modal()
-        elif button_id == "modal-start-monitor":
-            await self.start_monitor()
-            self.refresh_modal_summaries()
-        elif button_id == "modal-stop-monitor":
-            await self.stop_monitor(close_modal=True)
         elif button_id == "refresh-session":
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
@@ -1684,14 +1911,6 @@ class MarketplaceToolsApp(App[None]):
                 group="actions",
                 exclusive=True,
             )
-        elif button_id == "open-blank-browser":
-            if self._debug_action_allowed():
-                self.run_worker(
-                    self.open_blank_browser_diagnostic(),
-                    name="blank-browser-diagnostic",
-                    group="actions",
-                    exclusive=True,
-                )
         elif button_id == "reset-steam-setup":
             await self.reset_test_steam_setup_status()
         elif button_id == "clear-browser-cookies":
@@ -1702,11 +1921,11 @@ class MarketplaceToolsApp(App[None]):
                     group="actions",
                     exclusive=True,
                 )
-        elif button_id == "dump-cookies-keep-steam":
+        elif button_id == "clear-cookies-keep-steam":
             if self._debug_action_allowed():
                 self.run_worker(
-                    self.dump_test_cookies_keep_steam(),
-                    name="dump-cookies-keep-steam",
+                    self.clear_test_cookies_keep_steam(),
+                    name="clear-cookies-keep-steam",
                     group="actions",
                     exclusive=True,
                 )
@@ -1714,12 +1933,24 @@ class MarketplaceToolsApp(App[None]):
             await self.start_single_item_test_monitor()
         elif button_id == "start-test-buy":
             await self.start_single_item_test_monitor(allow_purchase=True)
+        elif button_id == "live-buy-error-probe":
+            await self.start_live_buy_error_probe()
         elif button_id == "stop-test-monitor":
             await self.stop_single_item_test_monitor()
         elif button_id == "fake-detection":
             await self.fake_outfit_detection()
+        elif button_id == "fake-multi-detection":
+            await self.fake_multi_outfit_detection()
         elif button_id == "fake-buy-success":
             await self.fake_buy_success()
+        elif button_id == "fake-bundled-buy":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.fake_bundled_buy_success(),
+                    name="fake-bundled-buy",
+                    group="debug-actions",
+                    exclusive=True,
+                )
 
     async def on_dashboard_tile_pressed(self, event: DashboardTile.Pressed) -> None:
         event.stop()
@@ -1804,10 +2035,9 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
-    async def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id != "buy-mode-switch":
-            return
-        await self.apply_purchase_mode(bool(event.value), source_switch_id=event.switch.id)
+    async def on_monitor_mode_tile_pressed(self, event: MonitorModeTile.Pressed) -> None:
+        event.stop()
+        await self.apply_purchase_mode(event.tile.mode_key == "buy")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id in {
@@ -1875,7 +2105,7 @@ class MarketplaceToolsApp(App[None]):
         if not self.apply_custom_delay_from_inputs(log_status=False):
             return False
 
-        self.set_status(f"Polling settings saved: {self.polling_status_detail()}.", "success")
+        self.set_status(f"Polling settings saved: {highlight(self.polling_status_detail())}.", "success")
         return True
 
     def apply_purchase_delay_from_inputs(self, log_status: bool = True) -> bool:
@@ -1903,7 +2133,7 @@ class MarketplaceToolsApp(App[None]):
         if not self.apply_purchase_delay_from_inputs(log_status=False):
             return False
 
-        self.set_status(f"Buy delay saved: {self.task_manager.purchase_delay_range()}.", "success")
+        self.set_status(f"Buy delay saved: {highlight(self.task_manager.purchase_delay_range())}.", "success")
         return True
 
     async def apply_purchase_mode(self, enabled: bool, source_switch_id: str | None = None) -> None:
@@ -1915,7 +2145,7 @@ class MarketplaceToolsApp(App[None]):
 
         if not enabled:
             self.task_manager.set_purchase_submission_enabled(False)
-            self.set_status("Mode set to watch only.", "info")
+            self.set_status(f"Mode set to {highlight('Watch only')}.", "info")
             self.sync_mode_switches(False, except_id=source_switch_id)
             self.refresh_settings_summary()
             self.refresh_live_widgets()
@@ -1949,7 +2179,9 @@ class MarketplaceToolsApp(App[None]):
             return
 
         self.task_manager.set_purchase_submission_enabled(True)
-        self.set_status("Mode set to buy mode. Starting the monitor will ask for confirmation.", "warning")
+        # Arming buy mode is a deliberate choice, not a fault — the orange mode name carries
+        # the caution; the sentence itself stays on the dim noise floor.
+        self.set_status(f"Mode set to {highlight_brand('Buy mode')}. Starting the monitor will ask for confirmation.", "info")
         self.sync_mode_switches(True, except_id=source_switch_id)
         self.refresh_settings_summary()
         self.refresh_live_widgets()
@@ -1957,7 +2189,7 @@ class MarketplaceToolsApp(App[None]):
     def _handle_running_buy_mode_confirmation(self, confirmed: bool) -> None:
         self.task_manager.set_purchase_submission_enabled(bool(confirmed))
         if confirmed:
-            self.set_status("Buy mode enabled for the running monitor.", "warning")
+            self.set_status(f"{highlight_brand('Buy mode')} enabled for the running monitor.", "info")
         else:
             self.set_status("Buy mode canceled. Monitor remains watch only.", "info")
         self.sync_mode_switches(self.task_manager.purchase_submission_enabled)
@@ -1965,17 +2197,8 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     def sync_mode_switches(self, value: bool, except_id: str | None = None) -> None:
-        self._syncing_controls = True
-        try:
-            for switch_id in ("buy-mode-switch",):
-                if switch_id == except_id:
-                    continue
-                try:
-                    self.query_visible_one(f"#{switch_id}", Switch).value = value
-                except Exception:
-                    pass
-        finally:
-            self._syncing_controls = False
+        # The buy/watch mode controls derive their state from the task manager; re-render them.
+        self.refresh_monitor_summary()
 
     def apply_spend_cap_from_input(self, input_id: str) -> bool:
         try:
@@ -2097,15 +2320,6 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
-    async def open_blank_browser_diagnostic(self) -> None:
-        self.set_status("Opening blank Chrome diagnostic browser.")
-        opened = await self.task_manager.debug_open_blank_browser_diagnostic()
-        if opened:
-            self.set_status("Blank Chrome diagnostic browser closed.")
-        else:
-            self.set_status("Blank Chrome diagnostic browser failed.")
-        self.refresh_live_widgets()
-
     async def reset_test_steam_setup_status(self) -> None:
         if not self._debug_action_allowed():
             return
@@ -2128,21 +2342,20 @@ class MarketplaceToolsApp(App[None]):
         else:
             self.set_status("Browser cookie clear failed.", "warning")
 
-    async def dump_test_cookies_keep_steam(self) -> None:
+    async def clear_test_cookies_keep_steam(self) -> None:
         if not self._debug_action_allowed():
             return
 
-        dumped = await self.task_manager.debug_dump_cookies_keep_steam_login()
-        if dumped:
+        cleared = await self.task_manager.debug_clear_market_cookies_keep_steam_login()
+        if cleared:
             self.set_status("Cleared non-Steam cookies; kept Steam login. Run Reauth Check to test.", "warning")
         else:
-            self.set_status("Cookie dump skipped (Steam Account mode only) or failed; see log.", "warning")
+            self.set_status("Cookie clear skipped (Steam Account mode only) or failed; see log.", "warning")
 
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():
             return
 
-        item_name = SINGLE_ITEM_TEST_TARGET["name"]
         if self.task_manager.single_item_test_checker_enabled:
             self.set_status("Single-item test monitor already running; no additional task started.", "info")
             await self.return_to_dashboard()
@@ -2194,6 +2407,55 @@ class MarketplaceToolsApp(App[None]):
             exclusive=True,
         )
 
+    async def start_live_buy_error_probe(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        if self.is_simulated_session:
+            self.set_status("Disable the simulated test session before sending the live buy error probe.", "warning")
+            await self.return_to_dashboard()
+            return
+
+        if not self.api_handler.login_status:
+            self.set_status("Login required before sending the live buy error probe. Refresh the marketplace session first.", "warning")
+            await self.return_to_dashboard()
+            return
+
+        target = LIVE_BUY_ERROR_TEST_TARGET
+        self.push_screen(
+            ConfirmLiveTestBuyScreen(
+                item_id=target["main_key"],
+                price=format_compact_silver(int(target["max_buy_price"])),
+                account=self.session_account_label(),
+                buy_delay=self.task_manager.purchase_delay_range(),
+            ),
+            callback=self._handle_live_buy_error_probe_confirmation,
+        )
+
+    def _handle_live_buy_error_probe_confirmation(self, confirmed: bool) -> None:
+        if not confirmed:
+            self.set_status("Live buy error probe canceled.", "info")
+            return
+        self.run_worker(
+            self._run_live_buy_error_probe_now(),
+            name="live-buy-error-probe",
+            group="actions",
+            exclusive=True,
+        )
+
+    async def _run_live_buy_error_probe_now(self) -> None:
+        target = LIVE_BUY_ERROR_TEST_TARGET
+        self.set_status(
+            f"Submitting live buy error probe for item {target['main_key']} at {format_compact_silver(int(target['max_buy_price']))}.",
+            "warning",
+        )
+        submitted = await self.task_manager.debug_run_live_buy_error_probe()
+        if submitted:
+            self.set_status("Live buy error probe completed. Check Core logs for the marketplace response.", "warning")
+        else:
+            self.set_status("Live buy error probe did not run. Check Core logs for details.", "warning")
+        await self.return_to_dashboard()
+
     async def _start_single_item_test_monitor_now(self, allow_purchase: bool = False) -> None:
         item_name = SINGLE_ITEM_TEST_TARGET["name"]
         started = await self.task_manager.start_single_item_test_checker(allow_purchase=allow_purchase)
@@ -2233,6 +2495,14 @@ class MarketplaceToolsApp(App[None]):
         self.set_status("Fake detection processed through watch-only path.")
         await self.return_to_dashboard()
 
+    async def fake_multi_outfit_detection(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        await self.task_manager.debug_fake_multi_outfit_detection()
+        self.set_status("Fake multi-listing detection processed.")
+        await self.return_to_dashboard()
+
     async def fake_buy_success(self) -> None:
         if not self._debug_action_allowed():
             return
@@ -2240,6 +2510,18 @@ class MarketplaceToolsApp(App[None]):
         await self.task_manager.debug_simulate_purchase_success()
         self.set_status("Fake detection and purchase recorded.")
         await self.return_to_dashboard()
+
+    async def fake_bundled_buy_success(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        self.set_status("Fake bundled buy list running: 8 outfits.")
+        await self.return_to_dashboard()
+        await self.task_manager.debug_simulate_bundled_purchase_success(
+            progress_callback=self.refresh_live_widgets
+        )
+        self.refresh_live_widgets()
+        self.set_status("Fake bundled buy list recorded: 8 outfits.")
 
     async def prepare_steam_browser_profile(self) -> None:
         try:
@@ -2301,7 +2583,7 @@ class MarketplaceToolsApp(App[None]):
             await self.task_manager.reset_authentication_context("Credentials changed")
         self.sync_mode_switches(False)
         self.query_visible_one("#password-input", Input).value = ""
-        self.set_status(f"Credentials saved: {self.task_manager.account_mode_label()}.", "success")
+        self.set_status(f"Credentials saved: {highlight(self.task_manager.account_mode_label())}.", "success")
         self.refresh_credentials_summary()
         self.refresh_settings_summary()
         self.refresh_live_widgets()
@@ -2420,7 +2702,7 @@ class MarketplaceToolsApp(App[None]):
             cache_input.value = str(threshold)
         except Exception:
             pass
-        message = f"Browser cache cleanup limit saved: {label}."
+        message = f"Browser cache cleanup limit saved: {highlight(label)}."
         self.set_settings_maintenance_status(message)
         self.set_status(message, "success")
         self.refresh_settings_summary()
@@ -2473,12 +2755,11 @@ class MarketplaceToolsApp(App[None]):
             self.task_manager.set_purchase_submission_enabled(False)
             self.sync_mode_switches(False)
 
-        self.set_status(f"Settings saved: {self.task_manager.account_mode_label()}.", "success")
+        self.set_status(f"Settings saved: {highlight(self.task_manager.account_mode_label())}.", "success")
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
     async def login_refresh(self) -> None:
-        self.task_manager.add_event("Fetching session status...", "info")
         self.set_status("Fetching session status...")
         await self.task_manager.login()
         self.set_status("Login check complete.")
@@ -2498,17 +2779,18 @@ class MarketplaceToolsApp(App[None]):
 
         if self.task_manager.purchase_submission_enabled and not self.api_handler.login_status:
             if self.task_manager.uses_steam_browser_session():
-                self.set_status(
-                    "Steam Account refresh required before starting buy mode. Refresh Session first.",
-                    "warning",
-                )
+                message = "Steam Account refresh required before starting buy mode. Refresh Session first."
+                self.set_status(message)
+                self.task_manager.add_event(message, "warning")
                 self.refresh_live_widgets()
                 return
 
-            self.set_status(
-                "Login required before starting buy mode. Login or refresh the marketplace session before starting the monitor.",
-                "warning",
+            message = (
+                "Login required before starting buy mode. "
+                "Login or refresh the marketplace session before starting the monitor."
             )
+            self.set_status(message)
+            self.task_manager.add_event(message, "warning")
             self.refresh_live_widgets()
             return
 
@@ -2536,7 +2818,8 @@ class MarketplaceToolsApp(App[None]):
         mode = "buy mode" if self.task_manager.purchase_submission_enabled else "watch-only mode"
         started = await self.task_manager.start_checker()
         if started:
-            self.set_status(f"Monitor started in {mode}.", "success")
+            # start_checker logs the notable "Monitor started" event; status bar only here.
+            self.set_status(f"Monitor started in {mode}.")
             self.close_dashboard_modals()
         elif self.task_manager.single_item_test_checker_enabled:
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
@@ -2570,17 +2853,21 @@ class MarketplaceToolsApp(App[None]):
 
         self.query_one("#wallet-output", Static).update(Group(summary, JSON.from_data(response)))
         if silver_balance is not None:
-            self.set_status(f"Inventory loaded: {format_compact_silver(silver_balance)}.", "success")
+            self.set_status(f"Inventory loaded: {highlight_silver(format_compact_silver(silver_balance))}.", "success")
         else:
             self.set_status("Inventory loaded.", "success")
 
     def action_show_dashboard(self) -> None:
         self.run_worker(self.show_view("dashboard"), name="show-dashboard", group="navigation", exclusive=True)
 
+    async def action_toggle_monitor(self) -> None:
+        if self.current_view == "dashboard" and not isinstance(self.focused, Input):
+            await self.toggle_monitor_from_dashboard()
+
     async def action_quit_app(self) -> None:
         await self.task_manager.stop_checker()
         await self.task_manager.stop_single_item_test_checker()
         await self.task_manager.stop_login_status_checker()
+        await self.task_manager.flush_stats_writes()
         self.api_handler.save_session()
         self.exit()
-

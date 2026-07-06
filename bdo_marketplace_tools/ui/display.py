@@ -1,6 +1,3 @@
-from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION
-
-
 APP_TITLE = "Marketplace Tools"
 
 COLOR_BRAND = "rgb(255,145,60)"
@@ -19,6 +16,25 @@ EVENT_LEVEL_COLORS = {
     "warning": COLOR_WARNING,
     "error": COLOR_ERROR,
 }
+
+# Routine (non-notable) info lines form the log's dim noise floor so notable
+# lines stand out without hiding anything.
+COLOR_EVENT_ROUTINE = "rgb(111,111,111)"
+
+
+def highlight(value):
+    """Bold-white emphasis for key values (counts, item ids) inside an event line."""
+    return f"[bold {COLOR_INFO}]{value}[/bold {COLOR_INFO}]"
+
+
+def highlight_silver(value):
+    """Gold emphasis for silver amounts, matching the dashboard spent display."""
+    return f"[bold {COLOR_GOLD}]{value}[/bold {COLOR_GOLD}]"
+
+
+def highlight_brand(value):
+    """Brand-orange emphasis for non-silver mode labels and action names."""
+    return f"[bold {COLOR_BRAND}]{value}[/bold {COLOR_BRAND}]"
 
 
 def mask_email(email):
