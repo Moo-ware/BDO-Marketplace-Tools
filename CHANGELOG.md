@@ -49,6 +49,7 @@ No released changes yet.
 - Added configurable cleanup for disposable Chrome browser-profile cache before user-initiated session refresh/setup, preserving cookies and browser storage used for login persistence. App Settings now shows storage usage, saves the auto-clean limit, and offers manual cleanup.
 - Added an unread indicator to the dashboard event-log Core/UI tabs when events arrive on the channel that is not currently visible.
 - Added clearer in-browser authentication overlays, including working/manual-action states, page dimming during automation, Steam "Remember me" guidance, and a dedicated saved-credentials-rejected state.
+- Added retries upon login failure not caused by wrong password/CAPTCHA
 
 ### Changed
 
