@@ -67,7 +67,7 @@
 | Category | Details |
 | --- | --- |
 | **Accounts** | Pearl Abyss launcher · Steam |
-| **Region** | NA / EU only |
+| **Region** | NA only |
 | **OTP / two-factor** | Not currently supported |
 
 <sub>Last verified June 30, 2026.</sub>
