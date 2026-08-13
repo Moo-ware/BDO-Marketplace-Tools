@@ -92,12 +92,6 @@ Or run directly from the repository root:
 py -3 main.py
 ```
 
-Use test mode when working on UI, screenshots, or synthetic stats:
-
-```powershell
-run.bat --test-mode
-```
-
 `run.bat` uses Windows Terminal when available so the Textual UI opens at a usable size. Set `BDO_DISABLE_WT=1` before launching to run in the current console instead.
 
 Runtime data is stored outside the repository by default at `%LOCALAPPDATA%\bdo-marketplace-tools\data`. Set `BDO_DATA_DIR` before launch to use a portable or custom data location.
