@@ -42,6 +42,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
+    save_include_outfit_pieces,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -162,6 +163,7 @@ class BackgroundTasks:
         }
         ui_settings = load_ui_settings() if self.persist_ui_settings else default_app_settings()["ui"]
         polling_settings = ui_settings["polling"]
+        self.include_outfit_pieces = bool(ui_settings["scan_scope"]["include_outfit_pieces"])
         self.delay = polling_settings["selected"]
         self.custom_delay_range = tuple(polling_settings["custom_range"])
         if self.delay == "custom":
@@ -678,6 +680,15 @@ class BackgroundTasks:
             save_buy_mode(self.purchase_submission_enabled)
         return self.purchase_submission_enabled
 
+    def set_include_outfit_pieces(self, enabled):
+        self.include_outfit_pieces = bool(enabled)
+        if self.persist_ui_settings:
+            self.include_outfit_pieces = save_include_outfit_pieces(self.include_outfit_pieces)
+        return self.include_outfit_pieces
+
+    def scan_scope_label(self):
+        return "Boxes + outfit pieces" if self.include_outfit_pieces else "Outfit boxes"
+
     def pause_buy_mode_for_session_refresh(self, reason):
         if not self.purchase_submission_enabled:
             return False
@@ -880,11 +891,12 @@ class BackgroundTasks:
         self.checker_enabled = True
         mode = self.monitor_mode_label()
         mode_markup = highlight_brand(mode) if self.purchase_submission_enabled else highlight(mode)
+        scope = self.scan_scope_label()
         self.add_event(
-            f"Monitor started — {mode_markup}.",
+            f"Monitor started — {mode_markup} · {highlight(scope)}.",
             "info",
             notable=True,
-            divider=f"monitor started · {mode.lower()}",
+            divider=f"monitor started · {mode.lower()} · {scope.lower()}",
         )
         return True
 
@@ -998,7 +1010,9 @@ class BackgroundTasks:
         try:
             while not self.checker_stop_requested:
                 try:
-                    buy_list = await self.api_handler.check_stock()
+                    buy_list = await self.api_handler.check_stock(
+                        include_outfit_pieces=self.include_outfit_pieces
+                    )
                     await self._record_scan_coverage()
                     await self.process_detected_outfits(buy_list)
                     self.consecutive_cycle_errors = 0
@@ -1641,10 +1655,7 @@ class BackgroundTasks:
         return capped
 
     async def adjust_prices(self, buy_list):
-        modified_list, fallback_items = apply_price_rules(buy_list)
-        if fallback_items:
-            self.add_event(f"Fallback pricing applied to {highlight(len(fallback_items))} outfit listings.", "warning")
-        return modified_list
+        return apply_price_rules(buy_list)
 
     async def login(self):
         session_check_error = None

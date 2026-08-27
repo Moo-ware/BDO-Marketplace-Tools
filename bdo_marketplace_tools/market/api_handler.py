@@ -37,6 +37,14 @@ MARKET_USER_AGENT = (
 )
 MARKET_AJAX_HEADER = "XMLHttpRequest"
 DEFAULT_PURCHASE_DELAY_BOUNDS = (1.0, 2.5)
+OUTFIT_BOX_SCAN_CATEGORIES = (
+    ("male", "male outfit stock", 1),
+    ("female", "female outfit stock", 2),
+)
+OUTFIT_PIECE_SCAN_CATEGORIES = (
+    ("male_pieces", "male outfit pieces stock", 3),
+    ("female_pieces", "female outfit pieces stock", 4),
+)
 
 
 class MarketplaceAPIError(RuntimeError):
@@ -126,6 +134,8 @@ class APIHandler:
         self.public_market_sessions = {
             "male": requests.Session(),
             "female": requests.Session(),
+            "male_pieces": requests.Session(),
+            "female_pieces": requests.Session(),
         }
         self.login_status = False
         self.account_mode = load_account_mode()
@@ -205,43 +215,35 @@ class APIHandler:
             raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
         return data
 
-    async def check_stock(self):
+    async def check_stock(self, include_outfit_pieces=False):
         url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)
-        payload_male = {
-            "keyType": 0,
-            "mainCategory": 55,
-            "subCategory": 1,
-        }
-        payload_female = {
-            "keyType": 0,
-            "mainCategory": 55,
-            "subCategory": 2,
-        }
+        categories = OUTFIT_BOX_SCAN_CATEGORIES
+        if include_outfit_pieces:
+            categories += OUTFIT_PIECE_SCAN_CATEGORIES
 
-        response_male, response_female = await asyncio.gather(
-            self._request(
-                self._public_market_client("male"),
-                "POST",
-                url,
-                "male outfit stock check",
-                json=payload_male,
-                headers=headers,
-            ),
-            self._request(
-                self._public_market_client("female"),
-                "POST",
-                url,
-                "female outfit stock check",
-                json=payload_female,
-                headers=headers,
-            ),
+        responses = await asyncio.gather(
+            *(
+                self._request(
+                    self._public_market_client(category_key),
+                    "POST",
+                    url,
+                    f"{context} check",
+                    json={
+                        "keyType": 0,
+                        "mainCategory": 55,
+                        "subCategory": subcategory,
+                    },
+                    headers=headers,
+                )
+                for category_key, context, subcategory in categories
+            )
         )
 
-        return (
-            self._parse_world_market_response(response_male.content, "male outfit stock")
-            + self._parse_world_market_response(response_female.content, "female outfit stock")
-        )
+        stock = []
+        for response, (_category_key, context, _subcategory) in zip(responses, categories):
+            stock.extend(self._parse_world_market_response(response.content, context))
+        return stock
 
     def _parse_world_market_response(self, content, context):
         try:

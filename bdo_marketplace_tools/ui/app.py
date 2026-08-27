@@ -73,6 +73,7 @@ from bdo_marketplace_tools.ui.widgets import (
     LogFilterOption,
     ModalAction,
     MonitorModeTile,
+    MonitorScopeTile,
     MonitorToggleTile,
     NavTab,
     PollingPresetTile,
@@ -1629,6 +1630,36 @@ class MarketplaceToolsApp(App[None]):
             )
             tile.update(body)
 
+        try:
+            boxes_tile = self.query_visible_one("#monitor-scope-boxes", Static)
+            pieces_tile = self.query_visible_one("#monitor-scope-pieces", MonitorScopeTile)
+        except Exception:
+            return
+
+        boxes_body = Table.grid(expand=True)
+        boxes_body.add_column(justify="left")
+        boxes_body.add_row(Text("Outfit boxes", style="bold #8f8f8f"))
+        boxes_body.add_row(Text("Male + female sets", style="#6f6f6f"))
+        boxes_body.add_row(Text(f"{STATUS_DOT} Always on", style=STATUS_STYLES["success"]))
+        boxes_tile.update(boxes_body)
+
+        pieces_enabled = self.task_manager.include_outfit_pieces
+        pieces_tile.set_class(pieces_enabled, "preset-selected")
+        pieces_body = Table.grid(expand=True)
+        pieces_body.add_column(justify="left")
+        pieces_body.add_row(
+            Text("Outfit pieces", style=f"bold {COLOR_BRAND}" if pieces_enabled else "bold #8f8f8f")
+        )
+        pieces_body.add_row(
+            Text("Male + female items", style="#a06a35" if pieces_enabled else "#6f6f6f")
+        )
+        pieces_body.add_row(
+            Text(f"{STATUS_DOT} On", style=STATUS_STYLES["success"])
+            if pieces_enabled
+            else Text(f"{IDLE_DOT} Off", style=STATUS_STYLES["idle"])
+        )
+        pieces_tile.update(pieces_body)
+
     def refresh_session_summary(self) -> None:
         try:
             self.query_visible_one("#session-summary")
@@ -2039,6 +2070,17 @@ class MarketplaceToolsApp(App[None]):
         event.stop()
         await self.apply_purchase_mode(event.tile.mode_key == "buy")
 
+    def on_monitor_scope_tile_pressed(self, event: MonitorScopeTile.Pressed) -> None:
+        event.stop()
+        enabled = self.task_manager.set_include_outfit_pieces(
+            not self.task_manager.include_outfit_pieces
+        )
+        state = "enabled" if enabled else "disabled"
+        timing = " It will apply on the next scan." if self.task_manager.checker_enabled else ""
+        request_note = " Two additional concurrent requests will be used per scan." if enabled else ""
+        self.set_status(f"Outfit-piece scanning {state}.{request_note}{timing}", "info")
+        self.refresh_monitor_summary()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id in {
             "spend-cap-input",
@@ -2164,6 +2206,7 @@ class MarketplaceToolsApp(App[None]):
             self.push_screen(
                 ConfirmBuyModeScreen(
                     account=self.session_account_label(),
+                    scan_scope=self.task_manager.scan_scope_label(),
                     polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
                     spend_cap=format_compact_silver(self.task_manager.max_spend),
                     buy_delay=self.task_manager.purchase_delay_range(),
@@ -2798,6 +2841,7 @@ class MarketplaceToolsApp(App[None]):
             self.push_screen(
                 ConfirmBuyModeScreen(
                     account=self.session_account_label(),
+                    scan_scope=self.task_manager.scan_scope_label(),
                     polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
                     spend_cap=format_compact_silver(self.task_manager.max_spend),
                     buy_delay=self.task_manager.purchase_delay_range(),
@@ -2819,7 +2863,8 @@ class MarketplaceToolsApp(App[None]):
         started = await self.task_manager.start_checker()
         if started:
             # start_checker logs the notable "Monitor started" event; status bar only here.
-            self.set_status(f"Monitor started in {mode}.")
+            scope = self.task_manager.scan_scope_label().lower()
+            self.set_status(f"Monitor started in {mode} — {scope}.")
             self.close_dashboard_modals()
         elif self.task_manager.single_item_test_checker_enabled:
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")

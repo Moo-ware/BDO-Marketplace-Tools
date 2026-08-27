@@ -7,7 +7,13 @@ from textual.widgets import Button, Input, Label, Select, Static
 
 from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS
 from bdo_marketplace_tools.ui.styles import MODAL_CSS
-from bdo_marketplace_tools.ui.widgets import ModalAction, MonitorModeTile, PollingPresetTile, SteamSetupTile
+from bdo_marketplace_tools.ui.widgets import (
+    ModalAction,
+    MonitorModeTile,
+    MonitorScopeTile,
+    PollingPresetTile,
+    SteamSetupTile,
+)
 
 
 class DashboardModalScreen(ModalScreen[None]):
@@ -35,12 +41,20 @@ class ConfirmBuyModeScreen(ModalScreen[bool]):
     CSS = DashboardModalScreen.CSS
     AUTO_FOCUS = None
 
-    def __init__(self, account: str, polling: str, spend_cap: str, buy_delay: str) -> None:
+    def __init__(
+        self,
+        account: str,
+        polling: str,
+        spend_cap: str,
+        buy_delay: str,
+        scan_scope: str | None = None,
+    ) -> None:
         super().__init__()
         self.account = account
         self.polling = polling
         self.spend_cap = spend_cap
         self.buy_delay = buy_delay
+        self.scan_scope = scan_scope
 
     def compose(self) -> ComposeResult:
         review = Table.grid(padding=(0, 2))
@@ -48,6 +62,8 @@ class ConfirmBuyModeScreen(ModalScreen[bool]):
         review.add_column()
         review.add_row("Account", self.account)
         review.add_row("Mode", "Buy mode")
+        if self.scan_scope is not None:
+            review.add_row("Scan scope", self.scan_scope)
         review.add_row("Polling", self.polling)
         review.add_row("Spend cap", self.spend_cap)
         review.add_row("Buy delay", self.buy_delay)
@@ -117,6 +133,15 @@ class MonitorModal(DashboardModalScreen):
             with Horizontal(id="monitor-mode-options", classes="modal-summary-row"):
                 yield MonitorModeTile("watch", "Watch only")
                 yield MonitorModeTile("buy", "Buy mode")
+            yield Static("Scan scope", classes="modal-section-title")
+            with Horizontal(id="monitor-scope-options", classes="modal-summary-row"):
+                yield Static(id="monitor-scope-boxes", classes="modal-info-tile modal-info-muted")
+                yield MonitorScopeTile()
+            yield Static(
+                "Scanning outfit pieces adds the male and female individual-item categories: two additional concurrent requests per scan.",
+                id="monitor-scope-note",
+                classes="modal-note",
+            )
             with Horizontal(classes="modal-actions"):
                 yield Static("", classes="modal-actions-spacer")
                 yield Button("Close", id="close-modal", classes="btn-quiet")

@@ -79,6 +79,7 @@ from bdo_marketplace_tools.market.pricing import (
     OUTFIT_SET_MAX_PRICE,
     PREMIUM_OUTFIT_MAX_PRICE,
     apply_price_rules,
+    maximum_market_price_from_median,
     purchase_record_count,
     purchase_record_spend,
 )
@@ -156,7 +157,7 @@ class FakeAPI:
             "maxWeight": 100,
         }
 
-    async def check_stock(self):
+    async def check_stock(self, include_outfit_pieces=False):
         return []
 
     async def is_session_expired(self):
@@ -232,13 +233,42 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PricingTests(unittest.TestCase):
-    def test_apply_price_rules_uses_known_rules_and_reports_fallbacks(self):
-        adjusted, fallbacks = apply_price_rules(
+    def test_maximum_market_price_formula_matches_verified_examples(self):
+        examples = {
+            705_000_000: 755_000_000,
+            1_100_000_000: 1_180_000_000,
+            1_630_000_000: 1_750_000_000,
+            2_020_000_000: 2_170_000_000,
+            199_000_000: 213_000_000,
+            493_000_000: 525_000_000,
+            530_000_000: 565_000_000,
+            220_000_000: 236_000_000,
+            880_000_000: 945_000_000,
+            395_000_000: 424_000_000,
+            330_000_000: 354_000_000,
+            176_000_000: 189_000_000,
+            815_000_000: 875_000_000,
+            204_000_000: 219_000_000,
+            870_000_000: 935_000_000,
+        }
+
+        for median, expected in examples.items():
+            with self.subTest(median=median):
+                self.assertEqual(maximum_market_price_from_median(median), expected)
+
+    def test_maximum_market_price_formula_rejects_invalid_prices(self):
+        for price in (0, -1, "not-a-price", None, 25_200):
+            with self.subTest(price=price), self.assertRaises(ValueError):
+                maximum_market_price_from_median(price)
+
+    def test_apply_price_rules_calculates_unknown_outfit_prices_without_fallbacks(self):
+        adjusted = apply_price_rules(
             [
                 ["premium", "1", "2020000000"],
                 ["classic", "1", "1630000000"],
                 ["set", "1", "1100000000"],
-                ["unknown", "2", "12345"],
+                ["piece", "2", "705000000"],
+                ["direct-compatibility", "1", "25200"],
             ]
         )
 
@@ -248,14 +278,10 @@ class PricingTests(unittest.TestCase):
                 ["premium", "1", PREMIUM_OUTFIT_MAX_PRICE],
                 ["classic", "1", CLASSIC_OUTFIT_MAX_PRICE],
                 ["set", "1", OUTFIT_SET_MAX_PRICE],
-                ["unknown", "2", OUTFIT_SET_MAX_PRICE],
+                ["piece", "2", "755000000"],
+                ["direct-compatibility", "1", "25200"],
             ],
         )
-        self.assertEqual(
-            fallbacks,
-            [{"item_id": "unknown", "detected_price": "12345", "adjusted_price": OUTFIT_SET_MAX_PRICE}],
-        )
-
     def test_purchase_record_helpers_sum_actual_successes(self):
         records = [
             {"item_id": "a", "price": 100, "count": 2},
@@ -2907,6 +2933,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertTrue(saved_settings["pa_browser"]["profile_prepared"])
             self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
             self.assertEqual(saved_settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 256)
+            self.assertFalse(saved_settings["ui"]["scan_scope"]["include_outfit_pieces"])
             self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
             self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
             self.assertEqual(saved_settings["ui"]["buy_delay"]["range"], [1.0, 2.5])
@@ -2921,6 +2948,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_include_outfit_pieces(True)
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(123456789)
                 account_mode_module.save_buy_mode(True)
@@ -2930,6 +2958,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             self.assertEqual(settings["ui"]["polling"]["selected"], "custom")
             self.assertEqual(settings["ui"]["polling"]["custom_range"], [8, 13])
+            self.assertTrue(settings["ui"]["scan_scope"]["include_outfit_pieces"])
             self.assertEqual(settings["ui"]["buy_delay"]["range"], [4.5, 8.0])
             self.assertEqual(settings["ui"]["spend_cap"], 123456789)
             self.assertTrue(settings["ui"]["buy_mode"])
@@ -2949,6 +2978,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_include_outfit_pieces(True)
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(250)
                 account_mode_module.save_buy_mode(True)
@@ -2958,6 +2988,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                     manager = BackgroundTasks(FakeAPI())
 
                 self.assertEqual(manager.delay, "custom")
+                self.assertTrue(manager.include_outfit_pieces)
                 self.assertEqual(manager.current_delay_bounds(), (8, 13))
                 self.assertEqual(manager.purchase_delay_bounds, (4.5, 8.0))
                 self.assertEqual(manager.max_spend, 250)
@@ -2965,6 +2996,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertEqual(manager.browser_cache_cleanup_threshold_mb, 512)
 
                 manager.set_delay_choice("2")
+                manager.set_include_outfit_pieces(False)
                 manager.set_purchase_delay_range("1.25", "3.5")
                 manager.set_spend_cap(0)
                 manager.set_purchase_submission_enabled(False)
@@ -2974,6 +3006,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                     restored = BackgroundTasks(FakeAPI())
 
             self.assertEqual(restored.delay, "2")
+            self.assertFalse(restored.include_outfit_pieces)
             self.assertEqual(restored.current_delay_bounds(), (5, 10))
             self.assertEqual(restored.purchase_delay_bounds, (1.25, 3.5))
             self.assertIsNone(restored.max_spend)
@@ -3039,6 +3072,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertFalse(settings["steam_browser"]["pa_cookie_consent_prepared"])
             self.assertFalse(settings["pa_browser"]["profile_prepared"])
             self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 150)
+            self.assertFalse(settings["ui"]["scan_scope"]["include_outfit_pieces"])
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
 
@@ -3777,6 +3811,48 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result,
             [["male outfit stock", "1", "100"], ["female outfit stock", "1", "100"]],
+        )
+
+    async def test_check_stock_adds_both_piece_categories_concurrently_when_enabled(self):
+        handler = object.__new__(APIHandler)
+        clients = {
+            "male": object(),
+            "female": object(),
+            "male_pieces": object(),
+            "female_pieces": object(),
+        }
+        handler.public_market_sessions = clients
+        captured = []
+
+        class FakeResponse:
+            content = b"compressed"
+
+        async def fake_request(client, *args, **kwargs):
+            captured.append((client, kwargs["json"]["subCategory"]))
+            return FakeResponse()
+
+        handler._request = fake_request
+        handler._parse_world_market_response = lambda _content, context: [[context, "1", "100"]]
+
+        result = await APIHandler.check_stock(handler, include_outfit_pieces=True)
+
+        self.assertEqual(
+            captured,
+            [
+                (clients["male"], 1),
+                (clients["female"], 2),
+                (clients["male_pieces"], 3),
+                (clients["female_pieces"], 4),
+            ],
+        )
+        self.assertEqual(
+            result,
+            [
+                ["male outfit stock", "1", "100"],
+                ["female outfit stock", "1", "100"],
+                ["male outfit pieces stock", "1", "100"],
+                ["female outfit pieces stock", "1", "100"],
+            ],
         )
 
     async def test_buy_item_returns_structured_purchase_records(self):
@@ -4871,6 +4947,21 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
                     await manager.checker()
 
         uniform_mock.assert_called_once_with(8, 13)
+
+    async def test_checker_forwards_current_outfit_piece_scope_each_cycle(self):
+        manager = self.make_task_manager()
+        manager.set_include_outfit_pieces(True)
+        manager.api_handler.check_stock = AsyncMock(return_value=[])
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await manager.checker()
+
+        manager.api_handler.check_stock.assert_awaited_once_with(include_outfit_pieces=True)
+        self.assertEqual(manager.scan_scope_label(), "Boxes + outfit pieces")
 
     async def test_monitor_errors_back_off_from_normal_polling_window(self):
         manager = self.make_task_manager()
@@ -8558,6 +8649,25 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.screen_stack[-1].query("#buy-mode-switch"))), 0)
                 self.assertTrue(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
                 self.assertFalse(app.query_visible_one("#monitor-mode-buy").has_class("preset-selected"))
+                self.assertFalse(app.task_manager.include_outfit_pieces)
+                self.assertFalse(app.query_visible_one("#monitor-scope-pieces").has_class("preset-selected"))
+                scope_console = Console(width=80, color_system=None)
+                with scope_console.capture() as scope_capture:
+                    scope_console.print(app.query_visible_one("#monitor-scope-boxes", Static).content)
+                    scope_console.print(app.query_visible_one("#monitor-scope-pieces", Static).content)
+                scope_text = scope_capture.get()
+                self.assertIn("Always on", scope_text)
+                self.assertIn("Off", scope_text)
+                self.assertIn(
+                    "two additional concurrent requests",
+                    str(app.query_visible_one("#monitor-scope-note", Static).content),
+                )
+
+                await pilot.click("#monitor-scope-pieces")
+                await pilot.pause(0.1)
+                self.assertTrue(app.task_manager.include_outfit_pieces)
+                self.assertTrue(app.query_visible_one("#monitor-scope-pieces").has_class("preset-selected"))
+                self.assertIn("Two additional concurrent requests", app.status_message)
 
                 await pilot.click("#monitor-mode-buy")
                 await pilot.pause(0.1)
@@ -8577,6 +8687,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.api_handler.login_status = True
         app.api_handler.email = "user@example.com"
         app.task_manager.purchase_submission_enabled = True
+        app.task_manager.set_include_outfit_pieces(True)
         app.task_manager.set_purchase_delay_range("4.5", "8")
 
         async def idle_checker():
@@ -8599,6 +8710,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     for widget in app.screen_stack[-1].query(Static):
                         confirm_console.print(widget.content)
                 confirmation_text = confirm_capture.get()
+                self.assertIn("Scan scope", confirmation_text)
+                self.assertIn("Boxes + outfit pieces", confirmation_text)
                 self.assertIn("Buy delay", confirmation_text)
                 self.assertIn("4.5-8s", confirmation_text)
 

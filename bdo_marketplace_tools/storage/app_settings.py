@@ -96,6 +96,12 @@ def default_app_settings():
             "browser_cache_cleanup_threshold_mb": DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB,
         },
         "ui": {
+            "scan_scope": {
+                # Outfit boxes (male/female subcategories 1 and 2) are always scanned.
+                # When True, also scan the lower-volume individual outfit-piece
+                # subcategories 3 and 4. This adds two concurrent public requests per cycle.
+                "include_outfit_pieces": False,
+            },
             "polling": {
                 # Marketplace scan-interval preset: "1" Fast (3-5s), "2" Balanced (5-10s),
                 # "3" Slow (15-30s), or "custom".
@@ -224,6 +230,7 @@ def _normalize_settings(data):
     session = data.get("session") if isinstance(data.get("session"), dict) else {}
     maintenance = data.get("maintenance") if isinstance(data.get("maintenance"), dict) else {}
     ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
+    scan_scope = ui.get("scan_scope") if isinstance(ui.get("scan_scope"), dict) else {}
     polling = ui.get("polling") if isinstance(ui.get("polling"), dict) else {}
     buy_delay = ui.get("buy_delay") if isinstance(ui.get("buy_delay"), dict) else {}
     updates = data.get("updates") if isinstance(data.get("updates"), dict) else {}
@@ -258,6 +265,10 @@ def _normalize_settings(data):
                 DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB,
             ),
         )
+    )
+
+    settings["ui"]["scan_scope"]["include_outfit_pieces"] = _coerce_bool(
+        scan_scope.get("include_outfit_pieces", False)
     )
 
     selected_delay = str(polling.get("selected", data.get("delay", DEFAULT_POLLING_DELAY_KEY))).strip().lower()
@@ -411,6 +422,14 @@ def save_polling_settings(selected, custom_range):
         "custom_range": list(custom_range),
     }
     return save_ui_settings(ui)["polling"]
+
+
+def save_include_outfit_pieces(enabled):
+    ui = load_ui_settings()
+    ui["scan_scope"] = {
+        "include_outfit_pieces": bool(enabled),
+    }
+    return save_ui_settings(ui)["scan_scope"]["include_outfit_pieces"]
 
 
 def save_purchase_delay_bounds(bounds):

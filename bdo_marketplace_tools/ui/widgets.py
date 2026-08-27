@@ -197,6 +197,24 @@ class MonitorModeTile(Static):
         self.post_message(self.Pressed(self))
 
 
+class MonitorScopeTile(Static):
+    class Pressed(Message):
+        def __init__(self, tile: "MonitorScopeTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self) -> None:
+        super().__init__(
+            "",
+            id="monitor-scope-pieces",
+            classes="modal-info-tile modal-info-clickable",
+        )
+        self.border_title = "Outfit pieces"
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
 class PollingPresetTile(Static):
     class Pressed(Message):
         def __init__(self, preset: "PollingPresetTile") -> None:
