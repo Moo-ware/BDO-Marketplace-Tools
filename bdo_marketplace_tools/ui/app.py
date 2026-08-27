@@ -1630,35 +1630,26 @@ class MarketplaceToolsApp(App[None]):
             )
             tile.update(body)
 
-        try:
-            boxes_tile = self.query_visible_one("#monitor-scope-boxes", Static)
-            pieces_tile = self.query_visible_one("#monitor-scope-pieces", MonitorScopeTile)
-        except Exception:
-            return
-
-        boxes_body = Table.grid(expand=True)
-        boxes_body.add_column(justify="left")
-        boxes_body.add_row(Text("Outfit boxes", style="bold #8f8f8f"))
-        boxes_body.add_row(Text("Male + female sets", style="#6f6f6f"))
-        boxes_body.add_row(Text(f"{STATUS_DOT} Always on", style=STATUS_STYLES["success"]))
-        boxes_tile.update(boxes_body)
-
-        pieces_enabled = self.task_manager.include_outfit_pieces
-        pieces_tile.set_class(pieces_enabled, "preset-selected")
-        pieces_body = Table.grid(expand=True)
-        pieces_body.add_column(justify="left")
-        pieces_body.add_row(
-            Text("Outfit pieces", style=f"bold {COLOR_BRAND}" if pieces_enabled else "bold #8f8f8f")
+        scope_tiles = (
+            ("boxes", "Outfit boxes", "Male + female sets", self.task_manager.include_outfit_boxes),
+            ("pieces", "Outfit pieces", "Male + female items", self.task_manager.include_outfit_pieces),
         )
-        pieces_body.add_row(
-            Text("Male + female items", style="#a06a35" if pieces_enabled else "#6f6f6f")
-        )
-        pieces_body.add_row(
-            Text(f"{STATUS_DOT} On", style=STATUS_STYLES["success"])
-            if pieces_enabled
-            else Text(f"{IDLE_DOT} Off", style=STATUS_STYLES["idle"])
-        )
-        pieces_tile.update(pieces_body)
+        for key, title, detail, enabled in scope_tiles:
+            try:
+                tile = self.query_visible_one(f"#monitor-scope-{key}", MonitorScopeTile)
+            except Exception:
+                continue
+            tile.set_class(enabled, "preset-selected")
+            body = Table.grid(expand=True)
+            body.add_column(justify="left")
+            body.add_row(Text(title, style=f"bold {COLOR_BRAND}" if enabled else "bold #8f8f8f"))
+            body.add_row(Text(detail, style="#a06a35" if enabled else "#6f6f6f"))
+            body.add_row(
+                Text(f"{STATUS_DOT} On", style=STATUS_STYLES["success"])
+                if enabled
+                else Text(f"{IDLE_DOT} Off", style=STATUS_STYLES["idle"])
+            )
+            tile.update(body)
 
     def refresh_session_summary(self) -> None:
         try:
@@ -2072,13 +2063,29 @@ class MarketplaceToolsApp(App[None]):
 
     def on_monitor_scope_tile_pressed(self, event: MonitorScopeTile.Pressed) -> None:
         event.stop()
-        enabled = self.task_manager.set_include_outfit_pieces(
-            not self.task_manager.include_outfit_pieces
-        )
+        scope_key = event.tile.scope_key
+        if scope_key == "boxes":
+            current = self.task_manager.include_outfit_boxes
+            setter = self.task_manager.set_include_outfit_boxes
+            scope_name = "Outfit boxes"
+        else:
+            current = self.task_manager.include_outfit_pieces
+            setter = self.task_manager.set_include_outfit_pieces
+            scope_name = "Outfit pieces"
+
+        try:
+            enabled = setter(not current)
+        except ValueError:
+            self.set_status("Choose at least one outfit scan category.", "warning")
+            self.refresh_monitor_summary()
+            return
+
         state = "enabled" if enabled else "disabled"
         timing = " It will apply on the next scan." if self.task_manager.checker_enabled else ""
-        request_note = " Two additional concurrent requests will be used per scan." if enabled else ""
-        self.set_status(f"Outfit-piece scanning {state}.{request_note}{timing}", "info")
+        self.set_status(
+            f"{scope_name} {state}. Active scope: {self.task_manager.scan_scope_label()}.{timing}",
+            "info",
+        )
         self.refresh_monitor_summary()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -2820,6 +2827,11 @@ class MarketplaceToolsApp(App[None]):
             self.refresh_live_widgets()
             return
 
+        if not self.task_manager.has_scan_scope():
+            self.set_status("Choose at least one outfit scan category before starting the monitor.", "warning")
+            self.refresh_live_widgets()
+            return
+
         if self.task_manager.purchase_submission_enabled and not self.api_handler.login_status:
             if self.task_manager.uses_steam_browser_session():
                 message = "Steam Account refresh required before starting buy mode. Refresh Session first."
@@ -2870,6 +2882,8 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
         elif self.task_manager.checker_enabled:
             self.set_status(f"Monitor already running in {mode}; no additional monitor task started.", "info")
+        elif not self.task_manager.has_scan_scope():
+            self.set_status("Choose at least one outfit scan category before starting the monitor.", "warning")
         else:
             self.set_status(f"Monitor did not start in {mode}.", "warning")
         await self.show_view("dashboard")

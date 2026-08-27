@@ -42,7 +42,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
-    save_include_outfit_pieces,
+    save_scan_scope,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -163,6 +163,7 @@ class BackgroundTasks:
         }
         ui_settings = load_ui_settings() if self.persist_ui_settings else default_app_settings()["ui"]
         polling_settings = ui_settings["polling"]
+        self.include_outfit_boxes = bool(ui_settings["scan_scope"]["include_outfit_boxes"])
         self.include_outfit_pieces = bool(ui_settings["scan_scope"]["include_outfit_pieces"])
         self.delay = polling_settings["selected"]
         self.custom_delay_range = tuple(polling_settings["custom_range"])
@@ -680,14 +681,39 @@ class BackgroundTasks:
             save_buy_mode(self.purchase_submission_enabled)
         return self.purchase_submission_enabled
 
-    def set_include_outfit_pieces(self, enabled):
-        self.include_outfit_pieces = bool(enabled)
+    def set_scan_scope(self, include_outfit_boxes=None, include_outfit_pieces=None):
+        boxes = self.include_outfit_boxes if include_outfit_boxes is None else bool(include_outfit_boxes)
+        pieces = self.include_outfit_pieces if include_outfit_pieces is None else bool(include_outfit_pieces)
+        if not boxes and not pieces:
+            raise ValueError("Choose at least one outfit scan category.")
+
+        self.include_outfit_boxes = boxes
+        self.include_outfit_pieces = pieces
         if self.persist_ui_settings:
-            self.include_outfit_pieces = save_include_outfit_pieces(self.include_outfit_pieces)
+            saved_scope = save_scan_scope(self.include_outfit_boxes, self.include_outfit_pieces)
+            self.include_outfit_boxes = bool(saved_scope["include_outfit_boxes"])
+            self.include_outfit_pieces = bool(saved_scope["include_outfit_pieces"])
+        return self.include_outfit_boxes, self.include_outfit_pieces
+
+    def set_include_outfit_boxes(self, enabled):
+        self.set_scan_scope(include_outfit_boxes=enabled)
+        return self.include_outfit_boxes
+
+    def set_include_outfit_pieces(self, enabled):
+        self.set_scan_scope(include_outfit_pieces=enabled)
         return self.include_outfit_pieces
 
+    def has_scan_scope(self):
+        return self.include_outfit_boxes or self.include_outfit_pieces
+
     def scan_scope_label(self):
-        return "Boxes + outfit pieces" if self.include_outfit_pieces else "Outfit boxes"
+        if self.include_outfit_boxes and self.include_outfit_pieces:
+            return "Outfit boxes + pieces"
+        if self.include_outfit_boxes:
+            return "Outfit boxes"
+        if self.include_outfit_pieces:
+            return "Outfit pieces"
+        return "No categories selected"
 
     def pause_buy_mode_for_session_refresh(self, reason):
         if not self.purchase_submission_enabled:
@@ -873,6 +899,13 @@ class BackgroundTasks:
         return "Buy mode" if self.purchase_submission_enabled else "Watch only"
 
     async def start_checker(self):
+        if not self.has_scan_scope():
+            self.add_event(
+                "Monitor cannot start until at least one outfit scan category is selected.",
+                "warning",
+            )
+            return False
+
         if self.purchase_submission_enabled and not self.api_handler.login_status:
             return False
 
@@ -1011,7 +1044,8 @@ class BackgroundTasks:
             while not self.checker_stop_requested:
                 try:
                     buy_list = await self.api_handler.check_stock(
-                        include_outfit_pieces=self.include_outfit_pieces
+                        include_outfit_boxes=self.include_outfit_boxes,
+                        include_outfit_pieces=self.include_outfit_pieces,
                     )
                     await self._record_scan_coverage()
                     await self.process_detected_outfits(buy_list)

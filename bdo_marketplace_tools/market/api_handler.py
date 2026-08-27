@@ -215,12 +215,16 @@ class APIHandler:
             raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
         return data
 
-    async def check_stock(self, include_outfit_pieces=False):
+    async def check_stock(self, include_outfit_pieces=False, *, include_outfit_boxes=True):
         url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)
-        categories = OUTFIT_BOX_SCAN_CATEGORIES
+        categories = ()
+        if include_outfit_boxes:
+            categories += OUTFIT_BOX_SCAN_CATEGORIES
         if include_outfit_pieces:
             categories += OUTFIT_PIECE_SCAN_CATEGORIES
+        if not categories:
+            raise MarketplaceResponseError("marketplace scan requires at least one outfit category")
 
         responses = await asyncio.gather(
             *(

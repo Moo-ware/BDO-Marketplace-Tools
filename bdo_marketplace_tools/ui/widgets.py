@@ -203,13 +203,14 @@ class MonitorScopeTile(Static):
             super().__init__()
             self.tile = tile
 
-    def __init__(self) -> None:
+    def __init__(self, scope_key: str, title: str) -> None:
         super().__init__(
             "",
-            id="monitor-scope-pieces",
+            id=f"monitor-scope-{scope_key}",
             classes="modal-info-tile modal-info-clickable",
         )
-        self.border_title = "Outfit pieces"
+        self.scope_key = scope_key
+        self.border_title = title
 
     def on_click(self) -> None:
         self.post_message(self.Pressed(self))

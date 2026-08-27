@@ -6,6 +6,24 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.4.0-beta - 2026-08-27
+
+### Added
+
+- Added independently selectable outfit-box and outfit-piece scan groups to the Monitor modal, supporting boxes-only, combined, or pieces-only monitoring. Boxes-only remains the default, and every enabled male/female category pair joins the same concurrent public scan batch.
+- Added persisted scan-scope settings, live monitor status, and active-scope details in normal buy-mode confirmations.
+
+### Changed
+
+- Replaced static outfit-price mappings and fallback pricing with the verified median-to-maximum formula: median price plus 7.5%, rounded down to the marketplace tick selected from the raw maximum. The calculation uses exact integer arithmetic and rejects invalid prices before purchase submission.
+- Added empty-scope protection at the UI, task-manager, settings, and marketplace API layers so monitoring cannot start or send requests without at least one selected outfit category.
+- Refreshed the README with current dashboard and Stats screenshots, updated feature and account-support summaries, SQLite persistence details, and current known issues.
+- Settings schema is now `11` for the independently persisted outfit-box and outfit-piece scan preferences.
+
+### Tests
+
+- Added coverage for exact price conversions and invalid-price rejection; boxes-only, combined, and pieces-only scanning; empty-scope rejection; scan-scope persistence and monitor forwarding; and the Monitor/buy-confirmation UI workflow.
+
 ## 1.3.0-beta - 2026-07-04
 
 ### Added

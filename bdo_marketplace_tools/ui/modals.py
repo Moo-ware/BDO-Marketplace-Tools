@@ -135,10 +135,10 @@ class MonitorModal(DashboardModalScreen):
                 yield MonitorModeTile("buy", "Buy mode")
             yield Static("Scan scope", classes="modal-section-title")
             with Horizontal(id="monitor-scope-options", classes="modal-summary-row"):
-                yield Static(id="monitor-scope-boxes", classes="modal-info-tile modal-info-muted")
-                yield MonitorScopeTile()
+                yield MonitorScopeTile("boxes", "Outfit boxes")
+                yield MonitorScopeTile("pieces", "Outfit pieces")
             yield Static(
-                "Scanning outfit pieces adds the male and female individual-item categories: two additional concurrent requests per scan.",
+                "Choose at least one category. Each enabled group scans its male and female categories with two concurrent requests.",
                 id="monitor-scope-note",
                 classes="modal-note",
             )

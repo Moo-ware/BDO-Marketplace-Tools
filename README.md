@@ -6,7 +6,7 @@
   <a href="https://www.python.org/downloads/">
     <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
   </a>
-  <img alt="Version 1.3.0-beta" src="https://img.shields.io/badge/Version-1.3.0--beta-blueviolet">
+  <img alt="Version 1.4.0-beta" src="https://img.shields.io/badge/Version-1.4.0--beta-blueviolet">
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
@@ -43,7 +43,7 @@
 
 ### Core Capabilities
 
-- **Automatic market monitoring.** Continuously scans the Central Market at an adjustable interval and detects outfit listings the moment they appear — no manual refreshing required.
+- **Automatic market monitoring.** Continuously scans independently selectable male/female outfit-box and individual-piece groups at an adjustable interval, with boxes-only, combined, and pieces-only scopes persisted across launches — no manual refreshing required.
 - **Watch-only by default.** On launch it only reports what it finds and never spends silver. Buying stays disabled until you explicitly enable it.
 - **Optional buy mode.** When enabled, it submits purchase requests as listings appear, bounded by a per-session spend cap you set and a configurable delay between buys.
 - **Unified dashboard.** A single live view shows session status, current monitor activity, and a running feed of recent events.

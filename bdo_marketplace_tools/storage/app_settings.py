@@ -97,9 +97,10 @@ def default_app_settings():
         },
         "ui": {
             "scan_scope": {
-                # Outfit boxes (male/female subcategories 1 and 2) are always scanned.
-                # When True, also scan the lower-volume individual outfit-piece
-                # subcategories 3 and 4. This adds two concurrent public requests per cycle.
+                # Independently controls the two male/female outfit category pairs.
+                # Boxes preserve the historical default. The UI and task manager require
+                # at least one scope before monitoring can start.
+                "include_outfit_boxes": True,
                 "include_outfit_pieces": False,
             },
             "polling": {
@@ -267,6 +268,9 @@ def _normalize_settings(data):
         )
     )
 
+    settings["ui"]["scan_scope"]["include_outfit_boxes"] = _coerce_bool(
+        scan_scope.get("include_outfit_boxes", True)
+    )
     settings["ui"]["scan_scope"]["include_outfit_pieces"] = _coerce_bool(
         scan_scope.get("include_outfit_pieces", False)
     )
@@ -424,12 +428,28 @@ def save_polling_settings(selected, custom_range):
     return save_ui_settings(ui)["polling"]
 
 
-def save_include_outfit_pieces(enabled):
+def save_scan_scope(include_outfit_boxes, include_outfit_pieces):
+    include_outfit_boxes = bool(include_outfit_boxes)
+    include_outfit_pieces = bool(include_outfit_pieces)
+    if not include_outfit_boxes and not include_outfit_pieces:
+        raise ValueError("At least one outfit scan category must be enabled.")
+
     ui = load_ui_settings()
     ui["scan_scope"] = {
-        "include_outfit_pieces": bool(enabled),
+        "include_outfit_boxes": include_outfit_boxes,
+        "include_outfit_pieces": include_outfit_pieces,
     }
-    return save_ui_settings(ui)["scan_scope"]["include_outfit_pieces"]
+    return save_ui_settings(ui)["scan_scope"]
+
+
+def save_include_outfit_boxes(enabled):
+    scan_scope = load_ui_settings()["scan_scope"]
+    return save_scan_scope(enabled, scan_scope["include_outfit_pieces"])["include_outfit_boxes"]
+
+
+def save_include_outfit_pieces(enabled):
+    scan_scope = load_ui_settings()["scan_scope"]
+    return save_scan_scope(scan_scope["include_outfit_boxes"], enabled)["include_outfit_pieces"]
 
 
 def save_purchase_delay_bounds(bounds):

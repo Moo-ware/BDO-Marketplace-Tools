@@ -157,7 +157,7 @@ class FakeAPI:
             "maxWeight": 100,
         }
 
-    async def check_stock(self, include_outfit_pieces=False):
+    async def check_stock(self, include_outfit_pieces=False, *, include_outfit_boxes=True):
         return []
 
     async def is_session_expired(self):
@@ -2933,6 +2933,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertTrue(saved_settings["pa_browser"]["profile_prepared"])
             self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
             self.assertEqual(saved_settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 256)
+            self.assertTrue(saved_settings["ui"]["scan_scope"]["include_outfit_boxes"])
             self.assertFalse(saved_settings["ui"]["scan_scope"]["include_outfit_pieces"])
             self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
             self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
@@ -2948,7 +2949,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 account_mode_module.save_polling_settings("custom", (8, 13))
-                account_mode_module.save_include_outfit_pieces(True)
+                account_mode_module.save_scan_scope(False, True)
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(123456789)
                 account_mode_module.save_buy_mode(True)
@@ -2958,6 +2959,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             self.assertEqual(settings["ui"]["polling"]["selected"], "custom")
             self.assertEqual(settings["ui"]["polling"]["custom_range"], [8, 13])
+            self.assertFalse(settings["ui"]["scan_scope"]["include_outfit_boxes"])
             self.assertTrue(settings["ui"]["scan_scope"]["include_outfit_pieces"])
             self.assertEqual(settings["ui"]["buy_delay"]["range"], [4.5, 8.0])
             self.assertEqual(settings["ui"]["spend_cap"], 123456789)
@@ -2968,6 +2970,8 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertFalse(account_mode_module.save_saved_session_last_known_valid(False))
                 self.assertFalse(account_mode_module.load_saved_session_last_known_valid())
                 self.assertEqual(account_mode_module.save_browser_cache_cleanup_threshold_mb("512"), 512)
+                with self.assertRaisesRegex(ValueError, "At least one"):
+                    account_mode_module.save_scan_scope(False, False)
                 with self.assertRaises(ValueError):
                     account_mode_module.save_browser_cache_cleanup_threshold_mb("-1")
 
@@ -2978,7 +2982,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 account_mode_module.save_polling_settings("custom", (8, 13))
-                account_mode_module.save_include_outfit_pieces(True)
+                account_mode_module.save_scan_scope(False, True)
                 account_mode_module.save_purchase_delay_bounds((4.5, 8))
                 account_mode_module.save_spend_cap(250)
                 account_mode_module.save_buy_mode(True)
@@ -2988,6 +2992,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                     manager = BackgroundTasks(FakeAPI())
 
                 self.assertEqual(manager.delay, "custom")
+                self.assertFalse(manager.include_outfit_boxes)
                 self.assertTrue(manager.include_outfit_pieces)
                 self.assertEqual(manager.current_delay_bounds(), (8, 13))
                 self.assertEqual(manager.purchase_delay_bounds, (4.5, 8.0))
@@ -2996,6 +3001,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertEqual(manager.browser_cache_cleanup_threshold_mb, 512)
 
                 manager.set_delay_choice("2")
+                manager.set_include_outfit_boxes(True)
                 manager.set_include_outfit_pieces(False)
                 manager.set_purchase_delay_range("1.25", "3.5")
                 manager.set_spend_cap(0)
@@ -3006,6 +3012,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                     restored = BackgroundTasks(FakeAPI())
 
             self.assertEqual(restored.delay, "2")
+            self.assertTrue(restored.include_outfit_boxes)
             self.assertFalse(restored.include_outfit_pieces)
             self.assertEqual(restored.current_delay_bounds(), (5, 10))
             self.assertEqual(restored.purchase_delay_bounds, (1.25, 3.5))
@@ -3072,6 +3079,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertFalse(settings["steam_browser"]["pa_cookie_consent_prepared"])
             self.assertFalse(settings["pa_browser"]["profile_prepared"])
             self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 150)
+            self.assertTrue(settings["ui"]["scan_scope"]["include_outfit_boxes"])
             self.assertFalse(settings["ui"]["scan_scope"]["include_outfit_pieces"])
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
@@ -3834,7 +3842,9 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._request = fake_request
         handler._parse_world_market_response = lambda _content, context: [[context, "1", "100"]]
 
-        result = await APIHandler.check_stock(handler, include_outfit_pieces=True)
+        # The pre-scan-scope positional argument remains compatible and still
+        # enables outfit pieces while leaving the default boxes enabled.
+        result = await APIHandler.check_stock(handler, True)
 
         self.assertEqual(
             captured,
@@ -3854,6 +3864,53 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
                 ["female outfit pieces stock", "1", "100"],
             ],
         )
+
+    async def test_check_stock_can_scan_outfit_pieces_without_boxes(self):
+        handler = object.__new__(APIHandler)
+        clients = {
+            "male_pieces": object(),
+            "female_pieces": object(),
+        }
+        handler.public_market_sessions = clients
+        captured_subcategories = []
+
+        class FakeResponse:
+            content = b"compressed"
+
+        async def fake_request(_client, *args, **kwargs):
+            captured_subcategories.append(kwargs["json"]["subCategory"])
+            return FakeResponse()
+
+        handler._request = fake_request
+        handler._parse_world_market_response = lambda _content, context: [[context, "1", "100"]]
+
+        result = await APIHandler.check_stock(
+            handler,
+            include_outfit_boxes=False,
+            include_outfit_pieces=True,
+        )
+
+        self.assertEqual(captured_subcategories, [3, 4])
+        self.assertEqual(
+            result,
+            [
+                ["male outfit pieces stock", "1", "100"],
+                ["female outfit pieces stock", "1", "100"],
+            ],
+        )
+
+    async def test_check_stock_rejects_empty_scan_scope_before_requesting(self):
+        handler = object.__new__(APIHandler)
+        handler._request = AsyncMock()
+
+        with self.assertRaisesRegex(MarketplaceResponseError, "at least one outfit category"):
+            await APIHandler.check_stock(
+                handler,
+                include_outfit_boxes=False,
+                include_outfit_pieces=False,
+            )
+
+        handler._request.assert_not_awaited()
 
     async def test_buy_item_returns_structured_purchase_records(self):
         handler = object.__new__(APIHandler)
@@ -4948,7 +5005,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         uniform_mock.assert_called_once_with(8, 13)
 
-    async def test_checker_forwards_current_outfit_piece_scope_each_cycle(self):
+    async def test_checker_forwards_current_outfit_scope_each_cycle(self):
         manager = self.make_task_manager()
         manager.set_include_outfit_pieces(True)
         manager.api_handler.check_stock = AsyncMock(return_value=[])
@@ -4960,8 +5017,31 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await manager.checker()
 
-        manager.api_handler.check_stock.assert_awaited_once_with(include_outfit_pieces=True)
-        self.assertEqual(manager.scan_scope_label(), "Boxes + outfit pieces")
+        manager.api_handler.check_stock.assert_awaited_once_with(
+            include_outfit_boxes=True,
+            include_outfit_pieces=True,
+        )
+        self.assertEqual(manager.scan_scope_label(), "Outfit boxes + pieces")
+
+    async def test_scan_scope_rejects_disabling_the_last_category(self):
+        manager = self.make_task_manager()
+        self.assertTrue(manager.include_outfit_boxes)
+        self.assertFalse(manager.include_outfit_pieces)
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            manager.set_include_outfit_boxes(False)
+
+        self.assertTrue(manager.include_outfit_boxes)
+        self.assertFalse(manager.include_outfit_pieces)
+
+    async def test_monitor_refuses_empty_scope_even_if_state_was_externally_corrupted(self):
+        manager = self.make_task_manager()
+        manager.include_outfit_boxes = False
+        manager.include_outfit_pieces = False
+
+        self.assertFalse(await manager.start_checker())
+        self.assertIsNone(manager.checker_task)
+        self.assertTrue(any("at least one outfit scan category" in event for event in manager.events))
 
     async def test_monitor_errors_back_off_from_normal_polling_window(self):
         manager = self.make_task_manager()
@@ -8609,6 +8689,19 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.task_manager.checker_enabled)
                 self.assertIn("Login or refresh", app.status_message)
 
+    async def test_monitor_start_rejects_an_empty_scan_scope(self):
+        app = self.make_app()
+        app.task_manager.include_outfit_boxes = False
+        app.task_manager.include_outfit_pieces = False
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)):
+                await app.start_monitor()
+
+        self.assertFalse(app.task_manager.checker_enabled)
+        self.assertIsNone(app.task_manager.checker_task)
+        self.assertIn("Choose at least one outfit scan category", app.status_message)
+
     async def test_repeated_start_and_stop_controls_log_without_duplicate_monitor_tasks(self):
         app = self.make_app()
 
@@ -8649,17 +8742,20 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.screen_stack[-1].query("#buy-mode-switch"))), 0)
                 self.assertTrue(app.query_visible_one("#monitor-mode-watch").has_class("preset-selected"))
                 self.assertFalse(app.query_visible_one("#monitor-mode-buy").has_class("preset-selected"))
+                self.assertTrue(app.task_manager.include_outfit_boxes)
                 self.assertFalse(app.task_manager.include_outfit_pieces)
+                self.assertTrue(app.query_visible_one("#monitor-scope-boxes").has_class("preset-selected"))
                 self.assertFalse(app.query_visible_one("#monitor-scope-pieces").has_class("preset-selected"))
                 scope_console = Console(width=80, color_system=None)
                 with scope_console.capture() as scope_capture:
                     scope_console.print(app.query_visible_one("#monitor-scope-boxes", Static).content)
                     scope_console.print(app.query_visible_one("#monitor-scope-pieces", Static).content)
                 scope_text = scope_capture.get()
-                self.assertIn("Always on", scope_text)
+                self.assertIn("Outfit boxes", scope_text)
+                self.assertIn("On", scope_text)
                 self.assertIn("Off", scope_text)
                 self.assertIn(
-                    "two additional concurrent requests",
+                    "Choose at least one category",
                     str(app.query_visible_one("#monitor-scope-note", Static).content),
                 )
 
@@ -8667,7 +8763,21 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.1)
                 self.assertTrue(app.task_manager.include_outfit_pieces)
                 self.assertTrue(app.query_visible_one("#monitor-scope-pieces").has_class("preset-selected"))
-                self.assertIn("Two additional concurrent requests", app.status_message)
+                self.assertIn("Outfit boxes + pieces", app.status_message)
+
+                await pilot.click("#monitor-scope-boxes")
+                await pilot.pause(0.1)
+                self.assertFalse(app.task_manager.include_outfit_boxes)
+                self.assertTrue(app.task_manager.include_outfit_pieces)
+                self.assertFalse(app.query_visible_one("#monitor-scope-boxes").has_class("preset-selected"))
+                self.assertIn("Active scope: Outfit pieces", app.status_message)
+
+                await pilot.click("#monitor-scope-pieces")
+                await pilot.pause(0.1)
+                self.assertFalse(app.task_manager.include_outfit_boxes)
+                self.assertTrue(app.task_manager.include_outfit_pieces)
+                self.assertTrue(app.query_visible_one("#monitor-scope-pieces").has_class("preset-selected"))
+                self.assertIn("Choose at least one outfit scan category", app.status_message)
 
                 await pilot.click("#monitor-mode-buy")
                 await pilot.pause(0.1)
@@ -8711,7 +8821,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                         confirm_console.print(widget.content)
                 confirmation_text = confirm_capture.get()
                 self.assertIn("Scan scope", confirmation_text)
-                self.assertIn("Boxes + outfit pieces", confirmation_text)
+                self.assertIn("Outfit boxes + pieces", confirmation_text)
                 self.assertIn("Buy delay", confirmation_text)
                 self.assertIn("4.5-8s", confirmation_text)
 
