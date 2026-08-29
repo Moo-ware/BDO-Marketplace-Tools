@@ -18,12 +18,9 @@ from bdo_marketplace_tools.market.browser_auth import (
 )
 from bdo_marketplace_tools.market.browser_worker import PersistentPABrowserWorker
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
-from bdo_marketplace_tools.market.test_mode import (
-    LIVE_BUY_ERROR_TEST_TARGET,
-    SINGLE_ITEM_TEST_TARGET,
-    check_single_item_stock,
-    live_buy_error_test_listing,
-)
+from bdo_marketplace_tools.services.purchase_executor import ApiPurchaseExecutor
+from bdo_marketplace_tools.services.runtime import live_runtime
+from bdo_marketplace_tools.services.session_recovery import NoSessionFaults
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
     PA_CREDENTIALS_MODE,
@@ -70,7 +67,6 @@ from bdo_marketplace_tools.storage.paths import (
     PA_MARKET_PROFILE_PATH,
     STATS_DB_PATH,
     STEAM_MARKET_PROFILE_PATH,
-    TEST_STATS_DB_PATH,
 )
 from bdo_marketplace_tools.services.event_log import EventLog
 from bdo_marketplace_tools.ui.display import (
@@ -85,14 +81,6 @@ LOCAL_DATA_PATH = LOCAL_STATS_PATH
 DEFAULT_LOCAL_DATA = stats_db.DEFAULT_LIFETIME_STATS
 _DEFAULT_STATS_PATH = object()
 _DEFAULT_LEGACY_STATS_PATH = object()
-DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
-DEBUG_MULTI_OUTFIT_INITIAL_LISTING = [["debug-premium-outfit-a", "2", "2020000000"]]
-DEBUG_MULTI_OUTFIT_JOINED_LISTING = [
-    ["debug-premium-outfit-a", "2", "2020000000"],
-    ["debug-premium-outfit-b", "1", "2020000000"],
-]
-DEBUG_BUNDLED_OUTFIT_LISTING = [["debug-premium-outfit", "8", "2020000000"]]
-DEBUG_BUNDLED_PURCHASE_TICK_SECONDS = 5.0
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
 # Scan coverage flushes are batched so watching does not turn into a disk write per cycle.
 SCAN_COVERAGE_FLUSH_THRESHOLD = 12
@@ -102,7 +90,6 @@ STATS_WRITE_RETRY_DELAY_SECONDS = 0.1
 # couple of successful scans. This avoids counting one visible bundle again on every poll,
 # while still splitting real disappear/reappear cycles.
 DETECTION_EPISODE_MISSED_SCAN_LIMIT = 2
-SIMULATED_SESSION_EMAIL = "test-session@example.local"
 BROWSER_VERIFICATION_MARKERS = (
     "browser verification",
     "manual browser verification",
@@ -157,13 +144,23 @@ def _save_local_data(data, path=_DEFAULT_STATS_PATH):
 
 
 class BackgroundTasks:
-    def __init__(self, api_handler, test_mode_enabled=False, persist_ui_settings=True):
+    def __init__(
+        self,
+        api_handler,
+        *,
+        runtime=None,
+        session_faults=None,
+        purchase_executor=None,
+        persist_ui_settings=True,
+    ):
         self.api_handler = api_handler
-        self.test_mode_enabled = bool(test_mode_enabled)
+        self.runtime = runtime or live_runtime()
+        self.session_faults = session_faults or NoSessionFaults()
+        self.purchase_executor = purchase_executor or ApiPurchaseExecutor(api_handler)
         self.persist_ui_settings = bool(persist_ui_settings)
-        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
+        self.stats_db_path = self.runtime.stats_db_path
         self._assert_stats_db_path_allowed(self.stats_db_path)
-        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
+        self.legacy_stats_path = self.runtime.legacy_stats_path
         local_data = _load_local_data(path=self.stats_db_path, legacy_json_path=self.legacy_stats_path)
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
@@ -181,15 +178,12 @@ class BackgroundTasks:
         )
         self.steam_auto_reauth_enabled = False
         self.checker_task = None
-        self.single_item_test_checker_task = None
         self.login_checker_task = None
         self.checker_enabled = False
         self.checker_stop_requested = False
         self._checker_purchase_stop_event = asyncio.Event()
-        self.single_item_test_checker_enabled = False
-        self.single_item_test_purchase_enabled = False
-        self._single_item_test_purchase_stop_event = asyncio.Event()
         self._purchase_owner_task = None
+        self._active_purchase_stop_event = None
         self.delay_choices = {
             "1": ("Fast", (3, 5)),
             "2": ("Balanced", (5, 10)),
@@ -216,7 +210,6 @@ class BackgroundTasks:
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
         self.checker_started_at = None
-        self.single_item_test_checker_started_at = None
         self.session_detected_outfits = 0
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
@@ -226,8 +219,6 @@ class BackgroundTasks:
         # Cosmetic mirror only — never used for stats, history, or spend-cap math.
         self.purchase_progress_count = 0
         self.purchase_progress_silver = 0
-        self.simulated_session_enabled = False
-        self.debug_force_purchase_session_expired = False
         self.purchase_in_progress = False
         self.pending_auth_reset_reason = None
         self.browser_auth_lock = asyncio.Lock()
@@ -236,7 +227,6 @@ class BackgroundTasks:
         self._pa_browser_stop_requests = 0
         self._pa_browser_start_task = None
         self.consecutive_cycle_errors = 0
-        self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
         # Bumped whenever stats.db gains new history rows; the Stats view uses it to
@@ -270,26 +260,15 @@ class BackgroundTasks:
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
 
-    def set_test_mode_enabled(self, enabled):
-        enabled = bool(enabled)
-        if enabled == self.test_mode_enabled:
-            return self.test_mode_enabled
-        self.test_mode_enabled = enabled
-        self.stats_db_path = TEST_STATS_DB_PATH if self.test_mode_enabled else STATS_DB_PATH
-        self._assert_stats_db_path_allowed(self.stats_db_path)
-        self.legacy_stats_path = None if self.test_mode_enabled else LOCAL_DATA_PATH
-        self.reload_lifetime_stats()
-        return self.test_mode_enabled
-
     def _assert_stats_db_path_allowed(self, path, *, require_explicit=False):
-        if not self.test_mode_enabled:
+        if not self.runtime.developer_tools_enabled:
             return
         if path is None:
             if require_explicit:
-                raise RuntimeError("Test mode stats writes require an explicit stats DB path.")
+                raise RuntimeError("Developer-runtime stats writes require an explicit database path.")
             return
         if _same_file_path(path, STATS_DB_PATH):
-            raise RuntimeError("Test mode cannot use the production stats DB.")
+            raise RuntimeError("Developer runtime cannot use the production stats database.")
 
     async def save_local_data(self):
         # Lifetime totals go through the same serialized writer as history rows: one
@@ -647,17 +626,19 @@ class BackgroundTasks:
     async def check_for_update(self, manual=False):
         """Check GitHub for a newer published version (notify-only).
 
-        Startup checks (``manual=False``) skip the remote lookup in test mode and when the
-        user turned off the startup check, but still record the running version. A manual
+        Automatic checks (``manual=False``) honor runtime policy and the saved preference,
+        but still record the running version. A manual
         check always runs. The check is network-soft: it never raises, and on startup a
         failure stays silent. Returns the result, or ``None`` when the remote lookup was
         skipped.
         """
         if not manual:
             # Always record the running version at startup so the log shows the check ran,
-            # even when the remote lookup is skipped (test mode or disabled).
+            # even when the remote lookup is disabled by runtime or user policy.
             self.add_event(f"{APP_TITLE} {highlight(f'v{APP_VERSION}')}.", "info", notable=True)
-        if not manual and (self.test_mode_enabled or not self.update_check_on_startup):
+        if not manual and (
+            not self.runtime.automatic_update_checks or not self.update_check_on_startup
+        ):
             return None
         if self.update_check_in_progress:
             return None
@@ -849,6 +830,10 @@ class BackgroundTasks:
     def _auth_context_snapshot(self):
         return self._auth_context_generation, self.account_mode
 
+    def authentication_context(self):
+        """Return the immutable identity of the active authentication context."""
+        return self._auth_context_snapshot()
+
     def _auth_context_is_current(self, snapshot, *, expected_mode=None):
         generation, mode = snapshot
         return (
@@ -856,6 +841,20 @@ class BackgroundTasks:
             and mode == self.account_mode
             and (expected_mode is None or mode == expected_mode)
         )
+
+    def _session_recovery_options(self, auth_context=None):
+        auth_context = auth_context or self._auth_context_snapshot()
+        return self.session_faults.options_for(auth_context)
+
+    def _notify_session_validated(self, auth_context):
+        self.session_faults.session_validated(auth_context)
+
+    def _notify_auth_context_changed(self):
+        auth_context = self._auth_context_snapshot()
+        self.session_faults.context_changed(auth_context)
+        context_changed = getattr(self.purchase_executor, "context_changed", None)
+        if callable(context_changed):
+            context_changed(auth_context)
 
     def _discard_stale_imported_session(self):
         # validate_and_save_imported_session temporarily installs its candidate
@@ -870,6 +869,8 @@ class BackgroundTasks:
         self._set_saved_session_last_known_valid(False)
 
     async def _saved_session_is_valid(self, auth_context=None):
+        if auth_context is None:
+            auth_context = self._auth_context_snapshot()
         if not self._api_has_session_cookies():
             return False
         try:
@@ -877,12 +878,13 @@ class BackgroundTasks:
         except MarketplaceAPIError:
             return False
 
-        if auth_context is not None and not self._auth_context_is_current(auth_context):
+        if not self._auth_context_is_current(auth_context):
             return False
 
         if status == 0:
             self.api_handler.login_status = True
             self._set_saved_session_last_known_valid(True)
+            self._notify_session_validated(auth_context)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
@@ -899,18 +901,13 @@ class BackgroundTasks:
         return f"{value:g}"
 
     def runtime_label(self):
-        started_at = None
-        if self.checker_enabled:
-            started_at = self.checker_started_at
-        elif self.single_item_test_checker_enabled:
-            started_at = self.single_item_test_checker_started_at
-
+        started_at = self.checker_started_at if self.checker_enabled else None
         if started_at is None:
             return "00:00:00"
         return format_duration(time.monotonic() - started_at)
 
     def monitor_running(self):
-        return self.checker_enabled or self.single_item_test_checker_enabled
+        return self.checker_enabled
 
     def uses_steam_browser_session(self):
         return self.account_mode == STEAM_BROWSER_MODE
@@ -1171,6 +1168,7 @@ class BackgroundTasks:
             self.buy_mode_resume_pending = False
         self.account_mode = save_account_mode(normalized) if self.persist_ui_settings else normalized
         self.api_handler.account_mode = self.account_mode
+        self._notify_auth_context_changed()
         return self.account_mode
 
     async def change_account_mode(self, mode):
@@ -1198,6 +1196,7 @@ class BackgroundTasks:
         # Invalidate every saved-session check or browser refresh that started in
         # the previous context before this coroutine reaches its first await.
         self._auth_context_generation += 1
+        self._notify_auth_context_changed()
         self.steam_auto_reauth_enabled = False
         self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
@@ -1207,8 +1206,8 @@ class BackgroundTasks:
             self.pending_auth_reset_reason = reason
             self.checker_stop_requested = True
             self._checker_purchase_stop_event.set()
-            if self._purchase_owner_task is self.single_item_test_checker_task:
-                self._single_item_test_purchase_stop_event.set()
+            if self._active_purchase_stop_event is not None:
+                self._active_purchase_stop_event.set()
             self.add_event(
                 f"{reason}. The in-flight purchase request will finish and be recorded, remaining attempts "
                 "will be skipped, then the monitor will stop and the marketplace session will be cleared.",
@@ -1225,7 +1224,6 @@ class BackgroundTasks:
             return self.pending_auth_reset_reason is None
 
         await self.stop_checker()
-        await self.stop_single_item_test_checker()
         self._clear_marketplace_session(reason)
         return True
 
@@ -1236,15 +1234,29 @@ class BackgroundTasks:
             return True
         return False
 
+    def invalidate_marketplace_session_state(self):
+        """Invalidate request-session state while preserving monitor and buy-mode intent."""
+        was_logged_in = bool(getattr(self.api_handler, "login_status", False))
+        self._auth_context_generation += 1
+        self._notify_auth_context_changed()
+        if hasattr(self.api_handler, "clear_session"):
+            self.api_handler.clear_session()
+        else:
+            self.api_handler.login_status = False
+        self._set_saved_session_last_known_valid(False)
+        if self.uses_steam_browser_session() and was_logged_in:
+            self.steam_auto_reauth_enabled = True
+        return self._auth_context_snapshot()
+
     def _clear_marketplace_session(self, reason):
         # A deferred clear may run after another auth task started. Advance again so
         # that task cannot repopulate the session after this explicit reset.
         self._auth_context_generation += 1
+        self._notify_auth_context_changed()
         self.pending_auth_reset_reason = None
         self.steam_auto_reauth_enabled = False
         self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
-        self.simulated_session_enabled = False
         if hasattr(self.api_handler, "clear_session"):
             self.api_handler.clear_session()
         else:
@@ -1257,15 +1269,11 @@ class BackgroundTasks:
         )
 
     def monitor_status_label(self):
-        if self.single_item_test_checker_enabled:
-            return "Test Scan"
         if self.checker_enabled:
             return "Running"
         return "Stopped"
 
     def monitor_mode_label(self):
-        if self.single_item_test_checker_enabled:
-            return "Test buy" if self.single_item_test_purchase_enabled else "Single item"
         return "Buy mode" if self.purchase_submission_enabled else "Watch only"
 
     async def start_checker(self):
@@ -1277,9 +1285,6 @@ class BackgroundTasks:
             return False
 
         if self.purchase_submission_enabled and not self.api_handler.login_status:
-            return False
-
-        if self.single_item_test_checker_task is not None and not self.single_item_test_checker_task.done():
             return False
 
         if self.checker_task is not None and not self.checker_task.done():
@@ -1307,25 +1312,6 @@ class BackgroundTasks:
         )
         return True
 
-    async def start_single_item_test_checker(self, allow_purchase=False):
-        if not self.test_mode_enabled:
-            return False
-
-        if self.checker_task is not None and not self.checker_task.done():
-            return False
-
-        if self.single_item_test_checker_task is not None and not self.single_item_test_checker_task.done():
-            self.single_item_test_checker_enabled = True
-            return False
-
-        self.single_item_test_checker_started_at = time.monotonic()
-        self.single_item_test_purchase_enabled = bool(allow_purchase)
-        self._single_item_test_purchase_stop_event = asyncio.Event()
-        self.single_item_test_checker_task = asyncio.create_task(self.single_item_test_checker())
-        self.single_item_test_checker_task.add_done_callback(self._handle_single_item_test_checker_done)
-        self.single_item_test_checker_enabled = True
-        return True
-
     def _handle_checker_done(self, task):
         if task.cancelled():
             return
@@ -1346,24 +1332,6 @@ class BackgroundTasks:
             self.checker_task = None
         if should_flush_pending_coverage:
             self._schedule_scan_coverage_flush()
-
-    def _handle_single_item_test_checker_done(self, task):
-        if task.cancelled():
-            return
-
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-
-        if exc is not None:
-            self.add_event(f"Single-item test monitor stopped after an unexpected error: {exc}", "error")
-
-        self.single_item_test_checker_enabled = False
-        self.single_item_test_purchase_enabled = False
-        self.single_item_test_checker_started_at = None
-        if self.single_item_test_checker_task is task:
-            self.single_item_test_checker_task = None
 
     async def stop_checker(self):
         task = self.checker_task
@@ -1395,26 +1363,6 @@ class BackgroundTasks:
             self.add_event("Monitor stopped.", "info", notable=True, divider="monitor stopped")
         return was_running
 
-    async def stop_single_item_test_checker(self):
-        task = self.single_item_test_checker_task
-        was_running = bool(task and not task.done())
-        self._single_item_test_purchase_stop_event.set()
-        if task and not task.done():
-            purchase_owned_by_checker = self.purchase_in_progress and self._purchase_owner_task is task
-            if not purchase_owned_by_checker:
-                task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        self.single_item_test_checker_enabled = False
-        self.single_item_test_purchase_enabled = False
-        self.single_item_test_checker_started_at = None
-        self.single_item_test_checker_task = None
-        await self.flush_stats_writes()
-        return was_running
-
     def start_login_status_checker(self):
         if self.login_checker_task is None or self.login_checker_task.done():
             self.login_checker_task = asyncio.create_task(self.login_status_checker())
@@ -1437,7 +1385,10 @@ class BackgroundTasks:
                         include_outfit_pieces=self.include_outfit_pieces,
                     )
                     await self._record_scan_coverage()
-                    await self.process_detected_outfits(buy_list)
+                    await self.process_detected_outfits(
+                        buy_list,
+                        purchase_stop_event=self._checker_purchase_stop_event,
+                    )
                     self.consecutive_cycle_errors = 0
                 except Exception as exc:
                     self.consecutive_cycle_errors += 1
@@ -1451,42 +1402,10 @@ class BackgroundTasks:
         except asyncio.CancelledError:
             raise
 
-    async def single_item_test_checker(self):
-        if not self.test_mode_enabled:
-            self.add_event("Single-item test monitor is only available in test mode.", "warning")
-            return
-
-        item_name = SINGLE_ITEM_TEST_TARGET["name"]
-        try:
-            while not self._single_item_test_purchase_stop_event.is_set():
-                try:
-                    buy_list = await check_single_item_stock(self.api_handler, SINGLE_ITEM_TEST_TARGET)
-                    await self.process_detected_outfits(
-                        buy_list,
-                        allow_purchase=self.single_item_test_purchase_enabled,
-                        item_noun="test item",
-                        adjust_pricing=False,
-                    )
-                    self.single_item_test_cycle_errors = 0
-                except Exception as exc:
-                    self.single_item_test_cycle_errors += 1
-                    self.add_event(f"{item_name} test scan failed: {exc}", "error")
-
-                if self._single_item_test_purchase_stop_event.is_set():
-                    break
-
-                sleep_duration = self.next_single_item_test_sleep_duration()
-                await asyncio.sleep(sleep_duration)
-        except asyncio.CancelledError:
-            raise
-
     def next_sleep_duration(self):
-        return self._next_sleep_duration(self.consecutive_cycle_errors)
+        return self.next_sleep_duration_for_errors(self.consecutive_cycle_errors)
 
-    def next_single_item_test_sleep_duration(self):
-        return self._next_sleep_duration(self.single_item_test_cycle_errors)
-
-    def _next_sleep_duration(self, cycle_errors):
+    def next_sleep_duration_for_errors(self, cycle_errors):
         low, high = self.current_delay_bounds()
         if cycle_errors <= 0:
             return random.uniform(low, high)
@@ -1494,7 +1413,14 @@ class BackgroundTasks:
         multiplier = min(MAX_ERROR_BACKOFF_MULTIPLIER, 1 + cycle_errors)
         return random.uniform(low * multiplier, high * multiplier)
 
-    async def process_detected_outfits(self, buy_list, allow_purchase=None, item_noun="outfit", adjust_pricing=True):
+    async def process_detected_outfits(
+        self,
+        buy_list,
+        allow_purchase=None,
+        item_noun="outfit",
+        adjust_pricing=True,
+        purchase_stop_event=None,
+    ):
         new_episode_count = await self._record_detection_history(buy_list)
 
         if not buy_list:
@@ -1529,7 +1455,11 @@ class BackgroundTasks:
                 "success",
                 notable=True,
             )
-            await self.buy_item(buy_list, adjust_pricing=adjust_pricing)
+            await self.buy_item(
+                buy_list,
+                adjust_pricing=adjust_pricing,
+                purchase_stop_event=purchase_stop_event,
+            )
         elif new_episode_count > 0:
             # Watch-only logs once per episode start; repeat sightings of the same
             # lingering listings would otherwise fill the event log every poll.
@@ -1538,245 +1468,16 @@ class BackgroundTasks:
     def _detected_outfit_count(self, buy_list):
         return sum(int(item[1]) for item in buy_list)
 
+    def reset_detection_episodes(self):
+        self._active_detection_episodes.clear()
+
     def _pluralize(self, noun, count):
         if count == 1:
             return noun
         return f"{noun}s"
 
-    async def debug_fake_outfit_detection(self):
-        if not self.test_mode_enabled:
-            return False
-
-        self._active_detection_episodes.clear()
-        await self.process_detected_outfits(DEBUG_OUTFIT_LISTING, allow_purchase=False)
-        return True
-
-    async def debug_fake_multi_outfit_detection(self):
-        if not self.test_mode_enabled:
-            return False
-
-        self._active_detection_episodes.clear()
-        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_INITIAL_LISTING, allow_purchase=False)
-        await self.process_detected_outfits(DEBUG_MULTI_OUTFIT_JOINED_LISTING, allow_purchase=False)
-        return True
-
-    async def debug_simulate_purchase_success(self):
-        if not self.test_mode_enabled:
-            return False
-
-        self._active_detection_episodes.clear()
-        new_episode_count = await self._record_detection_history(DEBUG_OUTFIT_LISTING)
-        detected_count = self._detected_outfit_count(DEBUG_OUTFIT_LISTING)
-        self.session_detected_outfits += new_episode_count
-        self.add_event(
-            f"Outfit detected: {highlight(detected_count)} available outfits. Simulating purchase.",
-            "success",
-            notable=True,
-        )
-
-        adjusted_buy_list = await self.adjust_prices(DEBUG_OUTFIT_LISTING)
-        await self.record_purchase_summary(
-            self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded")
-        )
-        return True
-
-    async def debug_simulate_bundled_purchase_success(self, progress_callback=None):
-        if not self.test_mode_enabled:
-            return False
-
-        self._active_detection_episodes.clear()
-        new_episode_count = await self._record_detection_history(DEBUG_BUNDLED_OUTFIT_LISTING)
-        detected_count = self._detected_outfit_count(DEBUG_BUNDLED_OUTFIT_LISTING)
-        self.session_detected_outfits += new_episode_count
-        self.add_event(
-            f"Outfit detected: {highlight(detected_count)} available outfits in one bundled buy list.",
-            "success",
-            notable=True,
-        )
-
-        adjusted_buy_list = await self.adjust_prices(DEBUG_BUNDLED_OUTFIT_LISTING)
-        item_id, stock, price = adjusted_buy_list[0]
-        purchase_records = []
-        self._sync_purchase_progress_to_committed()
-        self.purchase_in_progress = True
-        try:
-            stock_count = int(stock)
-            for index in range(stock_count):
-                record = {
-                    "item_id": item_id,
-                    "price": int(price),
-                    "count": 1,
-                    "result_code": 0,
-                }
-                purchase_records.append(record)
-                self._note_purchase_progress(record)
-                if progress_callback is not None:
-                    try:
-                        progress_callback()
-                    except Exception:
-                        pass
-                if index < stock_count - 1:
-                    await asyncio.sleep(DEBUG_BUNDLED_PURCHASE_TICK_SECONDS)
-
-            await self.record_purchase_summary(
-                {
-                    "purchase_records": purchase_records,
-                    "events": [
-                        {
-                            "level": "success",
-                            "message": f"Simulated bundled buy list succeeded for {len(purchase_records)} outfits.",
-                        }
-                    ],
-                }
-            )
-        finally:
-            self.purchase_in_progress = False
-            self._complete_pending_auth_reset_if_ready()
-        return True
-
-    async def debug_run_live_buy_error_probe(self):
-        if not self.test_mode_enabled:
-            return False
-
-        if self.simulated_session_enabled:
-            self.add_event("Live buy error probe requires a real marketplace session; disable test session first.", "warning")
-            return False
-
-        if not getattr(self.api_handler, "login_status", False):
-            self.add_event("Live buy error probe requires an online marketplace session.", "warning")
-            return False
-
-        target = LIVE_BUY_ERROR_TEST_TARGET
-        buy_list = live_buy_error_test_listing(target)
-        self._active_detection_episodes.clear()
-        self.add_event(
-            f"Live buy error probe submitting item {target['main_key']} at {target['max_buy_price']} silver.",
-            "warning",
-        )
-        await self.process_detected_outfits(
-            buy_list,
-            allow_purchase=True,
-            item_noun="live buy probe",
-            adjust_pricing=False,
-        )
-        return True
-
-    def debug_invalidate_marketplace_session(self):
-        if not self.test_mode_enabled:
-            return False
-
-        self._debug_invalidate_marketplace_state()
-        self.add_event(
-            "Test: app marketplace session cleared; the next recovery will also clear the browser "
-            "marketplace session before re-authentication.",
-            "warning",
-        )
-        return True
-
-    def _debug_invalidate_marketplace_state(self):
-        """Invalidate app-owned market state without changing browser-profile preparation."""
-        was_logged_in = bool(getattr(self.api_handler, "login_status", False))
-        self._auth_context_generation += 1
-        self.simulated_session_enabled = False
-        self.debug_force_purchase_session_expired = True
-        if hasattr(self.api_handler, "clear_session"):
-            self.api_handler.clear_session()
-        else:
-            self.api_handler.login_status = False
-        self._set_saved_session_last_known_valid(False)
-        if self.uses_steam_browser_session() and was_logged_in:
-            self.steam_auto_reauth_enabled = True
-
-    async def debug_expire_pa_login_session(self):
-        """Prepare a genuine PA credential-login test in the retained browser worker."""
-        if not self.test_mode_enabled:
-            return False
-        if self.uses_steam_browser_session():
-            self.add_event("Expire PA Login is only available in Pearl Abyss Account mode.", "warning")
-            return False
-        if not self.pa_browser_keep_open or not self.pa_browser_worker_running:
-            self.add_event(
-                "Expire PA Login requires the Keep Open Chrome worker to be running.",
-                "warning",
-                notable=True,
-            )
-            return False
-
-        auth_context = self._auth_context_snapshot()
-        async with self.browser_auth_lock:
-            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
-                return False
-            worker = self._pa_browser_worker
-            if worker is None or not worker.running:
-                self.add_event(
-                    "Expire PA Login could not run because the Keep Open Chrome worker is closed.",
-                    "warning",
-                    notable=True,
-                )
-                return False
-            try:
-                cleared_count = await worker.clear_pa_login_session_cookies()
-            except BrowserAuthError as exc:
-                self.add_event(f"Expire PA Login failed: {exc}", "error", notable=True)
-                return False
-            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
-                return False
-
-            self._debug_invalidate_marketplace_state()
-            self.invalidate_browser_storage_summary()
-            self.add_event(
-                "Test: app marketplace session plus browser marketplace and Pearl Abyss login "
-                f"cookies cleared ({highlight(cleared_count)} cookies); consent and saved "
-                "credentials were preserved. Run Session Check to test automatic credential login.",
-                "warning",
-                notable=True,
-            )
-            return True
-
-    def debug_toggle_steam_auto_reauth(self):
-        if not self.test_mode_enabled or not self.uses_steam_browser_session():
-            return None
-
-        self.steam_auto_reauth_enabled = not self.steam_auto_reauth_enabled
-        return self.steam_auto_reauth_enabled
-
-    async def debug_run_reauthentication_check(self):
-        if not self.test_mode_enabled:
-            return False
-
-        self.add_event("Simulated purchase response: login session expired.", "warning")
-        recovered = await self._recover_purchase_session_for_retry(
-            force_browser_refresh=True,
-            clear_browser_market_session=True,
-        )
-        if recovered:
-            self.debug_force_purchase_session_expired = False
-        return recovered
-
-    async def debug_run_session_check_now(self):
-        """Run one iteration of the production periodic session checker on demand (test mode).
-
-        This is the real `_run_one_session_check` path: it detects expiry (honoring the "Expire
-        Session" override) and, if expired, runs `handle_expired_session` exactly as the idle bot
-        would. Use "Expire Session" first to exercise the detect -> auto re-auth flow.
-        """
-        if not self.test_mode_enabled:
-            return None
-
-        self.add_event("Test: running the periodic session check now.", "info")
-        result = await self._run_one_session_check()
-        if result and self.debug_force_purchase_session_expired:
-            # A forced-expiry run that recovered: drop the override so later checks see the real
-            # session instead of staying permanently "expired".
-            self.debug_force_purchase_session_expired = False
-        return result
-
     def reset_steam_initial_setup_status(self):
-        """Mark Steam initial setup incomplete and clear the one-time consent flag.
-
-        Ungated maintenance action used by App Settings; the test-mode debug
-        control delegates here.
-        """
+        """Mark Steam initial setup incomplete and clear the one-time consent flag."""
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
         self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
@@ -1784,16 +1485,7 @@ class BackgroundTasks:
         self.add_event("Initial Steam setup status reset to incomplete.", "warning")
         return True
 
-    def debug_clear_steam_initial_setup_status(self):
-        if not self.test_mode_enabled:
-            return False
-
-        return self.reset_steam_initial_setup_status()
-
-    async def debug_clear_market_cookies_keep_steam_login(self):
-        if not self.test_mode_enabled:
-            return False
-
+    async def clear_market_cookies_keep_steam_login(self):
         if not self.uses_steam_browser_session():
             self.add_event(
                 "Clear cookies (keep Steam login) is only available in Steam Account mode.",
@@ -1804,7 +1496,7 @@ class BackgroundTasks:
         try:
             cleared_count = await clear_market_cookies_keep_steam_login(profile_path=STEAM_MARKET_PROFILE_PATH)
         except BrowserAuthError as exc:
-            self.add_event(f"Test cookie clear failed: {exc}", "error")
+            self.add_event(f"Marketplace cookie clear failed: {exc}", "error")
             return False
 
         # Re-arm the re-auth flow so the next refresh runs the full cookie-box + Steam-button path,
@@ -1813,11 +1505,32 @@ class BackgroundTasks:
         self._set_saved_session_last_known_valid(False)
         self.invalidate_browser_storage_summary()
         self.add_event(
-            f"Test mode: cleared {cleared_count} non-Steam cookies (market/PA/consent); kept Steam login. "
-            "Run Reauth Check to exercise the full re-auth flow.",
+            f"Cleared {cleared_count} non-Steam cookies (market/PA/consent); kept Steam login.",
             "warning",
         )
         return True
+
+    async def clear_pa_login_session_cookies(self, expected_context=None):
+        """Atomically invalidate request state and clear the retained PA login session."""
+        auth_context = expected_context or self._auth_context_snapshot()
+        async with self.browser_auth_lock:
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return None
+            worker = self._pa_browser_worker
+            if worker is None or not worker.running:
+                raise BrowserAuthError("Pearl Abyss Chrome worker is not running.")
+
+            # Commit the safe side while browser authentication is excluded. If the browser
+            # clear fails or is cancelled, the separate request session must stay invalid.
+            expired_context = self.invalidate_marketplace_session_state()
+            self.invalidate_browser_storage_summary()
+            cleared_count = await worker.clear_pa_login_session_cookies()
+            if not self._auth_context_is_current(
+                expired_context,
+                expected_mode=PA_CREDENTIALS_MODE,
+            ):
+                return None
+            return cleared_count
 
     async def _clear_pa_browser_profile_cookies_in_auth_scope(self):
         """Clear the PA profile while ``browser_auth_lock`` is already held."""
@@ -1875,6 +1588,11 @@ class BackgroundTasks:
         if not self.uses_steam_browser_session():
             return await self.clear_pa_browser_identity_cookies()
 
+        return await self.clear_steam_browser_session_cookies()
+
+    async def clear_steam_browser_session_cookies(self):
+        """Clear the app-owned Steam profile regardless of the active login method."""
+
         async with self.browser_auth_lock:
             try:
                 cleared_count = await clear_steam_browser_profile_cookies(
@@ -1894,23 +1612,6 @@ class BackgroundTasks:
                 "warning",
             )
             return True
-
-    async def debug_clear_steam_browser_cookies(self):
-        if not self.test_mode_enabled:
-            return False
-
-        try:
-            cleared_count = await clear_steam_browser_profile_cookies()
-        except BrowserAuthError as exc:
-            self.add_event(f"Steam browser cookie clear failed: {exc}", "error")
-            return False
-
-        self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
-        self._set_steam_pa_cookie_consent_prepared(False)
-        self.steam_auto_reauth_enabled = False
-        self.invalidate_browser_storage_summary()
-        self.add_event(f"Steam browser cookies cleared from the app-owned profile ({cleared_count} cookies).", "warning")
-        return True
 
     async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False, cleanup_browser_cache=True):
         async with self.browser_auth_lock:
@@ -1959,6 +1660,11 @@ class BackgroundTasks:
         clear_browser_market_session=False,
     ):
         auth_context = self._auth_context_snapshot()
+        recovery_options = self._session_recovery_options(auth_context)
+        clear_browser_market_session = bool(
+            clear_browser_market_session
+            or recovery_options.clear_market_session
+        )
         self.add_event("Login session expired. Attempting to re-authenticate.", "warning", notable=True)
 
         if auth_context[1] == STEAM_BROWSER_MODE:
@@ -1973,6 +1679,7 @@ class BackgroundTasks:
             if not self._auth_context_is_current(auth_context):
                 return False
             if refreshed:
+                self._notify_session_validated(auth_context)
                 success_message = "Re-authentication succeeded. Retrying purchase request."
                 if not retry_purchase:
                     success_message = (
@@ -2003,6 +1710,7 @@ class BackgroundTasks:
             return False
         if refreshed:
             self._set_saved_session_last_known_valid(True)
+            self._notify_session_validated(auth_context)
             self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
             return True
 
@@ -2011,42 +1719,23 @@ class BackgroundTasks:
         self.add_event("Re-authentication failed.", "error")
         return False
 
-    def set_simulated_session(self, enabled):
-        if not self.test_mode_enabled:
-            return False
+    async def recover_purchase_session(
+        self,
+        *,
+        force_browser_refresh=False,
+        clear_market_session=False,
+    ):
+        """Run the production purchase-session recovery path without submitting a buy."""
+        return await self._recover_purchase_session_for_retry(
+            force_browser_refresh=force_browser_refresh,
+            clear_browser_market_session=clear_market_session,
+        )
 
-        self.simulated_session_enabled = bool(enabled)
-        self.api_handler.login_status = bool(enabled)
-        if enabled and not getattr(self.api_handler, "email", None):
-            self.api_handler.email = SIMULATED_SESSION_EMAIL
-        if not enabled and getattr(self.api_handler, "email", None) == SIMULATED_SESSION_EMAIL:
-            self.api_handler.email = None
-        if not enabled:
-            self.set_purchase_submission_enabled(False)
-        return True
-
-    def _simulated_purchase_summary(self, buy_list, label="Test-mode purchase simulated"):
-        purchase_records = []
-        for item_id, stock, price in buy_list:
-            purchase_records.append(
-                {
-                    "item_id": item_id,
-                    "price": int(price),
-                    "count": int(stock),
-                    "result_code": 0,
-                }
-            )
-
-        purchased_count = purchase_record_count(purchase_records)
-        return {
-            "purchase_records": purchase_records,
-            "events": [
-                {
-                    "level": "success",
-                    "message": f"{label} for {purchased_count} outfit.",
-                }
-            ],
-        }
+    def set_steam_auto_reauth_enabled(self, enabled):
+        if not self.uses_steam_browser_session():
+            return None
+        self.steam_auto_reauth_enabled = bool(enabled)
+        return self.steam_auto_reauth_enabled
 
     def _note_purchase_progress(self, purchase_record):
         # Synchronous, exception-isolated observer invoked from the buy loop per secured
@@ -2060,25 +1749,25 @@ class BackgroundTasks:
         self.purchase_progress_count += count
         self.purchase_progress_silver += silver
 
+    def note_purchase_progress(self, purchase_record):
+        """Record one successful purchase tick for an external purchase executor."""
+        self._note_purchase_progress(purchase_record)
+
     def _sync_purchase_progress_to_committed(self):
         self.purchase_progress_count = max(self.purchase_progress_count, self.session_successful_purchases)
         self.purchase_progress_silver = max(self.purchase_progress_silver, self.session_silver_spent)
 
-    def _purchase_stop_event_for_task(self, task):
-        if task is self.checker_task:
-            return self._checker_purchase_stop_event
-        if task is self.single_item_test_checker_task:
-            return self._single_item_test_purchase_stop_event
-        return None
+    def purchase_owned_by(self, task):
+        return self.purchase_in_progress and self._purchase_owner_task is task
 
     async def _submit_purchase_batch(self, buy_list, stop_event):
-        kwargs = {
-            "purchase_delay_bounds": self.purchase_delay_bounds,
-            "on_purchase": self._note_purchase_progress,
-        }
-        if stop_event is not None:
-            kwargs["stop_event"] = stop_event
-        return await self.api_handler.buy_item(buy_list, **kwargs)
+        return await self.purchase_executor.submit(
+            buy_list,
+            auth_context=self._auth_context_snapshot(),
+            purchase_delay_bounds=self.purchase_delay_bounds,
+            on_purchase=self._note_purchase_progress,
+            stop_event=stop_event,
+        )
 
     async def _record_stopped_purchase_summary(self, summary, *, current_auth_result):
         await self.record_purchase_summary(summary)
@@ -2102,12 +1791,12 @@ class BackgroundTasks:
                 "The stopped purchase response reported an invalid session."
             )
 
-    async def buy_item(self, buy_list, adjust_pricing=True):
+    async def buy_item(self, buy_list, adjust_pricing=True, purchase_stop_event=None):
         purchase_task = asyncio.current_task()
         purchase_auth_context = self._auth_context_snapshot()
-        purchase_stop_event = self._purchase_stop_event_for_task(purchase_task)
         self._sync_purchase_progress_to_committed()
         self._purchase_owner_task = purchase_task
+        self._active_purchase_stop_event = purchase_stop_event
         self.purchase_in_progress = True
         try:
             if adjust_pricing:
@@ -2125,12 +1814,7 @@ class BackgroundTasks:
             # prepared. Never submit the first request under a different context.
             if not self._auth_context_is_current(purchase_auth_context):
                 return
-
-            if self.simulated_session_enabled:
-                simulated_summary = self._simulated_purchase_summary(capped_buy_list)
-                for record in simulated_summary.get("purchase_records", []):
-                    self._note_purchase_progress(record)
-                await self.record_purchase_summary(simulated_summary)
+            if purchase_stop_event is not None and purchase_stop_event.is_set():
                 return
 
             try:
@@ -2260,6 +1944,7 @@ class BackgroundTasks:
             if self._purchase_owner_task is purchase_task:
                 self.purchase_in_progress = False
                 self._purchase_owner_task = None
+                self._active_purchase_stop_event = None
                 self._complete_pending_auth_reset_if_ready()
 
     def _purchase_summary_has_expired_session(self, summary):
@@ -2380,6 +2065,9 @@ class BackgroundTasks:
 
     async def login(self):
         auth_context = self._auth_context_snapshot()
+        clear_browser_market_session = self._session_recovery_options(
+            auth_context
+        ).clear_market_session
         session_check_error = None
         try:
             status = await self.api_handler.is_session_expired()
@@ -2396,6 +2084,7 @@ class BackgroundTasks:
         if status == 0:
             self.api_handler.login_status = True
             self._set_saved_session_last_known_valid(True)
+            self._notify_session_validated(auth_context)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             elif self.pa_browser_keep_open and not self.pa_browser_worker_running:
@@ -2417,6 +2106,11 @@ class BackgroundTasks:
             refreshed = await self.refresh_browser_session(
                 session_check_error=session_check_error,
                 cleanup_browser_cache=True,
+                **(
+                    {"clear_market_session_before_auth": True}
+                    if clear_browser_market_session
+                    else {}
+                ),
             )
             if not self._auth_context_is_current(auth_context):
                 return
@@ -2427,6 +2121,11 @@ class BackgroundTasks:
         refreshed = await self.refresh_pa_browser_session(
             session_check_error=session_check_error,
             cleanup_browser_cache=True,
+            **(
+                {"clear_market_session_before_auth": True}
+                if clear_browser_market_session
+                else {}
+            ),
         )
         if not self._auth_context_is_current(auth_context):
             return
@@ -2580,6 +2279,7 @@ class BackgroundTasks:
                 self.api_handler.login_status = True
                 self._set_pa_browser_profile_prepared(True)
                 self._set_saved_session_last_known_valid(True)
+                self._notify_session_validated(auth_context)
                 self.start_login_status_checker()
                 self.add_event("Pearl Abyss Account session validated and saved.", "success", notable=True)
                 self.resume_buy_mode_after_refresh()
@@ -2688,6 +2388,7 @@ class BackgroundTasks:
                 if handle_pa_cookie_consent and not self.steam_pa_cookie_consent_prepared:
                     self._set_steam_pa_cookie_consent_prepared(True)
                 self._set_saved_session_last_known_valid(True)
+                self._notify_session_validated(auth_context)
                 self.steam_auto_reauth_enabled = True
                 self.add_event("Steam Account session validated and saved.", "success", notable=True)
                 self.start_login_status_checker()
@@ -2744,6 +2445,7 @@ class BackgroundTasks:
         if status == 0:
             self.api_handler.login_status = True
             self._set_saved_session_last_known_valid(True)
+            self._notify_session_validated(auth_context)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
@@ -2767,24 +2469,21 @@ class BackgroundTasks:
         try:
             while True:
                 await asyncio.sleep(random.uniform(1800, 2400))
-                if not await self._run_one_session_check():
+                if not await self.run_session_check_once():
                     break
         except asyncio.CancelledError:
             raise
 
     async def _check_session_expired(self):
-        # Test-only override: "Expire Session" sets this flag so the production session check below
-        # reports expiry without a live API call, letting the real detect -> re-auth path be tested.
-        if self.test_mode_enabled and self.debug_force_purchase_session_expired:
+        if self._session_recovery_options().force_expired:
             return -1
         return await self.api_handler.is_session_expired()
 
-    async def _run_one_session_check(self):
+    async def run_session_check_once(self):
         """Run one periodic session check and react to it.
 
         Returns True to keep the periodic checker running (session valid, recovered, or a transient
-        check error) and False to stop it (session expired and re-authentication failed). The "Run
-        Session Check" test control calls this same method so the test path is the production path.
+        check error) and False to stop it (session expired and re-authentication failed).
         """
         auth_context = self._auth_context_snapshot()
         try:
@@ -2802,15 +2501,16 @@ class BackgroundTasks:
             return await self.handle_expired_session()
 
         self.api_handler.login_status = True
+        self._notify_session_validated(auth_context)
         self.add_event("Session still valid.")
         return True
 
     async def handle_expired_session(self):
         auth_context = self._auth_context_snapshot()
         self.api_handler.login_status = False
-        clear_browser_market_session = bool(
-            self.test_mode_enabled and self.debug_force_purchase_session_expired
-        )
+        clear_browser_market_session = self._session_recovery_options(
+            auth_context
+        ).clear_market_session
         if auth_context[1] == STEAM_BROWSER_MODE:
             if self.steam_auto_reauth_available():
                 self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
@@ -2825,6 +2525,7 @@ class BackgroundTasks:
                 if not self._auth_context_is_current(auth_context):
                     return False
                 if refreshed:
+                    self._notify_session_validated(auth_context)
                     self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
                     return True
 
@@ -2849,6 +2550,7 @@ class BackgroundTasks:
         if not self._auth_context_is_current(auth_context):
             return False
         if refreshed:
+            self._notify_session_validated(auth_context)
             self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
             return True
 

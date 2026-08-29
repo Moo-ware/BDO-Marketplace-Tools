@@ -216,6 +216,19 @@ class APIHandler:
             raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
         return data
 
+    async def get_world_market_sublist(self, main_key, *, key_type=0, context=None):
+        """Fetch one public marketplace item's enhancement rows without authentication."""
+        context = context or f"market item {main_key} sublist"
+        response = await self._request(
+            requests,
+            "POST",
+            f"{self._trade_url()}/Trademarket/GetWorldMarketSubList",
+            context,
+            json={"keyType": int(key_type), "mainKey": int(main_key)},
+            headers=dict(PUBLIC_MARKET_HEADERS),
+        )
+        return self._json_response(response, context)
+
     async def check_stock(self, include_outfit_pieces=False, *, include_outfit_boxes=True):
         url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)

@@ -152,26 +152,6 @@ APP_CSS = """
         border-top: none;
     }
 
-    #body {
-        height: 1fr;
-    }
-
-    #test-controls {
-        width: 26;
-        min-width: 22;
-        height: 1fr;
-        margin-left: 1;
-        overflow-y: auto;
-    }
-
-    #test-controls Button {
-        width: 100%;
-        min-width: 0;
-        margin: 0;
-        text-align: left;
-        content-align: left middle;
-    }
-
     #statusbar {
         dock: bottom;
         height: 1;

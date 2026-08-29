@@ -131,7 +131,8 @@ def default_app_settings():
             # launch while a newer release is available instead of suppressing repeats.
             "last_seen_version": None,
             # Whether to check GitHub for a newer version on startup (soft, non-blocking,
-            # silent on failure, and skipped in test mode). The manual check always works.
+            # and silent on failure). Runtime policy may also disable automatic checks;
+            # the manual check always works.
             "check_on_startup": DEFAULT_UPDATE_CHECK_ON_STARTUP,
         },
     }
