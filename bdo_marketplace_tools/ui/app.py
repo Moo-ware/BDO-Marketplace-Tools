@@ -1506,12 +1506,13 @@ class MarketplaceToolsApp(App[None]):
 
         pa_browser_card = Horizontal(
             Static(id="settings-pa-browser-worker", classes="action-card-info"),
+            ModalAction("Open Browser", "settings-open-pa-browser", extra_classes="modal-action-compact"),
             ModalAction("Keep Open: Off", "settings-toggle-pa-browser-worker", extra_classes="modal-action-compact"),
             id="settings-pa-browser-card",
             classes="action-card",
         )
         await content.mount(pa_browser_card)
-        pa_browser_card.border_title = "Pearl Abyss Browser"
+        pa_browser_card.border_title = "Persistent PA Browser"
 
         storage_card = Vertical(
             Static(id="settings-storage-facts", classes="action-card-line"),
@@ -1642,17 +1643,27 @@ class MarketplaceToolsApp(App[None]):
                 detail = "   ·   Keep the dedicated Chrome window open and minimized."
             else:
                 label = "Enabled · browser closed"
-                detail = "   ·   Browser closed; background recovery will not reopen it. Use Refresh Session to restart."
+                detail = "   ·   Background recovery stays paused. Use Open Browser to restart."
             pa_browser_line.append(label, style=COLOR_INFO)
             pa_browser_line.append(detail, style=COLOR_TEXT_MUTED)
         else:
             pa_browser_line.append("Off", style=COLOR_TEXT_MUTED)
             pa_browser_line.append(
-                "   ·   Enabling opens one Chrome window; keep it minimized.",
+                "   ·   Keep one persistent Chrome window, no pop-ups.",
                 style=COLOR_TEXT_MUTED,
             )
         try:
             self.query_one("#settings-pa-browser-worker", Static).update(pa_browser_line)
+            open_browser_action = self.query_one("#settings-open-pa-browser", ModalAction)
+            open_browser_action.display = bool(
+                tm.pa_browser_keep_open
+                and not tm.uses_steam_browser_session()
+                and not tm.pa_browser_worker_running
+                and not (
+                    tm.pa_browser_worker_has_resources
+                    and not tm.pa_browser_worker_owns_profile
+                )
+            )
             self.query_one("#settings-toggle-pa-browser-worker", ModalAction).update(
                 f"Keep Open: {'On' if tm.pa_browser_keep_open else 'Off'}"
             )
@@ -2041,6 +2052,7 @@ class MarketplaceToolsApp(App[None]):
             "settings-reset-steam",
             "settings-check-update",
             "settings-toggle-update-startup",
+            "settings-open-pa-browser",
             "settings-toggle-pa-browser-worker",
             "settings-save-cache-limit",
             "settings-clean-cache",
@@ -2075,6 +2087,13 @@ class MarketplaceToolsApp(App[None]):
             )
         elif action_id == "settings-toggle-update-startup":
             self.toggle_update_startup_check()
+        elif action_id == "settings-open-pa-browser":
+            self.run_worker(
+                self.start_persisted_pa_browser_worker(),
+                name="open-pa-browser-worker",
+                group="actions",
+                exclusive=True,
+            )
         elif action_id == "settings-toggle-pa-browser-worker":
             self.run_worker(
                 self.toggle_pa_browser_worker(),

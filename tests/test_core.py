@@ -10847,7 +10847,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     str(app.query_one("#settings-status", Static).render()),
                 )
 
-    async def test_app_settings_pa_browser_worker_toggle_shows_minimize_guidance(self):
+    async def test_app_settings_pa_browser_worker_actions_follow_lifecycle_state(self):
         app = self.make_app()
         fake_worker = Mock(running=True, context_alive=True, owns_profile=True, has_resources=True)
 
@@ -10859,22 +10859,44 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             app.task_manager._pa_browser_worker = fake_worker if enabled else None
             return app.task_manager.pa_browser_keep_open
 
+        async def open_browser(**_kwargs):
+            fake_worker.running = True
+            return True
+
         app.task_manager.set_pa_browser_keep_open = AsyncMock(side_effect=set_keep_open)
+        app.task_manager.ensure_pa_browser_worker_started = AsyncMock(side_effect=open_browser)
+        app.api_handler.is_session_expired = AsyncMock(
+            side_effect=AssertionError("Open Browser must not check the marketplace session")
+        )
 
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("s")
                 action = app.query_one("#settings-toggle-pa-browser-worker", ModalAction)
+                open_action = app.query_one("#settings-open-pa-browser", ModalAction)
                 action.scroll_visible(animate=False)
                 await pilot.pause()
 
                 disabled_text = str(app.query_one("#settings-pa-browser-worker", Static).render())
-                self.assertIn("Enabling opens one Chrome window; keep it minimized", disabled_text)
+                self.assertEqual(action.parent.border_title, "Persistent PA Browser")
+                self.assertIn("Keep one persistent Chrome window, no pop-ups", disabled_text)
+                self.assertFalse(open_action.display)
 
                 await pilot.click("#settings-toggle-pa-browser-worker")
                 await pilot.pause(0.1)
 
                 enabled_text = str(app.query_one("#settings-pa-browser-worker", Static).render())
+                self.assertFalse(open_action.display)
+                fake_worker.running = False
+                app.refresh_settings_summary()
+                closed_text = str(app.query_one("#settings-pa-browser-worker", Static).render())
+                self.assertTrue(open_action.display)
+                await pilot.pause()
+
+                await pilot.click("#settings-open-pa-browser")
+                await pilot.pause(0.1)
+                opened_status = app.status_message
+                self.assertFalse(open_action.display)
 
                 await pilot.click("#settings-toggle-pa-browser-worker")
                 await pilot.pause(0.1)
@@ -10885,7 +10907,14 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             app.task_manager.set_pa_browser_keep_open.await_args_list,
             [call(True), call(False)],
         )
+        app.task_manager.ensure_pa_browser_worker_started.assert_awaited_once_with(
+            cleanup_browser_cache=True
+        )
+        app.api_handler.is_session_expired.assert_not_awaited()
         self.assertIn("Keep the dedicated Chrome window open and minimized", enabled_text)
+        self.assertEqual(closed_text.lower().count("browser closed"), 1)
+        self.assertIn("Background recovery stays paused. Use Open Browser to restart", closed_text)
+        self.assertIn("Chrome worker ready", opened_status)
         self.assertIn("could not be disabled", disable_failure_status)
         self.assertIn("Keep Open: On", action_text_after_failure)
 
