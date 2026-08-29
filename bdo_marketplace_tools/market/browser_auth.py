@@ -52,12 +52,6 @@ PA_PASSWORD_SELECTORS = (
     "input[name='_password']",
     "input[type='password']",
 )
-PA_LOGIN_BUTTON_SELECTORS = (
-    "#btnLogin",
-    "button.js-btnLastLoginCheck",
-    "button[data-type='original']",
-    "button:has-text('Log in')",
-)
 STEAM_CONFIRM_LOGIN_SELECTORS = (
     "#imageLogin",
     "input[type='submit'][value='Sign In']",
@@ -66,7 +60,7 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
-PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
+PA_AUTO_LOGIN_PRESS_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 PA_AUTO_LOGIN_RETRY_GRACE_SECONDS = 2.0
 PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES = 2
@@ -855,7 +849,7 @@ def _new_pa_auto_login_state():
         "pending": {},
         "attempts": {},
         "network_submit_count": {},
-        "network_count_at_click": {},
+        "network_count_before_submit": {},
         "technical_retries": {},
         "missing_started_at": {},
         "missing_reported": set(),
@@ -1080,21 +1074,37 @@ async def _maybe_run_pa_credentials_login_target(
             return PA_AUTO_LOGIN_WAITING
         if not await _pa_login_form_visible(scope):
             return PA_AUTO_LOGIN_WAITING
-        if not await _pa_password_field_empty(scope):
+
+        network_seen = tracking["network_submit_count"].get(key, 0) > tracking[
+            "network_count_before_submit"
+        ].get(key, 0)
+        # A populated password with an observed LoginProcess request may still be in
+        # flight or under manual control. Without that request, Enter did not reach
+        # the form, so the same bounded retry policy should recover instead of
+        # waiting until the overall browser timeout.
+        if network_seen and not await _pa_password_field_empty(scope):
             return PA_AUTO_LOGIN_WAITING
 
         retries_used = tracking["technical_retries"].get(key, 0)
         if retries_used >= PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES:
             if key not in tracking["manual_reported"]:
                 tracking["manual_reported"].add(key)
+                manual_message = (
+                    "Pearl Abyss login returned to the login page after saved credentials were submitted. "
+                    "Auto-login paused; complete login manually or update saved credentials."
+                )
+                if not network_seen:
+                    manual_message = (
+                        "Pearl Abyss login did not produce a login request after Enter was pressed. "
+                        "Auto-login paused; complete login manually or update saved credentials."
+                    )
                 await _emit_status(
                     status_callback,
-                    "Pearl Abyss login returned to the login page after saved credentials were submitted. Auto-login paused; complete login manually or update saved credentials.",
+                    manual_message,
                     "warning",
                 )
             return PA_AUTO_LOGIN_MANUAL_NEEDED
 
-        network_seen = tracking["network_submit_count"].get(key, 0) > tracking["network_count_at_click"].get(key, 0)
         retry_number = retries_used + 1
         retry_message = (
             f"Pearl Abyss login did not submit cleanly; retrying saved credentials "
@@ -1106,16 +1116,23 @@ async def _maybe_run_pa_credentials_login_target(
                 f"({retry_number}/{PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES})."
             )
 
-    credentials_filled = await _fill_pa_credentials(scope, email, password)
-    if (
-        credentials_filled
-        and _scope_is_pa_credentials_login_target(scope)
-        and await _click_first_available_pa_selector(
+    password_element = await _fill_pa_credentials(scope, email, password)
+    network_count_before_submit = None
+    submit_started = False
+    if password_element is not None and _scope_is_pa_credentials_login_target(scope):
+        # Capture the request counter immediately before Enter. The context request
+        # listener can observe LoginProcess while press() is still resolving.
+        network_count_before_submit = tracking["network_submit_count"].get(key, 0)
+        submit_started = await _press_pa_password_enter(
             scope,
-            PA_LOGIN_BUTTON_SELECTORS,
-            timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
+            password_element,
+            timeout=PA_AUTO_LOGIN_PRESS_TIMEOUT_MS,
         )
-    ):
+        submit_started = submit_started or (
+            tracking["network_submit_count"].get(key, 0) > network_count_before_submit
+        )
+
+    if submit_started:
         tracking["attempts"][key] = tracking["attempts"].get(key, 0) + 1
         # Count a technical retry only once a resubmit actually goes out, so a failed retry-fill
         # doesn't burn the retry budget and jump straight to manual hand-off.
@@ -1123,7 +1140,7 @@ async def _maybe_run_pa_credentials_login_target(
             tracking["technical_retries"][key] = tracking["technical_retries"].get(key, 0) + 1
             await _emit_status(status_callback, retry_message, "warning")
         tracking["pending"][key] = now
-        tracking["network_count_at_click"][key] = tracking["network_submit_count"].get(key, 0)
+        tracking["network_count_before_submit"][key] = network_count_before_submit
         tracking["missing_started_at"].pop(key, None)
         if tracking["attempts"][key] == 1:
             await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
@@ -1143,17 +1160,18 @@ async def _maybe_run_pa_credentials_login_target(
 
 
 async def _fill_pa_credentials(scope, email, password):
+    """Fill saved credentials and return the document-bound password element."""
     if not _scope_is_pa_credentials_login_target(scope):
-        return False
-    email_filled = await _fill_first_available_pa_selector(
+        return None
+    email_element = await _fill_first_available_pa_element(
         scope,
         PA_EMAIL_SELECTORS,
         str(email),
         timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
     )
-    if not email_filled or not _scope_is_pa_credentials_login_target(scope):
-        return False
-    return await _fill_first_available_pa_selector(
+    if email_element is None or not _scope_is_pa_credentials_login_target(scope):
+        return None
+    return await _fill_first_available_pa_element(
         scope,
         PA_PASSWORD_SELECTORS,
         str(password),
@@ -1173,12 +1191,12 @@ async def _bound_pa_element(scope, selector, timeout):
     return element
 
 
-async def _fill_first_available_pa_selector(scope, selectors, value, timeout):
+async def _fill_first_available_pa_element(scope, selectors, value, timeout):
     for selector in selectors:
         element = await _bound_pa_element(scope, selector, timeout)
         if element is None:
             if not _scope_is_pa_credentials_login_target(scope):
-                return False
+                return None
             continue
         try:
             # ElementHandle stays bound to the document in which it was resolved. If
@@ -1187,34 +1205,28 @@ async def _fill_first_available_pa_selector(scope, selectors, value, timeout):
             await element.fill(value, timeout=timeout)
         except Exception:
             if not _scope_is_pa_credentials_login_target(scope):
-                return False
+                return None
             continue
-        return _scope_is_pa_credentials_login_target(scope)
-    return False
+        if not _scope_is_pa_credentials_login_target(scope):
+            return None
+        return element
+    return None
 
 
-async def _click_first_available_pa_selector(scope, selectors, timeout):
-    for selector in selectors:
-        element = await _bound_pa_element(scope, selector, timeout)
-        if element is None:
-            if not _scope_is_pa_credentials_login_target(scope):
-                return False
-            continue
-        try:
-            # This polling loop owns navigation detection. Waiting for navigation
-            # inside click() can raise after the browser already dispatched the
-            # submit, which would lose the pending-attempt bookkeeping and allow
-            # an immediate duplicate submit on the returned login page.
-            await element.click(timeout=timeout, no_wait_after=True)
-        except Exception:
-            if not _scope_is_pa_credentials_login_target(scope):
-                return False
-            continue
-        # A successful login click commonly navigates away before click() resolves.
-        # The handle was bound on the verified PA document, so that navigation is
-        # expected and must not erase the submitted/pending attempt bookkeeping.
-        return True
-    return False
+async def _press_pa_password_enter(scope, password_element, timeout):
+    if not _scope_is_pa_credentials_login_target(scope):
+        return False
+    try:
+        # The password handle stays bound to the verified PA document. Let the auth
+        # polling loop own navigation so a successful submit cannot lose its pending
+        # bookkeeping or trigger an immediate duplicate submission.
+        await password_element.press("Enter", timeout=timeout, no_wait_after=True)
+    except Exception:
+        # Navigation can detach the element after Enter was dispatched. Treat leaving
+        # the verified login route as progress; a failure on the unchanged form will
+        # instead use the normal bounded retry/manual path.
+        return not _scope_is_pa_credentials_login_target(scope)
+    return True
 
 
 async def _pa_login_form_visible(scope):

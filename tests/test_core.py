@@ -1758,9 +1758,9 @@ class APIResultTests(unittest.TestCase):
         self.assertEqual(clicked_selectors, [])
         self.assertEqual(statuses, [])
 
-    def test_pa_credentials_auto_login_fills_fields_and_clicks_login(self):
+    def test_pa_credentials_auto_login_fills_fields_and_presses_enter(self):
         filled_fields = []
-        clicked_selectors = []
+        pressed_fields = []
         statuses = []
 
         class FakeFirstLocator(_BoundElementHandleLocator):
@@ -1772,10 +1772,10 @@ class APIResultTests(unittest.TestCase):
                     raise RuntimeError("not found")
                 filled_fields.append((self.selector, value, timeout))
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout, no_wait_after))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
         class FakeLocator:
             def __init__(self, selector):
@@ -1810,12 +1810,12 @@ class APIResultTests(unittest.TestCase):
                 ("#_password", "secret", 1000),
             ],
         )
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000, True)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
         self.assertEqual(statuses, [("Automatic Pearl Abyss login submitted saved credentials.", "info")])
 
-    def test_pa_credentials_auto_login_records_submit_when_click_navigates(self):
+    def test_pa_credentials_auto_login_records_submit_when_enter_navigates(self):
         tracking = _new_pa_auto_login_state()
-        clicked_selectors = []
+        pressed_fields = []
 
         class NavigatingFirstLocator(_BoundElementHandleLocator):
             def __init__(self, page, selector):
@@ -1826,13 +1826,13 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=False):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout, no_wait_after))
+            async def press(self, key, timeout=None, no_wait_after=False):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
                 self.page.url = "https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack"
                 if not no_wait_after:
-                    raise TimeoutError("navigation was dispatched but did not finish before the click timeout")
+                    raise TimeoutError("navigation was dispatched but did not finish before the press timeout")
 
         class NavigatingLocator:
             def __init__(self, page, selector):
@@ -1860,7 +1860,7 @@ class APIResultTests(unittest.TestCase):
         )
 
         self.assertEqual(result, PA_AUTO_LOGIN_SUBMITTED)
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000, True)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
         self.assertEqual(sum(tracking["attempts"].values()), 1)
         self.assertEqual(list(tracking["pending"].values()), [123])
 
@@ -1874,8 +1874,8 @@ class APIResultTests(unittest.TestCase):
             async def fill(self, _value, timeout=None):
                 attempted_selectors.append(("fill", self.selector, timeout))
 
-            async def click(self, timeout=None):
-                attempted_selectors.append(("click", self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                attempted_selectors.append(("press", self.selector, key, timeout, no_wait_after))
 
         class FakeLocator:
             def __init__(self, selector):
@@ -2020,9 +2020,9 @@ class APIResultTests(unittest.TestCase):
                     raise AssertionError("password must not be filled after navigation")
                 self.page.url = "https://login.example.invalid/account"
 
-            async def click(self, timeout=None):
-                attempted_actions.append(("click", self.selector, timeout))
-                raise AssertionError("login must not be clicked after navigation")
+            async def press(self, key, timeout=None, no_wait_after=None):
+                attempted_actions.append(("press", self.selector, key, timeout, no_wait_after))
+                raise AssertionError("Enter must not be pressed after navigation")
 
         class FakeLocator:
             def __init__(self, page, selector):
@@ -2068,9 +2068,9 @@ class APIResultTests(unittest.TestCase):
                 attempted_actions.append(("fill", self.selector, timeout))
                 raise AssertionError("a handle resolved across navigation must not receive credentials")
 
-            async def click(self, timeout=None):
-                attempted_actions.append(("click", self.selector, timeout))
-                raise AssertionError("login must not be clicked after navigation")
+            async def press(self, key, timeout=None, no_wait_after=None):
+                attempted_actions.append(("press", self.selector, key, timeout, no_wait_after))
+                raise AssertionError("Enter must not be pressed after navigation")
 
         class ResolvingLocator:
             def __init__(self, page, selector):
@@ -2101,13 +2101,13 @@ class APIResultTests(unittest.TestCase):
 
     def test_pa_credentials_auto_login_accepts_verified_pa_frame(self):
         filled_fields = []
-        clicked_selectors = []
+        pressed_fields = []
 
         class MissingFirstLocator(_BoundElementHandleLocator):
             async def fill(self, *_args, **_kwargs):
                 raise RuntimeError("not found")
 
-            async def click(self, *_args, **_kwargs):
+            async def press(self, *_args, **_kwargs):
                 raise RuntimeError("not found")
 
         class MissingLocator:
@@ -2122,10 +2122,10 @@ class APIResultTests(unittest.TestCase):
                     raise RuntimeError("not found")
                 filled_fields.append((self.selector, value, timeout))
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout, no_wait_after))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
         class FrameLocator:
             def __init__(self, selector):
@@ -2169,17 +2169,17 @@ class APIResultTests(unittest.TestCase):
                 ("#_password", "secret", 1000),
             ],
         )
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000, True)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
 
     def test_pa_credentials_auto_login_requires_saved_password(self):
-        clicked_selectors = []
+        attempted_actions = []
 
         class FakeFirstLocator(_BoundElementHandleLocator):
             async def fill(self, *_args, **_kwargs):
-                clicked_selectors.append("fill")
+                attempted_actions.append("fill")
 
-            async def click(self, *_args, **_kwargs):
-                clicked_selectors.append("click")
+            async def press(self, *_args, **_kwargs):
+                attempted_actions.append("press")
 
         class FakeLocator:
             first = FakeFirstLocator()
@@ -2202,11 +2202,11 @@ class APIResultTests(unittest.TestCase):
         )
 
         self.assertEqual(result, PA_AUTO_LOGIN_DISABLED)
-        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(attempted_actions, [])
 
     def test_pa_credentials_auto_login_retries_when_login_form_returns_after_submit(self):
         filled_fields = []
-        clicked_selectors = []
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
 
@@ -2219,10 +2219,10 @@ class APIResultTests(unittest.TestCase):
                     raise RuntimeError("not found")
                 filled_fields.append((self.selector, value, timeout))
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2283,7 +2283,13 @@ class APIResultTests(unittest.TestCase):
         results = asyncio.run(run())
 
         self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING, PA_AUTO_LOGIN_SUBMITTED])
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000), ("#btnLogin", 1000)])
+        self.assertEqual(
+            pressed_fields,
+            [
+                ("#_password", "Enter", 1000, True),
+                ("#_password", "Enter", 1000, True),
+            ],
+        )
         self.assertEqual(
             filled_fields,
             [
@@ -2302,7 +2308,7 @@ class APIResultTests(unittest.TestCase):
         )
 
     def test_pa_credentials_auto_login_stops_on_invalid_credentials_dialog(self):
-        clicked_selectors = []
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
         dialog_state = _new_auth_dialog_state()
@@ -2315,10 +2321,10 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2376,14 +2382,14 @@ class APIResultTests(unittest.TestCase):
         results = asyncio.run(run())
 
         self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED])
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
         self.assertIn(
             ("Pearl Abyss rejected the saved email/password. Update saved credentials before refreshing again.", "warning"),
             statuses,
         )
 
-    def test_pa_credentials_auto_login_network_submit_allows_two_retries_only(self):
-        clicked_selectors = []
+    def test_pa_credentials_auto_login_counts_synchronous_network_submits_and_limits_retries(self):
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
 
@@ -2395,10 +2401,13 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
+                # Context request events can fire before press() resolves. Keep this
+                # synchronous to protect the request-baseline ordering.
+                _record_pa_login_process_submit(tracking)
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2433,7 +2442,6 @@ class APIResultTests(unittest.TestCase):
                 status_callback=status_callback,
                 now=0,
             )
-            _record_pa_login_process_submit(tracking)
             second = await _maybe_run_pa_credentials_login(
                 page,
                 "pa",
@@ -2444,7 +2452,6 @@ class APIResultTests(unittest.TestCase):
                 status_callback=status_callback,
                 now=2.1,
             )
-            _record_pa_login_process_submit(tracking)
             third = await _maybe_run_pa_credentials_login(
                 page,
                 "pa",
@@ -2455,7 +2462,6 @@ class APIResultTests(unittest.TestCase):
                 status_callback=status_callback,
                 now=4.2,
             )
-            _record_pa_login_process_submit(tracking)
             fourth = await _maybe_run_pa_credentials_login(
                 page,
                 "pa",
@@ -2479,7 +2485,12 @@ class APIResultTests(unittest.TestCase):
                 PA_AUTO_LOGIN_MANUAL_NEEDED,
             ],
         )
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000), ("#btnLogin", 1000), ("#btnLogin", 1000)])
+        self.assertEqual(
+            pressed_fields,
+            [("#_password", "Enter", 1000, True)] * 3,
+        )
+        self.assertEqual(tracking["network_submit_count"], {"pa_credentials_login": 3})
+        self.assertEqual(tracking["network_count_before_submit"], {"pa_credentials_login": 2})
         self.assertIn(
             ("Pearl Abyss login returned to the login page; retrying saved credentials (1/2).", "warning"),
             statuses,
@@ -2490,7 +2501,7 @@ class APIResultTests(unittest.TestCase):
         )
 
     def test_pa_credentials_auto_login_does_not_retry_without_login_form(self):
-        clicked_selectors = []
+        pressed_fields = []
         tracking = _new_pa_auto_login_state()
         form_visible = True
 
@@ -2502,10 +2513,10 @@ class APIResultTests(unittest.TestCase):
                 if not form_visible or self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if not form_visible or self.selector != "#btnLogin":
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if not form_visible or self.selector != "#_password":
                     raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return form_visible and self.selector in {"#_email", "#_password"}
@@ -2547,10 +2558,10 @@ class APIResultTests(unittest.TestCase):
         results = asyncio.run(run())
 
         self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING])
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
 
     def test_pa_credentials_auto_login_stable_key_survives_page_object_churn(self):
-        clicked_selectors = []
+        pressed_fields = []
         tracking = _new_pa_auto_login_state()
 
         class FakeFirstLocator(_BoundElementHandleLocator):
@@ -2561,10 +2572,10 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2606,10 +2617,10 @@ class APIResultTests(unittest.TestCase):
         results = asyncio.run(run())
 
         self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING])
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)])
 
-    def test_pa_credentials_auto_login_does_not_retry_when_password_remains_filled(self):
-        clicked_selectors = []
+    def test_pa_credentials_auto_login_retries_filled_form_only_without_network_submit(self):
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
 
@@ -2621,10 +2632,10 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2649,37 +2660,59 @@ class APIResultTests(unittest.TestCase):
 
         async def run():
             page = FakePage()
-            return [
-                await _maybe_run_pa_credentials_login(
-                    page,
-                    "pa",
-                    enabled=True,
-                    email="user@example.com",
-                    password="secret",
-                    tracking=tracking,
-                    status_callback=status_callback,
-                    now=0,
-                ),
-                await _maybe_run_pa_credentials_login(
-                    page,
-                    "pa",
-                    enabled=True,
-                    email="user@example.com",
-                    password="secret",
-                    tracking=tracking,
-                    status_callback=status_callback,
-                    now=3,
-                ),
-            ]
+            first = await _maybe_run_pa_credentials_login(
+                page,
+                "pa",
+                enabled=True,
+                email="user@example.com",
+                password="secret",
+                tracking=tracking,
+                status_callback=status_callback,
+                now=0,
+            )
+            # No LoginProcess request: a populated form must get one bounded Enter retry.
+            second = await _maybe_run_pa_credentials_login(
+                page,
+                "pa",
+                enabled=True,
+                email="user@example.com",
+                password="secret",
+                tracking=tracking,
+                status_callback=status_callback,
+                now=3,
+            )
+            # Once a request is observed, leave a still-populated form alone instead
+            # of issuing a duplicate while the request may be in flight.
+            _record_pa_login_process_submit(tracking)
+            third = await _maybe_run_pa_credentials_login(
+                page,
+                "pa",
+                enabled=True,
+                email="user@example.com",
+                password="secret",
+                tracking=tracking,
+                status_callback=status_callback,
+                now=6,
+            )
+            return [first, second, third]
 
         results = asyncio.run(run())
 
-        self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING])
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
-        self.assertEqual(statuses, [("Automatic Pearl Abyss login submitted saved credentials.", "info")])
+        self.assertEqual(
+            results,
+            [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING],
+        )
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)] * 2)
+        self.assertEqual(
+            statuses,
+            [
+                ("Automatic Pearl Abyss login submitted saved credentials.", "info"),
+                ("Pearl Abyss login did not submit cleanly; retrying saved credentials (1/2).", "warning"),
+            ],
+        )
 
     def test_pa_credentials_auto_login_stops_after_two_technical_retries(self):
-        clicked_selectors = []
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
 
@@ -2691,10 +2724,10 @@ class APIResultTests(unittest.TestCase):
                 if self.selector not in {"#_email", "#_password"}:
                     raise RuntimeError("not found")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append((self.selector, timeout))
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2747,15 +2780,15 @@ class APIResultTests(unittest.TestCase):
                 PA_AUTO_LOGIN_MANUAL_NEEDED,
             ],
         )
-        self.assertEqual(clicked_selectors, [("#btnLogin", 1000), ("#btnLogin", 1000), ("#btnLogin", 1000)])
-        self.assertEqual(statuses[-1][0], "Pearl Abyss login returned to the login page after saved credentials were submitted. Auto-login paused; complete login manually or update saved credentials.")
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)] * 3)
+        self.assertEqual(statuses[-1][0], "Pearl Abyss login did not produce a login request after Enter was pressed. Auto-login paused; complete login manually or update saved credentials.")
         self.assertEqual(statuses[-1][1], "warning")
 
     def test_pa_credentials_auto_login_failed_retry_fill_does_not_consume_budget(self):
         # Regression: technical_retries used to be incremented before the retry fill, so a single
         # failed retry-fill burned the retry budget and jumped straight to manual. The budget and
         # retry status must only be consumed once a resubmit actually goes out.
-        clicked_selectors = []
+        pressed_fields = []
         statuses = []
         tracking = _new_pa_auto_login_state()
         control = {"fill_ok": True}
@@ -2770,10 +2803,10 @@ class APIResultTests(unittest.TestCase):
                 if not control["fill_ok"]:
                     raise RuntimeError("fill failed")
 
-            async def click(self, timeout=None, no_wait_after=None):
-                if self.selector != "#btnLogin":
-                    raise RuntimeError("not found")
-                clicked_selectors.append(self.selector)
+            async def press(self, key, timeout=None, no_wait_after=None):
+                if self.selector != "#_password":
+                    raise AssertionError("Enter must be pressed on the bound password field")
+                pressed_fields.append((self.selector, key, timeout, no_wait_after))
 
             async def is_visible(self, timeout=None):
                 return self.selector in {"#_email", "#_password"}
@@ -2833,8 +2866,8 @@ class APIResultTests(unittest.TestCase):
                 PA_AUTO_LOGIN_MANUAL_NEEDED,
             ],
         )
-        # Initial submit + exactly two real retry submits; the failed-fill poll never clicked.
-        self.assertEqual(clicked_selectors, ["#btnLogin", "#btnLogin", "#btnLogin"])
+        # Initial submit + exactly two real retry submits; the failed-fill poll never pressed Enter.
+        self.assertEqual(pressed_fields, [("#_password", "Enter", 1000, True)] * 3)
         self.assertEqual(status_count_after_failed_fill, 1)
         self.assertEqual(
             statuses,
@@ -2843,7 +2876,7 @@ class APIResultTests(unittest.TestCase):
                 ("Pearl Abyss login did not submit cleanly; retrying saved credentials (1/2).", "warning"),
                 ("Pearl Abyss login did not submit cleanly; retrying saved credentials (2/2).", "warning"),
                 (
-                    "Pearl Abyss login returned to the login page after saved credentials were submitted. Auto-login paused; complete login manually or update saved credentials.",
+                    "Pearl Abyss login did not produce a login request after Enter was pressed. Auto-login paused; complete login manually or update saved credentials.",
                     "warning",
                 ),
             ],
