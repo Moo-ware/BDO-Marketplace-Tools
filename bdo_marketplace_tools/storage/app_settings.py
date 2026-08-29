@@ -82,6 +82,11 @@ def default_app_settings():
             # True once a Pearl Abyss browser profile has been seeded from the Black Desert
             # homepage before its first successful marketplace auth (skips the warmup afterward).
             "profile_prepared": False,
+            # Optional PA-only authentication worker. When enabled, the app keeps its dedicated
+            # Chrome profile open between refreshes so later automatic re-authentication can reuse
+            # the already-open window. Disabled preserves the historical open/authenticate/close
+            # lifecycle exactly.
+            "keep_open": False,
         },
         "session": {
             # True only when the saved marketplace cookies (session.json, in the per-user data
@@ -254,6 +259,7 @@ def _normalize_settings(data):
     settings["steam_browser"]["pa_cookie_consent_prepared"] = _coerce_bool(steam_pa_consent_prepared)
     pa_prepared = pa_browser.get("profile_prepared", data.get(PA_BROWSER_PROFILE_PREPARED_KEY, False))
     settings["pa_browser"]["profile_prepared"] = _coerce_bool(pa_prepared)
+    settings["pa_browser"]["keep_open"] = _coerce_bool(pa_browser.get("keep_open", False))
 
     settings["session"]["saved_session_last_known_valid"] = _coerce_bool(
         session.get("saved_session_last_known_valid", data.get("saved_session_last_known_valid", False))
@@ -362,6 +368,16 @@ def save_pa_browser_profile_prepared(prepared=True):
     settings = read_app_settings()
     settings["pa_browser"]["profile_prepared"] = bool(prepared)
     return save_app_settings(settings)["pa_browser"]["profile_prepared"]
+
+
+def load_pa_browser_keep_open():
+    return read_app_settings()["pa_browser"]["keep_open"]
+
+
+def save_pa_browser_keep_open(enabled):
+    settings = read_app_settings()
+    settings["pa_browser"]["keep_open"] = bool(enabled)
+    return save_app_settings(settings)["pa_browser"]["keep_open"]
 
 
 def load_saved_email():

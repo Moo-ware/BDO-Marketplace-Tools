@@ -256,6 +256,7 @@ class CredentialsModal(DashboardModalScreen):
                 mode_options,
                 value=app.task_manager.account_mode,
                 id="account-mode-select",
+                allow_blank=False,
             )
             yield Static(id="credentials-mode-note", classes="modal-note")
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):

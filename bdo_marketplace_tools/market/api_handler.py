@@ -66,6 +66,7 @@ PURCHASE_RESULT_REASONS = {
     -16: "not enough silver for the order",
     2000: "login session expired",
 }
+ITEM_LOCAL_PURCHASE_RESULT_CODES = frozenset({30, 34})
 
 
 def _format_silver_amount(price):
@@ -290,7 +291,14 @@ class APIHandler:
         self.login_status = False
         return False
 
-    async def buy_item(self, buy_list, purchase_delay_bounds=None, *, on_purchase=None):
+    async def buy_item(
+        self,
+        buy_list,
+        purchase_delay_bounds=None,
+        *,
+        on_purchase=None,
+        stop_event=None,
+    ):
         # on_purchase: optional synchronous observer called with each purchase_record the
         # moment that item is secured (before the inter-buy delay). Cosmetic only — it is
         # exception-isolated and must never influence purchasing, retries, or timing.
@@ -311,7 +319,12 @@ class APIHandler:
             "results": [],
             "purchase_delay_bounds": purchase_delay_bounds,
             "auth_failed": False,
+            "stopped": False,
         }
+
+        if self._purchase_stop_requested(stop_event):
+            self._mark_purchase_stopped(summary, request_completed=False)
+            return summary
 
         if not getattr(self, "login_status", False) or not self._has_session_cookies():
             try:
@@ -337,7 +350,12 @@ class APIHandler:
 
         attempt_index = 0
         retried_after_session_refresh = False
+        retired_item_ids = set()
         while attempt_index < len(purchase_attempts):
+            if self._purchase_stop_requested(stop_event):
+                self._mark_purchase_stopped(summary, request_completed=False)
+                break
+
             item_id, price = purchase_attempts[attempt_index]
             payload = {
                 "buyMainKey": item_id,
@@ -389,7 +407,32 @@ class APIHandler:
                             ),
                         }
                     )
-                    break
+                    retired_item_ids.add(str(item_id))
+                    next_attempt_index = self._next_eligible_purchase_attempt_index(
+                        purchase_attempts,
+                        attempt_index + 1,
+                        retired_item_ids,
+                    )
+                    self._note_retired_item_attempts(
+                        summary,
+                        purchase_attempts,
+                        attempt_index + 1,
+                        item_id,
+                        will_continue=next_attempt_index < len(purchase_attempts),
+                    )
+                    stopped_during_delay = await self._sleep_before_next_purchase_attempt(
+                        next_attempt_index,
+                        purchase_attempts,
+                        purchase_delay_bounds,
+                        stop_event=stop_event,
+                    )
+                    if stopped_during_delay:
+                        self._mark_purchase_stopped(summary, request_completed=True)
+                        break
+
+                    attempt_index = next_attempt_index
+                    retried_after_session_refresh = False
+                    continue
 
                 summary["purchased"] += result_details["count"]
                 purchase_record = {
@@ -415,12 +458,26 @@ class APIHandler:
                         )
                     }
                 )
-                await self._sleep_before_next_purchase_attempt(
-                    attempt_index,
+                if self._purchase_stop_requested(stop_event):
+                    self._mark_purchase_stopped(summary, request_completed=True)
+                    break
+
+                next_attempt_index = self._next_eligible_purchase_attempt_index(
+                    purchase_attempts,
+                    attempt_index + 1,
+                    retired_item_ids,
+                )
+                stopped_during_delay = await self._sleep_before_next_purchase_attempt(
+                    next_attempt_index,
                     purchase_attempts,
                     purchase_delay_bounds,
+                    stop_event=stop_event,
                 )
-                attempt_index += 1
+                if stopped_during_delay:
+                    self._mark_purchase_stopped(summary, request_completed=True)
+                    break
+
+                attempt_index = next_attempt_index
                 retried_after_session_refresh = False
                 continue
 
@@ -434,6 +491,22 @@ class APIHandler:
                             "message": "Login session expired. Refresh the Steam Account session before buying.",
                         }
                     )
+                    if self._purchase_stop_requested(stop_event):
+                        self._mark_purchase_stopped(summary, request_completed=True)
+                    return summary
+
+                if self._purchase_stop_requested(stop_event):
+                    # STOP must prevent re-authentication and another request, but the
+                    # completed response still proves this cookie session is invalid.
+                    self.login_status = False
+                    summary["auth_failed"] = True
+                    summary["events"].append(
+                        {
+                            "level": "error",
+                            "message": "Login session expired. Purchase batch stopped before re-authentication.",
+                        }
+                    )
+                    self._mark_purchase_stopped(summary, request_completed=True)
                     return summary
 
                 summary["events"].append(
@@ -469,6 +542,33 @@ class APIHandler:
                     "message": purchase_result_message(result_code, item_id, price),
                 }
             )
+            if result_code in ITEM_LOCAL_PURCHASE_RESULT_CODES:
+                retired_item_ids.add(str(item_id))
+                next_attempt_index = self._next_eligible_purchase_attempt_index(
+                    purchase_attempts,
+                    attempt_index + 1,
+                    retired_item_ids,
+                )
+                self._note_retired_item_attempts(
+                    summary,
+                    purchase_attempts,
+                    attempt_index + 1,
+                    item_id,
+                    will_continue=next_attempt_index < len(purchase_attempts),
+                )
+                stopped_during_delay = await self._sleep_before_next_purchase_attempt(
+                    next_attempt_index,
+                    purchase_attempts,
+                    purchase_delay_bounds,
+                    stop_event=stop_event,
+                )
+                if stopped_during_delay:
+                    self._mark_purchase_stopped(summary, request_completed=True)
+                    break
+
+                attempt_index = next_attempt_index
+                retried_after_session_refresh = False
+                continue
             break
 
         return summary
@@ -490,6 +590,44 @@ class APIHandler:
                 attempts.append((str(item_id), str(price)))
         return attempts
 
+    def _next_eligible_purchase_attempt_index(self, purchase_attempts, start_index, retired_item_ids):
+        attempt_index = start_index
+        while attempt_index < len(purchase_attempts):
+            item_id, _price = purchase_attempts[attempt_index]
+            if item_id not in retired_item_ids:
+                break
+            attempt_index += 1
+        return attempt_index
+
+    def _note_retired_item_attempts(
+        self,
+        summary,
+        purchase_attempts,
+        start_index,
+        item_id,
+        *,
+        will_continue,
+    ):
+        skipped_count = sum(
+            1
+            for pending_item_id, _price in purchase_attempts[start_index:]
+            if pending_item_id == str(item_id)
+        )
+        if skipped_count <= 0:
+            return
+
+        noun = "attempt" if skipped_count == 1 else "attempts"
+        continuation = "; continuing with other item IDs." if will_continue else "."
+        summary["events"].append(
+            {
+                "level": "warning",
+                "message": (
+                    f"Skipped {skipped_count} remaining purchase {noun} for item {highlight(item_id)}"
+                    f"{continuation}"
+                ),
+            }
+        )
+
     def _purchase_delay_bounds(self, purchase_delay_bounds):
         bounds = DEFAULT_PURCHASE_DELAY_BOUNDS if purchase_delay_bounds is None else purchase_delay_bounds
         try:
@@ -505,15 +643,47 @@ class APIHandler:
             )
         return (low, high)
 
-    async def _sleep_before_next_purchase_attempt(self, attempt_index, purchase_attempts, purchase_delay_bounds):
-        if attempt_index >= len(purchase_attempts) - 1:
-            return
+    async def _sleep_before_next_purchase_attempt(
+        self,
+        next_attempt_index,
+        purchase_attempts,
+        purchase_delay_bounds,
+        *,
+        stop_event=None,
+    ):
+        if next_attempt_index >= len(purchase_attempts):
+            return False
 
         low, high = purchase_delay_bounds
         if high <= 0:
+            return False
+
+        delay = random.uniform(low, high)
+        if stop_event is None:
+            await asyncio.sleep(delay)
+            return False
+
+        if stop_event.is_set():
+            return True
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            return False
+        return True
+
+    def _purchase_stop_requested(self, stop_event):
+        return stop_event is not None and stop_event.is_set()
+
+    def _mark_purchase_stopped(self, summary, *, request_completed):
+        if summary.get("stopped"):
             return
 
-        await asyncio.sleep(random.uniform(low, high))
+        summary["stopped"] = True
+        message = "Purchase batch stopped before another request was submitted."
+        if request_completed:
+            message = "Purchase batch stopped after the in-flight request completed; remaining attempts were skipped."
+        summary["events"].append({"level": "warning", "message": message})
 
     def _purchase_result_code(self, response_json):
         if "resultCode" not in response_json:

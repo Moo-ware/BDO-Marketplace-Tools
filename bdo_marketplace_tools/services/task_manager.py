@@ -16,6 +16,7 @@ from bdo_marketplace_tools.market.browser_auth import (
     clear_steam_browser_profile_cookies,
     prepare_steam_browser_profile,
 )
+from bdo_marketplace_tools.market.browser_worker import PersistentPABrowserWorker
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
 from bdo_marketplace_tools.market.test_mode import (
     LIVE_BUY_ERROR_TEST_TARGET,
@@ -25,6 +26,7 @@ from bdo_marketplace_tools.market.test_mode import (
 )
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
+    PA_CREDENTIALS_MODE,
     STEAM_BROWSER_MODE,
     account_mode_detail,
     account_mode_label,
@@ -32,6 +34,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     load_browser_cache_cleanup_threshold_mb,
     load_account_mode,
     load_pa_browser_profile_prepared,
+    load_pa_browser_keep_open,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
     load_steam_pa_cookie_consent_prepared,
@@ -44,6 +47,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_buy_mode,
     save_scan_scope,
     save_pa_browser_profile_prepared,
+    save_pa_browser_keep_open,
     save_polling_settings,
     save_purchase_delay_bounds,
     save_saved_session_last_known_valid,
@@ -104,11 +108,34 @@ BROWSER_VERIFICATION_MARKERS = (
     "manual browser verification",
     "requires browser",
 )
-BROWSER_STORAGE_SUMMARY_CACHE_SECONDS = 5
 
 
 def _same_file_path(left, right):
     return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+
+
+async def _run_profile_io_in_thread(function, *args, **kwargs):
+    """Run profile filesystem work to completion even if its caller is cancelled.
+
+    Cancelling ``asyncio.to_thread`` only cancels the awaiter; the underlying thread keeps
+    running. Profile cleanup must therefore be joined before the caller can release its browser
+    locks, otherwise a replacement Chrome context could open while that thread is still deleting
+    files from the same profile.
+    """
+    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        await asyncio.wait((operation,))
+    except asyncio.CancelledError as cancellation:
+        while not operation.done():
+            try:
+                await asyncio.wait((operation,))
+            except asyncio.CancelledError:
+                # Repeated cancellation requests must not let the profile lock escape early.
+                continue
+        if not operation.cancelled():
+            operation.exception()
+        raise cancellation
+    return operation.result()
 
 
 def _load_local_data(path=_DEFAULT_STATS_PATH, legacy_json_path=_DEFAULT_LEGACY_STATS_PATH):
@@ -142,6 +169,10 @@ class BackgroundTasks:
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
         self.pa_browser_profile_prepared = load_pa_browser_profile_prepared()
+        self.pa_browser_keep_open = (
+            load_pa_browser_keep_open() if self.persist_ui_settings else False
+        )
+        self._pa_browser_worker = None
         self.saved_session_last_known_valid = (
             load_saved_session_last_known_valid() if self.persist_ui_settings else False
         )
@@ -154,8 +185,11 @@ class BackgroundTasks:
         self.login_checker_task = None
         self.checker_enabled = False
         self.checker_stop_requested = False
+        self._checker_purchase_stop_event = asyncio.Event()
         self.single_item_test_checker_enabled = False
         self.single_item_test_purchase_enabled = False
+        self._single_item_test_purchase_stop_event = asyncio.Event()
+        self._purchase_owner_task = None
         self.delay_choices = {
             "1": ("Fast", (3, 5)),
             "2": ("Balanced", (5, 10)),
@@ -197,6 +231,10 @@ class BackgroundTasks:
         self.purchase_in_progress = False
         self.pending_auth_reset_reason = None
         self.browser_auth_lock = asyncio.Lock()
+        self._auth_context_generation = 0
+        self._pa_browser_lifecycle_generation = 0
+        self._pa_browser_stop_requests = 0
+        self._pa_browser_start_task = None
         self.consecutive_cycle_errors = 0
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
@@ -216,7 +254,9 @@ class BackgroundTasks:
         self.update_check_completed = False
         self.update_check_in_progress = False
         self._browser_storage_summary = None
-        self._browser_storage_summary_at = 0.0
+        self._browser_storage_generation = 0
+        self._browser_storage_refresh_task = None
+        self._browser_storage_refresh_generation = None
 
     def reload_lifetime_stats(self):
         self._assert_stats_db_path_allowed(self.stats_db_path)
@@ -433,22 +473,45 @@ class BackgroundTasks:
         except RuntimeError:
             pass
 
-    def browser_storage_summary(self, *, force=False):
-        now = time.time()
-        if (
-            not force
-            and self._browser_storage_summary is not None
-            and now - self._browser_storage_summary_at < BROWSER_STORAGE_SUMMARY_CACHE_SECONDS
-        ):
+    def browser_storage_summary(self):
+        return self._browser_storage_summary
+
+    @property
+    def browser_storage_generation(self):
+        return self._browser_storage_generation
+
+    async def refresh_browser_storage_summary(self, *, force=False):
+        if self._browser_storage_summary is not None and not force:
             return self._browser_storage_summary
 
-        self._browser_storage_summary = measure_all_browser_profile_storage()
-        self._browser_storage_summary_at = now
-        return self._browser_storage_summary
+        generation = self._browser_storage_generation
+        existing_task = self._browser_storage_refresh_task
+        if (
+            existing_task is not None
+            and not existing_task.done()
+            and self._browser_storage_refresh_generation == generation
+        ):
+            return await asyncio.shield(existing_task)
+
+        async def measure_and_cache():
+            summary = await asyncio.to_thread(measure_all_browser_profile_storage)
+            if generation == self._browser_storage_generation:
+                self._browser_storage_summary = summary
+            return self._browser_storage_summary
+
+        refresh_task = asyncio.create_task(measure_and_cache())
+        self._browser_storage_refresh_task = refresh_task
+        self._browser_storage_refresh_generation = generation
+        try:
+            return await asyncio.shield(refresh_task)
+        finally:
+            if self._browser_storage_refresh_task is refresh_task and refresh_task.done():
+                self._browser_storage_refresh_task = None
+                self._browser_storage_refresh_generation = None
 
     def invalidate_browser_storage_summary(self):
         self._browser_storage_summary = None
-        self._browser_storage_summary_at = 0.0
+        self._browser_storage_generation += 1
 
     def browser_cache_cleanup_threshold_bytes(self):
         return int(self.browser_cache_cleanup_threshold_mb) * MIB
@@ -467,11 +530,14 @@ class BackgroundTasks:
 
     async def _clean_browser_cache_before_auth(self, profile_path, account_label):
         try:
-            result = await asyncio.to_thread(
+            result = await _run_profile_io_in_thread(
                 clean_disposable_browser_profile_cache,
                 profile_path,
                 threshold_bytes=self.browser_cache_cleanup_threshold_bytes(),
             )
+        except asyncio.CancelledError:
+            self.invalidate_browser_storage_summary()
+            raise
         except Exception as exc:
             self.invalidate_browser_storage_summary()
             self.add_event(
@@ -496,15 +562,42 @@ class BackgroundTasks:
         return result.removed_anything
 
     async def clean_browser_cache_now(self):
-        try:
-            results = await asyncio.to_thread(
-                clean_all_disposable_browser_profile_caches,
-                threshold_bytes=1,
+        async with self.browser_auth_lock:
+            restart_pa_worker = self.pa_browser_worker_running
+            restart_generation = (
+                self._pa_browser_lifecycle_generation if restart_pa_worker else None
             )
-        except Exception as exc:
-            self.invalidate_browser_storage_summary()
-            self.add_event(f"Manual browser cache cleanup failed: {exc}", "error")
-            return None
+            if self._pa_browser_worker is not None:
+                try:
+                    await self._close_pa_browser_worker()
+                except BrowserAuthError as exc:
+                    self.invalidate_browser_storage_summary()
+                    self.add_event(
+                        f"Manual browser cache cleanup skipped because the PA Chrome worker could not close: {exc}",
+                        "error",
+                    )
+                    return None
+            try:
+                results = await _run_profile_io_in_thread(
+                    clean_all_disposable_browser_profile_caches,
+                    threshold_bytes=1,
+                )
+            except asyncio.CancelledError:
+                restart_pa_worker = False
+                self.invalidate_browser_storage_summary()
+                raise
+            except Exception as exc:
+                self.invalidate_browser_storage_summary()
+                self.add_event(f"Manual browser cache cleanup failed: {exc}", "error")
+                return None
+            finally:
+                if (
+                    restart_pa_worker
+                    and restart_generation == self._pa_browser_lifecycle_generation
+                    and self.pa_browser_keep_open
+                    and not self.uses_steam_browser_session()
+                ):
+                    await self._ensure_pa_browser_worker_started()
 
         self.invalidate_browser_storage_summary()
         removed_bytes = sum(result.removed_bytes for result in results)
@@ -753,12 +846,38 @@ class BackgroundTasks:
         session = getattr(self.api_handler, "session", None)
         return bool(getattr(session, "cookies", None))
 
-    async def _saved_session_is_valid(self):
+    def _auth_context_snapshot(self):
+        return self._auth_context_generation, self.account_mode
+
+    def _auth_context_is_current(self, snapshot, *, expected_mode=None):
+        generation, mode = snapshot
+        return (
+            generation == self._auth_context_generation
+            and mode == self.account_mode
+            and (expected_mode is None or mode == expected_mode)
+        )
+
+    def _discard_stale_imported_session(self):
+        # validate_and_save_imported_session temporarily installs its candidate
+        # session before awaiting server validation. If a reset wins that race, the
+        # old auth task must erase its candidate (including any saved copy) without
+        # applying success side effects to the new context.
+        self.steam_auto_reauth_enabled = False
+        if hasattr(self.api_handler, "clear_session"):
+            self.api_handler.clear_session()
+        else:
+            self.api_handler.login_status = False
+        self._set_saved_session_last_known_valid(False)
+
+    async def _saved_session_is_valid(self, auth_context=None):
         if not self._api_has_session_cookies():
             return False
         try:
             status = await self._check_session_expired()
         except MarketplaceAPIError:
+            return False
+
+        if auth_context is not None and not self._auth_context_is_current(auth_context):
             return False
 
         if status == 0:
@@ -822,40 +941,288 @@ class BackgroundTasks:
             self.pa_browser_profile_prepared = save_pa_browser_profile_prepared(prepared)
         return self.pa_browser_profile_prepared
 
+    def invalidate_pa_browser_identity(self):
+        """Require the next PA auth context to clear cookies before login."""
+        return self._set_pa_browser_profile_prepared(False)
+
+    @property
+    def pa_browser_worker_running(self):
+        worker = self._pa_browser_worker
+        return bool(worker is not None and worker.running)
+
+    @property
+    def pa_browser_worker_owns_profile(self):
+        worker = self._pa_browser_worker
+        return bool(worker is not None and worker.owns_profile)
+
+    @property
+    def pa_browser_worker_has_resources(self):
+        worker = self._pa_browser_worker
+        return bool(worker is not None and worker.has_resources)
+
+    async def ensure_pa_browser_worker_started(self, *, cleanup_browser_cache=False, auth_context=None):
+        if auth_context is None:
+            auth_context = self._auth_context_snapshot()
+        async with self.browser_auth_lock:
+            return await self._ensure_pa_browser_worker_started(
+                cleanup_browser_cache=cleanup_browser_cache,
+                auth_context=auth_context,
+            )
+
+    async def _ensure_pa_browser_worker_started(self, *, cleanup_browser_cache=False, auth_context=None):
+        if auth_context is None:
+            auth_context = self._auth_context_snapshot()
+        generation = self._pa_browser_lifecycle_generation
+        if not self._pa_browser_worker_start_allowed(generation, auth_context):
+            return False
+        if self.pa_browser_worker_running:
+            return True
+
+        # A user can close the only Chrome page while Patchright still owns the persistent
+        # profile. Dispose that stale context before touching its cache or launching again.
+        if self._pa_browser_worker is not None:
+            try:
+                await self._close_pa_browser_worker()
+            except BrowserAuthError as exc:
+                self.add_event(
+                    f"Pearl Abyss Chrome worker could not release its stale profile: {exc}",
+                    "error",
+                )
+                return False
+            if not self._pa_browser_worker_start_allowed(generation, auth_context):
+                return False
+
+        if cleanup_browser_cache:
+            await self._clean_browser_cache_before_auth(PA_MARKET_PROFILE_PATH, "Pearl Abyss Account")
+
+        # Cache cleanup runs in a thread. The user may disable the setting, change modes, or
+        # exit while it is in flight; never launch a now-unwanted visible window afterward.
+        if not self._pa_browser_worker_start_allowed(generation, auth_context):
+            return False
+
+        worker = PersistentPABrowserWorker(profile_path=PA_MARKET_PROFILE_PATH)
+        self._pa_browser_worker = worker
+        start_operation = asyncio.create_task(
+            worker.start(status_callback=self._browser_auth_status)
+        )
+        self._pa_browser_start_task = start_operation
+        try:
+            try:
+                await start_operation
+            finally:
+                if self._pa_browser_start_task is start_operation:
+                    self._pa_browser_start_task = None
+        except asyncio.CancelledError:
+            # Worker.close() cancels an in-progress launch. Treat that as an intentional stop,
+            # while preserving ordinary external cancellation semantics for the caller.
+            if not self._pa_browser_worker_start_allowed(generation, auth_context):
+                return False
+            raise
+        except BrowserAuthError as exc:
+            self.add_event(f"Pearl Abyss Chrome worker failed to start: {exc}", "error")
+            return False
+
+        if not self._pa_browser_worker_start_allowed(generation, auth_context):
+            try:
+                await worker.close(status_callback=self._browser_auth_status)
+            except BrowserAuthError as exc:
+                self.add_event(
+                    f"Pearl Abyss Chrome worker stopped being needed but could not close: {exc}",
+                    "error",
+                )
+            else:
+                if self._pa_browser_worker is worker:
+                    self._pa_browser_worker = None
+                self.invalidate_browser_storage_summary()
+            return False
+
+        self.invalidate_browser_storage_summary()
+        return True
+
+    def _pa_browser_worker_start_allowed(self, generation, auth_context):
+        return bool(
+            not self._pa_browser_stop_requests
+            and generation == self._pa_browser_lifecycle_generation
+            and self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE)
+            and self.pa_browser_keep_open
+        )
+
+    async def stop_pa_browser_worker(self):
+        self._pa_browser_lifecycle_generation += 1
+        self._pa_browser_stop_requests += 1
+        start_operation = self._pa_browser_start_task
+        if start_operation is not None and not start_operation.done():
+            start_operation.cancel()
+        try:
+            # Do not wait on browser_auth_lock here: a retained worker can interrupt its own
+            # in-flight launch/auth operation, while a cleanup with no worker observes the
+            # lifecycle generation after its filesystem thread has been safely joined.
+            try:
+                return await self._close_pa_browser_worker()
+            finally:
+                # The worker performs a bounded operation drain. Retrieve a completed launch
+                # result here, but never reintroduce an unbounded shutdown wait at the manager.
+                if start_operation is not None and start_operation.done():
+                    await asyncio.gather(start_operation, return_exceptions=True)
+        finally:
+            self._pa_browser_stop_requests -= 1
+
+    async def stop_pa_browser_worker_best_effort(self, reason="Pearl Abyss Chrome worker could not close"):
+        """Try to release the PA browser without failing a broader lifecycle action."""
+        try:
+            return await self.stop_pa_browser_worker()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.add_event(f"{reason}: {exc}", "error")
+            return False
+
+    async def _close_pa_browser_worker(self):
+        worker = self._pa_browser_worker
+        if worker is None:
+            return False
+        closed = await worker.close(status_callback=self._browser_auth_status)
+        if self._pa_browser_worker is worker:
+            self._pa_browser_worker = None
+            self.invalidate_browser_storage_summary()
+        return closed
+
+    async def set_pa_browser_keep_open(self, enabled):
+        enabled = bool(enabled)
+        if not enabled:
+            # Keep routing on the worker branch until its profile ownership is fully released.
+            # A refresh already inside browser_auth_lock then fails cleanly at the stopping worker
+            # instead of opening a disposable context against the same profile mid-close.
+            try:
+                await self.stop_pa_browser_worker()
+            except BrowserAuthError as exc:
+                self.add_event(f"Pearl Abyss Chrome worker could not be disabled: {exc}", "error")
+                return True
+            self.pa_browser_keep_open = False
+            if self.persist_ui_settings:
+                self.pa_browser_keep_open = save_pa_browser_keep_open(False)
+            self.add_event("Pearl Abyss Chrome worker disabled.", "info")
+            return False
+
+        # Enabling waits for any disposable PA refresh to release the profile before changing the
+        # routing preference. This prevents an in-flight legacy refresh from suddenly switching
+        # to a worker that does not exist yet, and prevents two contexts from opening one profile.
+        async with self.browser_auth_lock:
+            self.pa_browser_keep_open = True
+            if self.persist_ui_settings:
+                self.pa_browser_keep_open = save_pa_browser_keep_open(True)
+
+            if self.uses_steam_browser_session():
+                self.add_event(
+                    "Pearl Abyss Chrome worker enabled; it will start when Pearl Abyss Account is selected.",
+                    "info",
+                )
+                return True
+
+            started = await self._ensure_pa_browser_worker_started(cleanup_browser_cache=True)
+            if not started:
+                self.add_event(
+                    "Pearl Abyss Chrome worker is enabled but could not start. Toggle it off and on to retry.",
+                    "warning",
+                )
+            return self.pa_browser_keep_open
+
+    async def _acquire_pa_market_cookies(self, *, allow_worker_start=False, **kwargs):
+        if self._pa_browser_stop_requests:
+            raise BrowserAuthError("Pearl Abyss Chrome worker is stopping.")
+        if not self.pa_browser_keep_open:
+            if self._pa_browser_worker is not None:
+                raise BrowserAuthError(
+                    "Pearl Abyss Chrome worker still owns its browser profile. Close Chrome manually before refreshing."
+                )
+            return await acquire_market_cookies(**kwargs)
+
+        if not self.pa_browser_worker_running:
+            if not allow_worker_start or not await self._ensure_pa_browser_worker_started(
+                cleanup_browser_cache=True,
+            ):
+                raise BrowserAuthError(
+                    "Pearl Abyss Chrome worker is not running. Open App Settings and restart it before refreshing."
+                )
+        return await self._pa_browser_worker.acquire_market_cookies(**kwargs)
+
+    async def _update_pa_browser_landing_validation(self, valid):
+        """Best-effort bridge from authoritative HTTP validation to the parked page."""
+        worker = self._pa_browser_worker
+        update = getattr(worker, "update_session_validation", None)
+        if not callable(update):
+            return False
+        try:
+            result = update(bool(valid))
+            if hasattr(result, "__await__"):
+                return await result
+            return bool(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The landing page is cosmetic and must never change an authentication result.
+            return False
+
     def set_account_mode(self, mode):
         normalized = normalize_account_mode(mode)
         if normalized != self.account_mode:
+            self._auth_context_generation += 1
             self.steam_auto_reauth_enabled = False
             self.buy_mode_resume_pending = False
-        self.account_mode = save_account_mode(normalized)
+        self.account_mode = save_account_mode(normalized) if self.persist_ui_settings else normalized
         self.api_handler.account_mode = self.account_mode
         return self.account_mode
 
     async def change_account_mode(self, mode):
         normalized = normalize_account_mode(mode)
         previous_mode = self.account_mode
-        self.account_mode = save_account_mode(normalized)
-        self.api_handler.account_mode = self.account_mode
         if normalized != previous_mode:
-            self.steam_auto_reauth_enabled = False
+            # Arm the purchase stop before publishing the new mode or awaiting any
+            # browser cleanup. Otherwise an old-mode request can finish in that gap
+            # and be interpreted by the new mode's recovery branch.
             await self.reset_authentication_context("Login method changed")
+            self.account_mode = save_account_mode(normalized) if self.persist_ui_settings else normalized
+            self.api_handler.account_mode = self.account_mode
+            if self.uses_steam_browser_session():
+                await self.stop_pa_browser_worker_best_effort(
+                    "Login method changed, but Pearl Abyss Chrome worker cleanup did not finish"
+                )
+            if not self.uses_steam_browser_session() and self.pa_browser_keep_open:
+                await self.ensure_pa_browser_worker_started(cleanup_browser_cache=True)
             return True
+        self.account_mode = save_account_mode(normalized) if self.persist_ui_settings else normalized
+        self.api_handler.account_mode = self.account_mode
         return False
 
     async def reset_authentication_context(self, reason):
-        await self.stop_login_status_checker()
+        # Invalidate every saved-session check or browser refresh that started in
+        # the previous context before this coroutine reaches its first await.
+        self._auth_context_generation += 1
         self.steam_auto_reauth_enabled = False
         self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
 
-        if self.purchase_in_progress:
+        purchase_was_in_progress = self.purchase_in_progress
+        if purchase_was_in_progress:
             self.pending_auth_reset_reason = reason
             self.checker_stop_requested = True
+            self._checker_purchase_stop_event.set()
+            if self._purchase_owner_task is self.single_item_test_checker_task:
+                self._single_item_test_purchase_stop_event.set()
             self.add_event(
-                f"{reason}. Current purchase chain will finish, then the monitor will stop and the marketplace session will be cleared.",
+                f"{reason}. The in-flight purchase request will finish and be recorded, remaining attempts "
+                "will be skipped, then the monitor will stop and the marketplace session will be cleared.",
                 "warning",
             )
-            return False
+
+        # The stop state above is synchronous. Cleanup is allowed to await only
+        # after an in-flight purchase can already observe STOP.
+        await self.stop_login_status_checker()
+        if purchase_was_in_progress:
+            # The purchase may have completed (and applied the deferred clear) while
+            # the checker was stopping. Report whether that clear is now complete,
+            # but never perform it a second time here.
+            return self.pending_auth_reset_reason is None
 
         await self.stop_checker()
         await self.stop_single_item_test_checker()
@@ -870,6 +1237,9 @@ class BackgroundTasks:
         return False
 
     def _clear_marketplace_session(self, reason):
+        # A deferred clear may run after another auth task started. Advance again so
+        # that task cannot repopulate the session after this explicit reset.
+        self._auth_context_generation += 1
         self.pending_auth_reset_reason = None
         self.steam_auto_reauth_enabled = False
         self.buy_mode_resume_pending = False
@@ -916,8 +1286,12 @@ class BackgroundTasks:
             self.checker_enabled = True
             return False
 
+        if self.pa_browser_keep_open and not self.uses_steam_browser_session():
+            await self.ensure_pa_browser_worker_started(cleanup_browser_cache=True)
+
         self._active_detection_episodes = {}
         self.checker_stop_requested = False
+        self._checker_purchase_stop_event = asyncio.Event()
         self.checker_started_at = time.monotonic()
         self.checker_task = asyncio.create_task(self.checker())
         self.checker_task.add_done_callback(self._handle_checker_done)
@@ -946,6 +1320,7 @@ class BackgroundTasks:
 
         self.single_item_test_checker_started_at = time.monotonic()
         self.single_item_test_purchase_enabled = bool(allow_purchase)
+        self._single_item_test_purchase_stop_event = asyncio.Event()
         self.single_item_test_checker_task = asyncio.create_task(self.single_item_test_checker())
         self.single_item_test_checker_task.add_done_callback(self._handle_single_item_test_checker_done)
         self.single_item_test_checker_enabled = True
@@ -991,12 +1366,22 @@ class BackgroundTasks:
             self.single_item_test_checker_task = None
 
     async def stop_checker(self):
-        was_running = bool(self.checker_task and not self.checker_task.done())
+        task = self.checker_task
+        was_running = bool(task and not task.done())
         self.checker_stop_requested = True
-        if self.checker_task and not self.checker_task.done():
-            self.checker_task.cancel()
+        self._checker_purchase_stop_event.set()
+        if task and not task.done():
+            purchase_owned_by_checker = self.purchase_in_progress and self._purchase_owner_task is task
+            if purchase_owned_by_checker:
+                self.add_event(
+                    "Monitor stop requested. Waiting for the in-flight purchase request to finish safely.",
+                    "warning",
+                    notable=True,
+                )
+            else:
+                task.cancel()
             try:
-                await self.checker_task
+                await task
             except asyncio.CancelledError:
                 pass
 
@@ -1011,11 +1396,15 @@ class BackgroundTasks:
         return was_running
 
     async def stop_single_item_test_checker(self):
-        was_running = bool(self.single_item_test_checker_task and not self.single_item_test_checker_task.done())
-        if self.single_item_test_checker_task and not self.single_item_test_checker_task.done():
-            self.single_item_test_checker_task.cancel()
+        task = self.single_item_test_checker_task
+        was_running = bool(task and not task.done())
+        self._single_item_test_purchase_stop_event.set()
+        if task and not task.done():
+            purchase_owned_by_checker = self.purchase_in_progress and self._purchase_owner_task is task
+            if not purchase_owned_by_checker:
+                task.cancel()
             try:
-                await self.single_item_test_checker_task
+                await task
             except asyncio.CancelledError:
                 pass
 
@@ -1069,7 +1458,7 @@ class BackgroundTasks:
 
         item_name = SINGLE_ITEM_TEST_TARGET["name"]
         try:
-            while True:
+            while not self._single_item_test_purchase_stop_event.is_set():
                 try:
                     buy_list = await check_single_item_stock(self.api_handler, SINGLE_ITEM_TEST_TARGET)
                     await self.process_detected_outfits(
@@ -1082,6 +1471,9 @@ class BackgroundTasks:
                 except Exception as exc:
                     self.single_item_test_cycle_errors += 1
                     self.add_event(f"{item_name} test scan failed: {exc}", "error")
+
+                if self._single_item_test_purchase_stop_event.is_set():
+                    break
 
                 sleep_duration = self.next_single_item_test_sleep_duration()
                 await asyncio.sleep(sleep_duration)
@@ -1273,7 +1665,18 @@ class BackgroundTasks:
         if not self.test_mode_enabled:
             return False
 
+        self._debug_invalidate_marketplace_state()
+        self.add_event(
+            "Test: app marketplace session cleared; the next recovery will also clear the browser "
+            "marketplace session before re-authentication.",
+            "warning",
+        )
+        return True
+
+    def _debug_invalidate_marketplace_state(self):
+        """Invalidate app-owned market state without changing browser-profile preparation."""
         was_logged_in = bool(getattr(self.api_handler, "login_status", False))
+        self._auth_context_generation += 1
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = True
         if hasattr(self.api_handler, "clear_session"):
@@ -1283,8 +1686,52 @@ class BackgroundTasks:
         self._set_saved_session_last_known_valid(False)
         if self.uses_steam_browser_session() and was_logged_in:
             self.steam_auto_reauth_enabled = True
-        self.add_event("Test: marketplace session cleared; next session check will run re-authentication.", "warning")
-        return True
+
+    async def debug_expire_pa_login_session(self):
+        """Prepare a genuine PA credential-login test in the retained browser worker."""
+        if not self.test_mode_enabled:
+            return False
+        if self.uses_steam_browser_session():
+            self.add_event("Expire PA Login is only available in Pearl Abyss Account mode.", "warning")
+            return False
+        if not self.pa_browser_keep_open or not self.pa_browser_worker_running:
+            self.add_event(
+                "Expire PA Login requires the Keep Open Chrome worker to be running.",
+                "warning",
+                notable=True,
+            )
+            return False
+
+        auth_context = self._auth_context_snapshot()
+        async with self.browser_auth_lock:
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return False
+            worker = self._pa_browser_worker
+            if worker is None or not worker.running:
+                self.add_event(
+                    "Expire PA Login could not run because the Keep Open Chrome worker is closed.",
+                    "warning",
+                    notable=True,
+                )
+                return False
+            try:
+                cleared_count = await worker.clear_pa_login_session_cookies()
+            except BrowserAuthError as exc:
+                self.add_event(f"Expire PA Login failed: {exc}", "error", notable=True)
+                return False
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return False
+
+            self._debug_invalidate_marketplace_state()
+            self.invalidate_browser_storage_summary()
+            self.add_event(
+                "Test: app marketplace session plus browser marketplace and Pearl Abyss login "
+                f"cookies cleared ({highlight(cleared_count)} cookies); consent and saved "
+                "credentials were preserved. Run Session Check to test automatic credential login.",
+                "warning",
+                notable=True,
+            )
+            return True
 
     def debug_toggle_steam_auto_reauth(self):
         if not self.test_mode_enabled or not self.uses_steam_browser_session():
@@ -1298,7 +1745,10 @@ class BackgroundTasks:
             return False
 
         self.add_event("Simulated purchase response: login session expired.", "warning")
-        recovered = await self._recover_purchase_session_for_retry(force_browser_refresh=True)
+        recovered = await self._recover_purchase_session_for_retry(
+            force_browser_refresh=True,
+            clear_browser_market_session=True,
+        )
         if recovered:
             self.debug_force_purchase_session_expired = False
         return recovered
@@ -1369,6 +1819,50 @@ class BackgroundTasks:
         )
         return True
 
+    async def _clear_pa_browser_profile_cookies_in_auth_scope(self):
+        """Clear the PA profile while ``browser_auth_lock`` is already held."""
+        if self.pa_browser_worker_owns_profile:
+            worker_was_running = self.pa_browser_worker_running
+            cleared_count = await self._pa_browser_worker.clear_cookies()
+            if not worker_was_running:
+                # This is maintenance inside an existing auth scope, not a new user/lifecycle
+                # stop request, so close the owned worker without advancing its generation.
+                await self._close_pa_browser_worker()
+            return cleared_count
+
+        if self._pa_browser_worker is not None:
+            await self._close_pa_browser_worker()
+        return await clear_steam_browser_profile_cookies(profile_path=PA_MARKET_PROFILE_PATH)
+
+    async def clear_pa_browser_identity_cookies(self):
+        """Clear cookies that could silently reopen a previously saved PA account."""
+        # Persist the unprepared state before waiting for an in-flight auth cycle.
+        # If clearing fails or the app exits, the next PA refresh must try again
+        # instead of trusting cookies from the former account.
+        self._set_pa_browser_profile_prepared(False)
+        async with self.browser_auth_lock:
+            try:
+                cleared_count = await self._clear_pa_browser_profile_cookies_in_auth_scope()
+            except BrowserAuthError as exc:
+                if self._pa_browser_worker is not None:
+                    try:
+                        await self._close_pa_browser_worker()
+                    except BrowserAuthError as close_exc:
+                        self.add_event(
+                            f"Pearl Abyss Chrome worker profile could not be released: {close_exc}",
+                            "error",
+                        )
+                self.add_event(f"Pearl Abyss browser cookie clear failed: {exc}", "error")
+                return False
+
+            self.invalidate_browser_storage_summary()
+            self.add_event(
+                "Browser cookies cleared from the app-owned Pearl Abyss Account profile "
+                f"({highlight(cleared_count)} cookies).",
+                "warning",
+            )
+            return True
+
     async def clear_browser_session_cookies(self):
         """Clear cookies from the app-owned browser profile for the active login method.
 
@@ -1376,27 +1870,30 @@ class BackgroundTasks:
         login. Clears the Steam profile in Steam mode (and resets Steam setup
         state) or the Pearl Abyss profile in PA mode.
         """
-        steam_mode = self.uses_steam_browser_session()
-        profile_path = STEAM_MARKET_PROFILE_PATH if steam_mode else PA_MARKET_PROFILE_PATH
-        try:
-            cleared_count = await clear_steam_browser_profile_cookies(profile_path=profile_path)
-        except BrowserAuthError as exc:
-            self.add_event(f"Browser cookie clear failed: {exc}", "error")
-            return False
+        # Resolve the target at invocation time. A concurrent mode change must not
+        # redirect an already-requested maintenance action to the other profile.
+        if not self.uses_steam_browser_session():
+            return await self.clear_pa_browser_identity_cookies()
 
-        if steam_mode:
+        async with self.browser_auth_lock:
+            try:
+                cleared_count = await clear_steam_browser_profile_cookies(
+                    profile_path=STEAM_MARKET_PROFILE_PATH
+                )
+            except BrowserAuthError as exc:
+                self.add_event(f"Browser cookie clear failed: {exc}", "error")
+                return False
+
             self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
             self._set_steam_pa_cookie_consent_prepared(False)
             self.steam_auto_reauth_enabled = False
-        else:
-            self._set_pa_browser_profile_prepared(False)
-        self.invalidate_browser_storage_summary()
-        self.add_event(
-            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile "
-            f"({highlight(cleared_count)} cookies).",
-            "warning",
-        )
-        return True
+            self.invalidate_browser_storage_summary()
+            self.add_event(
+                "Browser cookies cleared from the app-owned Steam Account profile "
+                f"({highlight(cleared_count)} cookies).",
+                "warning",
+            )
+            return True
 
     async def debug_clear_steam_browser_cookies(self):
         if not self.test_mode_enabled:
@@ -1416,6 +1913,18 @@ class BackgroundTasks:
         return True
 
     async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False, cleanup_browser_cache=True):
+        async with self.browser_auth_lock:
+            return await self._prepare_steam_browser_profile_in_auth_scope(
+                allow_inactive_mode=allow_inactive_mode,
+                cleanup_browser_cache=cleanup_browser_cache,
+            )
+
+    async def _prepare_steam_browser_profile_in_auth_scope(
+        self,
+        *,
+        allow_inactive_mode=False,
+        cleanup_browser_cache=True,
+    ):
         if not self.uses_steam_browser_session() and not allow_inactive_mode:
             self.add_event("Switch to Steam Account before running initial Steam setup.", "warning")
             return False
@@ -1442,23 +1951,57 @@ class BackgroundTasks:
         )
         return True
 
-    async def _recover_purchase_session_for_retry(self, *, force_browser_refresh=False):
+    async def _recover_purchase_session_for_retry(
+        self,
+        *,
+        force_browser_refresh=False,
+        retry_purchase=True,
+        clear_browser_market_session=False,
+    ):
+        auth_context = self._auth_context_snapshot()
         self.add_event("Login session expired. Attempting to re-authenticate.", "warning", notable=True)
 
-        if self.uses_steam_browser_session():
-            refreshed = await self.refresh_browser_session(force_refresh=force_browser_refresh)
+        if auth_context[1] == STEAM_BROWSER_MODE:
+            refreshed = await self.refresh_browser_session(
+                force_refresh=force_browser_refresh,
+                **(
+                    {"clear_market_session_before_auth": True}
+                    if clear_browser_market_session
+                    else {}
+                ),
+            )
+            if not self._auth_context_is_current(auth_context):
+                return False
             if refreshed:
-                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
+                success_message = "Re-authentication succeeded. Retrying purchase request."
+                if not retry_purchase:
+                    success_message = (
+                        "Re-authentication succeeded. The partial purchase batch will not be replayed."
+                    )
+                self.add_event(success_message, "success", notable=True)
                 return True
 
             # Pause and arm auto-resume (PA path does the same just below): otherwise buy mode stays
             # on against a dead session and the monitor keeps firing failed buys until the periodic
             # checker eventually pauses it.
             self.pause_buy_mode_for_session_refresh("Re-authentication failed.")
-            self.add_event("Re-authentication failed. Purchase retry skipped.", "error")
+            failure_message = "Re-authentication failed. Purchase retry skipped."
+            if not retry_purchase:
+                failure_message = "Re-authentication failed after the partial purchase batch."
+            self.add_event(failure_message, "error")
             return False
 
-        if await self.refresh_pa_browser_session(force_refresh=force_browser_refresh):
+        refreshed = await self.refresh_pa_browser_session(
+            force_refresh=force_browser_refresh,
+            **(
+                {"clear_market_session_before_auth": True}
+                if clear_browser_market_session
+                else {}
+            ),
+        )
+        if not self._auth_context_is_current(auth_context):
+            return False
+        if refreshed:
             self._set_saved_session_last_known_valid(True)
             self.add_event("Re-authentication succeeded. Retrying purchase request.", "success", notable=True)
             return True
@@ -1521,18 +2064,66 @@ class BackgroundTasks:
         self.purchase_progress_count = max(self.purchase_progress_count, self.session_successful_purchases)
         self.purchase_progress_silver = max(self.purchase_progress_silver, self.session_silver_spent)
 
-    async def buy_item(self, buy_list, adjust_pricing=True):
-        self._sync_purchase_progress_to_committed()
-        self.purchase_in_progress = True
-        if adjust_pricing:
-            updated_buy_list = await self.adjust_prices(buy_list)
+    def _purchase_stop_event_for_task(self, task):
+        if task is self.checker_task:
+            return self._checker_purchase_stop_event
+        if task is self.single_item_test_checker_task:
+            return self._single_item_test_purchase_stop_event
+        return None
+
+    async def _submit_purchase_batch(self, buy_list, stop_event):
+        kwargs = {
+            "purchase_delay_bounds": self.purchase_delay_bounds,
+            "on_purchase": self._note_purchase_progress,
+        }
+        if stop_event is not None:
+            kwargs["stop_event"] = stop_event
+        return await self.api_handler.buy_item(buy_list, **kwargs)
+
+    async def _record_stopped_purchase_summary(self, summary, *, current_auth_result):
+        await self.record_purchase_summary(summary)
+        # An auth failure from the request that just completed is still meaningful
+        # even though STOP forbids browser recovery or another buy. Do not apply this
+        # to the stale pre-refresh summary when STOP arrives during a successful refresh.
+        # APIHandler summaries always expose the terminal auth state explicitly.
+        # Prefer that field so an earlier 2000 followed by a successful internal
+        # re-auth is not mistaken for an invalid final session when STOP arrives.
+        if "auth_failed" in summary:
+            terminal_auth_failure = summary.get("auth_failed") is True
         else:
-            updated_buy_list = self._normalize_buy_list(buy_list)
+            terminal_auth_failure = (
+                self._purchase_summary_has_auth_failure(summary)
+                or self._purchase_summary_ends_with_expired_session(summary)
+            )
+        if current_auth_result and terminal_auth_failure:
+            self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
+            self.pause_buy_mode_for_session_refresh(
+                "The stopped purchase response reported an invalid session."
+            )
+
+    async def buy_item(self, buy_list, adjust_pricing=True):
+        purchase_task = asyncio.current_task()
+        purchase_auth_context = self._auth_context_snapshot()
+        purchase_stop_event = self._purchase_stop_event_for_task(purchase_task)
+        self._sync_purchase_progress_to_committed()
+        self._purchase_owner_task = purchase_task
+        self.purchase_in_progress = True
         try:
+            if adjust_pricing:
+                updated_buy_list = await self.adjust_prices(buy_list)
+            else:
+                updated_buy_list = self._normalize_buy_list(buy_list)
+
             capped_buy_list = self._apply_spend_cap(updated_buy_list)
 
             if not capped_buy_list:
                 self.add_event("Purchase skipped: spend cap would be exceeded.", "warning", notable=True)
+                return
+
+            # A mode/session reset may have started while pricing was being
+            # prepared. Never submit the first request under a different context.
+            if not self._auth_context_is_current(purchase_auth_context):
                 return
 
             if self.simulated_session_enabled:
@@ -1543,55 +2134,133 @@ class BackgroundTasks:
                 return
 
             try:
-                summary = await self.api_handler.buy_item(
-                    capped_buy_list,
-                    purchase_delay_bounds=self.purchase_delay_bounds,
-                    on_purchase=self._note_purchase_progress,
-                )
+                summary = await self._submit_purchase_batch(capped_buy_list, purchase_stop_event)
             except MarketplaceAPIError as exc:
+                if not self._auth_context_is_current(purchase_auth_context):
+                    self.add_event(f"Purchase request failed while the authentication context was changing: {exc}", "error")
+                    return
                 if not self.uses_steam_browser_session() and self._requires_browser_verification(exc):
                     self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
                 self.add_event(f"Purchase request failed: {exc}", "error")
                 return
 
-            if not self.uses_steam_browser_session() and not summary.get("purchase_records"):
+            if not self._auth_context_is_current(purchase_auth_context):
+                await self.record_purchase_summary(summary)
+                return
+
+            if purchase_stop_event is not None and purchase_stop_event.is_set():
+                await self._record_stopped_purchase_summary(summary, current_auth_result=True)
+                return
+
+            if (
+                not self.uses_steam_browser_session()
+                and not self._purchase_summary_has_nonreplayable_effect(summary)
+            ):
                 pa_auth_retry_needed = (
                     self._purchase_summary_requires_browser_verification(summary)
                     or self._purchase_summary_has_expired_session(summary)
                     or self._purchase_summary_has_auth_failure(summary)
                 )
                 if pa_auth_retry_needed and await self._recover_purchase_session_for_retry():
+                    if purchase_stop_event is not None and purchase_stop_event.is_set():
+                        await self._record_stopped_purchase_summary(summary, current_auth_result=False)
+                        return
                     try:
-                        summary = await self.api_handler.buy_item(
-                            capped_buy_list,
-                            purchase_delay_bounds=self.purchase_delay_bounds,
-                            on_purchase=self._note_purchase_progress,
-                        )
+                        summary = await self._submit_purchase_batch(capped_buy_list, purchase_stop_event)
                     except MarketplaceAPIError as exc:
+                        if not self._auth_context_is_current(purchase_auth_context):
+                            self.add_event(
+                                f"Purchase retry failed while the authentication context was changing: {exc}",
+                                "error",
+                            )
+                            return
                         if self._requires_browser_verification(exc):
                             self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
                         self.add_event(f"Purchase retry failed: {exc}", "error")
                         return
 
+            if not self._auth_context_is_current(purchase_auth_context):
+                await self.record_purchase_summary(summary)
+                return
+
+            # A login-method change or monitor STOP can arrive while the PA retry request is
+            # in flight. Record that completed response, then leave before current account-mode
+            # state can reinterpret it and launch the other mode's recovery browser.
+            if purchase_stop_event is not None and purchase_stop_event.is_set():
+                await self._record_stopped_purchase_summary(summary, current_auth_result=True)
+                return
+
             if not self.uses_steam_browser_session() and self._purchase_summary_has_auth_failure(summary):
+                self.api_handler.login_status = False
+                self._set_saved_session_last_known_valid(False)
                 self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
 
-            if self.uses_steam_browser_session() and self._purchase_summary_has_expired_session(summary):
+            steam_retry_submitted = False
+            steam_auth_issue = self.uses_steam_browser_session() and (
+                self._purchase_summary_has_expired_session(summary)
+                or self._purchase_summary_has_auth_failure(summary)
+            )
+            if steam_auth_issue:
+                if self._purchase_summary_has_nonreplayable_effect(summary):
+                    await self.record_purchase_summary(summary)
+                    self.add_event(
+                        "Remaining purchase attempts were skipped to avoid replaying a partially successful batch.",
+                        "warning",
+                        notable=True,
+                    )
+                    await self._recover_purchase_session_for_retry(retry_purchase=False)
+                    return
+
                 if await self._recover_purchase_session_for_retry():
+                    if purchase_stop_event is not None and purchase_stop_event.is_set():
+                        await self._record_stopped_purchase_summary(summary, current_auth_result=False)
+                        return
                     try:
-                        summary = await self.api_handler.buy_item(
-                            capped_buy_list,
-                            purchase_delay_bounds=self.purchase_delay_bounds,
-                            on_purchase=self._note_purchase_progress,
-                        )
+                        summary = await self._submit_purchase_batch(capped_buy_list, purchase_stop_event)
                     except MarketplaceAPIError as exc:
+                        if not self._auth_context_is_current(purchase_auth_context):
+                            self.add_event(
+                                f"Purchase retry failed while the authentication context was changing: {exc}",
+                                "error",
+                            )
+                            return
                         self.add_event(f"Purchase retry failed: {exc}", "error")
                         return
+                    steam_retry_submitted = True
+
+            if steam_retry_submitted:
+                if not self._auth_context_is_current(purchase_auth_context):
+                    await self.record_purchase_summary(summary)
+                    return
+                if purchase_stop_event is not None and purchase_stop_event.is_set():
+                    await self._record_stopped_purchase_summary(summary, current_auth_result=True)
+                    return
+
+                retry_auth_issue = (
+                    self._purchase_summary_has_expired_session(summary)
+                    or self._purchase_summary_has_auth_failure(summary)
+                )
+                if retry_auth_issue:
+                    await self.record_purchase_summary(summary)
+                    if summary.get("purchase_records"):
+                        self.add_event(
+                            "Remaining purchase attempts were skipped to avoid replaying a partially successful retry.",
+                            "warning",
+                            notable=True,
+                        )
+                    self.api_handler.login_status = False
+                    self._set_saved_session_last_known_valid(False)
+                    self.pause_buy_mode_for_session_refresh(
+                        "Purchase retry still reported an invalid or expired session."
+                    )
+                    return
 
             await self.record_purchase_summary(summary)
         finally:
-            self.purchase_in_progress = False
-            self._complete_pending_auth_reset_if_ready()
+            if self._purchase_owner_task is purchase_task:
+                self.purchase_in_progress = False
+                self._purchase_owner_task = None
+                self._complete_pending_auth_reset_if_ready()
 
     def _purchase_summary_has_expired_session(self, summary):
         for result in summary.get("results", []):
@@ -1631,6 +2300,24 @@ class BackgroundTasks:
             ):
                 return True
         return False
+
+    def _purchase_summary_ends_with_expired_session(self, summary):
+        for result in reversed(summary.get("results", [])):
+            if isinstance(result, dict) and "result_code" in result:
+                return result.get("result_code") == 2000
+        return False
+
+    def _purchase_summary_has_nonreplayable_effect(self, summary):
+        if summary.get("purchase_records"):
+            return True
+        return any(
+            isinstance(result, dict)
+            and (
+                result.get("outcome") == "preorder"
+                or result.get("reservation_id") not in (None, "", 0, "0")
+            )
+            for result in summary.get("results", [])
+        )
 
     def _normalize_buy_list(self, buy_list):
         return [[str(item_id), str(stock), str(price)] for item_id, stock, price in buy_list]
@@ -1692,37 +2379,58 @@ class BackgroundTasks:
         return apply_price_rules(buy_list)
 
     async def login(self):
+        auth_context = self._auth_context_snapshot()
         session_check_error = None
         try:
             status = await self.api_handler.is_session_expired()
         except MarketplaceAPIError as exc:
+            if not self._auth_context_is_current(auth_context):
+                return
             self.api_handler.login_status = False
             session_check_error = exc
             status = -1
+
+        if not self._auth_context_is_current(auth_context):
+            return
 
         if status == 0:
             self.api_handler.login_status = True
             self._set_saved_session_last_known_valid(True)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
+            elif self.pa_browser_keep_open and not self.pa_browser_worker_running:
+                # Refresh Session is an explicit worker-restart point even when the saved HTTP
+                # session is still valid and no browser authentication is otherwise necessary.
+                await self.ensure_pa_browser_worker_started(
+                    cleanup_browser_cache=True,
+                    auth_context=auth_context,
+                )
+                if self._pa_browser_stop_requests or not self._auth_context_is_current(auth_context):
+                    return
             # Routine check outcome (nothing changed) — stays out of the Activity tail.
             self.add_event("Existing marketplace session is valid.", "success")
             self.start_login_status_checker()
             self.resume_buy_mode_after_refresh()
             return
 
-        if self.uses_steam_browser_session():
-            if not await self.refresh_browser_session(
+        if auth_context[1] == STEAM_BROWSER_MODE:
+            refreshed = await self.refresh_browser_session(
                 session_check_error=session_check_error,
                 cleanup_browser_cache=True,
-            ):
+            )
+            if not self._auth_context_is_current(auth_context):
+                return
+            if not refreshed:
                 self.pause_buy_mode_for_session_refresh("Steam Account refresh failed.")
             return
 
-        if not await self.refresh_pa_browser_session(
+        refreshed = await self.refresh_pa_browser_session(
             session_check_error=session_check_error,
             cleanup_browser_cache=True,
-        ):
+        )
+        if not self._auth_context_is_current(auth_context):
+            return
+        if not refreshed:
             self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
 
     def _requires_browser_verification(self, exc):
@@ -1749,10 +2457,17 @@ class BackgroundTasks:
         auto_pa_login=None,
         force_refresh=False,
         cleanup_browser_cache=False,
+        clear_market_session_before_auth=False,
     ):
+        auth_context = self._auth_context_snapshot()
         async with self.browser_auth_lock:
-            if not force_refresh and await self._saved_session_is_valid():
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return False
+
+            if not force_refresh and await self._saved_session_is_valid(auth_context):
                 return True
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return False
 
             details = []
             if session_check_error:
@@ -1783,24 +2498,40 @@ class BackgroundTasks:
 
             if credential_error:
                 details.append(f"Saved credentials unavailable: {credential_error}.")
-            if auto_submit_credentials:
+            worker_closed_without_restart = False
+            if self.pa_browser_keep_open and self.pa_browser_worker_running:
+                details.append(
+                    "Refreshing session in the Pearl Abyss Chrome worker; keep its window minimized."
+                )
+            elif self.pa_browser_keep_open and cleanup_browser_cache:
+                details.append(
+                    "Restarting the Pearl Abyss Chrome worker for this manual refresh; keep its window minimized."
+                )
+            elif self.pa_browser_keep_open:
+                worker_closed_without_restart = True
+                details.append(
+                    "The Pearl Abyss Chrome worker is closed; automatic refresh will not reopen Chrome."
+                )
+            elif auto_submit_credentials:
                 details.append("Refreshing session — opening the Pearl Abyss browser; saved credentials will be submitted.")
             else:
                 details.append("Refreshing session — opening the Pearl Abyss browser for manual login.")
             # A routine refresh is a notable info line; it only escalates to a warning when
             # it carries an actual failure detail (session check / login / credential error).
-            opening_level = "warning" if len(details) > 1 else "info"
+            opening_level = "warning" if len(details) > 1 or worker_closed_without_restart else "info"
             self.add_event(" ".join(details), opening_level, notable=True)
 
             try:
-                bootstrap_url = None
-                if not self.pa_browser_profile_prepared:
-                    bootstrap_url = BDO_SITE_BOOTSTRAP_URL
+                profile_requires_fresh_setup = not self.pa_browser_profile_prepared
+                bootstrap_url = BDO_SITE_BOOTSTRAP_URL if profile_requires_fresh_setup else None
 
-                if cleanup_browser_cache:
+                if cleanup_browser_cache and not self.pa_browser_keep_open:
                     await self._clean_browser_cache_before_auth(PA_MARKET_PROFILE_PATH, "Pearl Abyss Account")
+                    if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                        return False
 
-                cookies = await acquire_market_cookies(
+                cookies = await self._acquire_pa_market_cookies(
+                    allow_worker_start=cleanup_browser_cache,
                     status_callback=self._browser_auth_status,
                     auto_steam_login=False,
                     auto_pa_login=auto_submit_credentials,
@@ -1808,23 +2539,43 @@ class BackgroundTasks:
                     pa_password=password if auto_submit_credentials else None,
                     profile_path=PA_MARKET_PROFILE_PATH,
                     bootstrap_url=bootstrap_url,
+                    clear_cookies_before_auth=profile_requires_fresh_setup,
                     account_label="Pearl Abyss Account",
                     announce_opening=False,
+                    **(
+                        {"clear_market_session_before_auth": True}
+                        if clear_market_session_before_auth
+                        else {}
+                    ),
                 )
             except BrowserAuthError as exc:
+                if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                    return False
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
                 self.add_event(f"Pearl Abyss Account browser refresh failed: {exc}", "error")
                 return False
 
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                return False
+
             try:
                 session_valid = await self.api_handler.validate_and_save_imported_session(cookies)
             except MarketplaceAPIError as exc:
+                if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                    self._discard_stale_imported_session()
+                    return False
+                await self._update_pa_browser_landing_validation(False)
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
                 self.add_event(f"Pearl Abyss Account browser session validation failed: {exc}", "error")
                 return False
 
+            if not self._auth_context_is_current(auth_context, expected_mode=PA_CREDENTIALS_MODE):
+                self._discard_stale_imported_session()
+                return False
+
+            await self._update_pa_browser_landing_validation(session_valid)
             if session_valid:
                 self.api_handler.login_status = True
                 self._set_pa_browser_profile_prepared(True)
@@ -1849,14 +2600,25 @@ class BackgroundTasks:
         auto_steam_login=None,
         force_refresh=False,
         cleanup_browser_cache=False,
+        clear_market_session_before_auth=False,
     ):
+        auth_context = self._auth_context_snapshot()
         async with self.browser_auth_lock:
-            if not force_refresh and await self._saved_session_is_valid():
+            if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                return False
+
+            if not force_refresh and await self._saved_session_is_valid(auth_context):
                 return True
+            if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                return False
 
             if self.steam_browser_profile_needs_setup():
                 self.add_event("Initial Steam browser setup is required before the market login refresh.", "warning")
-                prepared = await self.prepare_steam_browser_profile(cleanup_browser_cache=cleanup_browser_cache)
+                prepared = await self._prepare_steam_browser_profile_in_auth_scope(
+                    cleanup_browser_cache=cleanup_browser_cache
+                )
+                if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                    return False
                 if not prepared:
                     self.api_handler.login_status = False
                     self._set_saved_session_last_known_valid(False)
@@ -1876,13 +2638,22 @@ class BackgroundTasks:
                 handle_pa_cookie_consent = bool(auto_steam_login and not self.steam_pa_cookie_consent_prepared)
                 if cleanup_browser_cache:
                     await self._clean_browser_cache_before_auth(STEAM_MARKET_PROFILE_PATH, "Steam Account")
+                    if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                        return False
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,
                     auto_steam_login=auto_steam_login,
                     handle_pa_cookie_consent=handle_pa_cookie_consent,
                     pa_cookie_consent_callback=self._set_steam_pa_cookie_consent_prepared,
+                    **(
+                        {"clear_market_session_before_auth": True}
+                        if clear_market_session_before_auth
+                        else {}
+                    ),
                 )
             except BrowserAuthError as exc:
+                if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                    return False
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
                 # Deliberately do NOT touch steam_pa_cookie_consent_prepared here. Cookie consent is
@@ -1894,12 +2665,22 @@ class BackgroundTasks:
                 self.add_event(f"Steam Account refresh failed: {exc}", "error")
                 return False
 
+            if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                return False
+
             try:
                 session_valid = await self.api_handler.validate_and_save_imported_session(cookies)
             except MarketplaceAPIError as exc:
+                if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                    self._discard_stale_imported_session()
+                    return False
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
                 self.add_event(f"Steam Account session validation failed: {exc}", "error")
+                return False
+
+            if not self._auth_context_is_current(auth_context, expected_mode=STEAM_BROWSER_MODE):
+                self._discard_stale_imported_session()
                 return False
 
             if session_valid:
@@ -1919,9 +2700,12 @@ class BackgroundTasks:
             return False
 
     def _browser_auth_status(self, message, level="info"):
-        self.add_event(message, level)
+        # Browser warnings are actionable (verification, rejected credentials, or manual input),
+        # so keep them visible in the dashboard Activity tail as well as the full Logs stream.
+        self.add_event(message, level, notable=level in {"warning", "error"})
 
     async def initial_login_check(self):
+        auth_context = self._auth_context_snapshot()
         if not self.saved_session_last_known_valid:
             self.api_handler.login_status = False
             # A fresh start with no saved session is the normal logged-out state, not a
@@ -1948,8 +2732,13 @@ class BackgroundTasks:
         try:
             status = await self.api_handler.is_session_expired()
         except MarketplaceAPIError as exc:
+            if not self._auth_context_is_current(auth_context):
+                return
             self.api_handler.login_status = False
             self.add_event(f"Saved marketplace session check failed: {exc}", "warning")
+            return
+
+        if not self._auth_context_is_current(auth_context):
             return
 
         if status == 0:
@@ -1997,11 +2786,17 @@ class BackgroundTasks:
         check error) and False to stop it (session expired and re-authentication failed). The "Run
         Session Check" test control calls this same method so the test path is the production path.
         """
+        auth_context = self._auth_context_snapshot()
         try:
             status = await self._check_session_expired()
         except MarketplaceAPIError as exc:
+            if not self._auth_context_is_current(auth_context):
+                return False
             self.add_event(f"Session check failed: {exc}", "error")
             return True
+
+        if not self._auth_context_is_current(auth_context):
+            return False
 
         if status == -1:
             return await self.handle_expired_session()
@@ -2011,11 +2806,25 @@ class BackgroundTasks:
         return True
 
     async def handle_expired_session(self):
+        auth_context = self._auth_context_snapshot()
         self.api_handler.login_status = False
-        if self.uses_steam_browser_session():
+        clear_browser_market_session = bool(
+            self.test_mode_enabled and self.debug_force_purchase_session_expired
+        )
+        if auth_context[1] == STEAM_BROWSER_MODE:
             if self.steam_auto_reauth_available():
                 self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
-                if await self.refresh_browser_session(auto_steam_login=True):
+                refreshed = await self.refresh_browser_session(
+                    auto_steam_login=True,
+                    **(
+                        {"clear_market_session_before_auth": True}
+                        if clear_browser_market_session
+                        else {}
+                    ),
+                )
+                if not self._auth_context_is_current(auth_context):
+                    return False
+                if refreshed:
                     self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
                     return True
 
@@ -2030,7 +2839,16 @@ class BackgroundTasks:
             return False
 
         self.add_event("Session expired. Attempting Pearl Abyss Account browser re-authentication.", "warning")
-        if await self.refresh_pa_browser_session():
+        refreshed = await self.refresh_pa_browser_session(
+            **(
+                {"clear_market_session_before_auth": True}
+                if clear_browser_market_session
+                else {}
+            ),
+        )
+        if not self._auth_context_is_current(auth_context):
+            return False
+        if refreshed:
             self.add_event("Session expired. Re-authentication successful.", "success", notable=True)
             return True
 

@@ -33,14 +33,19 @@ async def run_app(test_mode=False):
     task_manager = BackgroundTasks(API, test_mode_enabled=test_mode)
     launch_mode = "test" if test_mode else "live"
 
-    if test_mode:
-        API.login_status = False
-        task_manager.add_event("Test mode active: startup session check skipped.", "warning")
-    else:
-        await task_manager.initial_login_check()
+    try:
+        if test_mode:
+            API.login_status = False
+            task_manager.add_event("Test mode active: startup session check skipped.", "warning")
+        else:
+            await task_manager.initial_login_check()
 
-    app = MarketplaceToolsApp(task_manager, API, launch_mode=launch_mode)
-    await app.run_async()
+        app = MarketplaceToolsApp(task_manager, API, launch_mode=launch_mode)
+        await app.run_async()
+    finally:
+        await task_manager.stop_pa_browser_worker_best_effort(
+            "App shutdown could not finish Pearl Abyss Chrome worker cleanup"
+        )
 
 
 async def main(argv=None):

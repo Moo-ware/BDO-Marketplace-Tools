@@ -63,9 +63,10 @@ class BrowserProfileCleanupResult:
 
 def measure_browser_profile_storage(profile_path):
     profile_path = Path(profile_path)
+    total_bytes, disposable_bytes = _profile_storage_sizes(profile_path)
     return BrowserProfileStorageSummary(
-        total_bytes=_path_size(profile_path),
-        disposable_bytes=_disposable_path_size(profile_path),
+        total_bytes=total_bytes,
+        disposable_bytes=disposable_bytes,
         scanned_at=time.time(),
     )
 
@@ -158,6 +159,41 @@ def _disposable_path_size(profile_path):
         target = Path(profile_path) / Path(relative_path)
         total += _path_size(target)
     return total
+
+
+def _profile_storage_sizes(profile_path):
+    profile_path = Path(profile_path)
+    if not profile_path.exists():
+        return 0, 0
+    if profile_path.is_file():
+        try:
+            size = profile_path.stat().st_size
+        except OSError:
+            size = 0
+        return size, 0
+
+    disposable_paths = tuple(Path(relative_path) for relative_path in DISPOSABLE_BROWSER_PROFILE_PATHS)
+    total_bytes = 0
+    disposable_bytes = 0
+    try:
+        iterator = profile_path.rglob("*")
+        for child in iterator:
+            if not child.is_file():
+                continue
+            try:
+                size = child.stat().st_size
+                relative_path = child.relative_to(profile_path)
+            except (OSError, ValueError):
+                continue
+            total_bytes += size
+            if any(
+                relative_path == disposable_path or disposable_path in relative_path.parents
+                for disposable_path in disposable_paths
+            ):
+                disposable_bytes += size
+    except OSError:
+        pass
+    return total_bytes, disposable_bytes
 
 
 def _path_size(path):

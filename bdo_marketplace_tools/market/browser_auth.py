@@ -103,6 +103,9 @@ STEAM_LOGIN_COOKIE_NAMES = _browser_cookies.STEAM_LOGIN_COOKIE_NAMES
 STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES = _browser_cookies.STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES
 _is_steam_auth_cookie = _browser_cookies._is_steam_auth_cookie
 _has_steam_login_cookie = _browser_cookies._has_steam_login_cookie
+_is_pa_account_cookie = _browser_cookies._is_pa_account_cookie
+_is_cookie_consent_cookie = _browser_cookies._is_cookie_consent_cookie
+pa_login_session_cookie_targets = _browser_cookies.pa_login_session_cookie_targets
 filter_market_cookies = _browser_cookies.filter_market_cookies
 _domain_applies_to_market = _browser_cookies._domain_applies_to_market
 _has_market_session_cookie = _browser_cookies._has_market_session_cookie
@@ -119,6 +122,9 @@ AUTH_DIALOG_VERIFICATION_MARKERS = _browser_dialogs.AUTH_DIALOG_VERIFICATION_MAR
 AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS = _browser_dialogs.AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS
 _maybe_await = _browser_dialogs._maybe_await
 _new_auth_dialog_state = _browser_dialogs._new_auth_dialog_state
+_reset_auth_dialog_state = _browser_dialogs._reset_auth_dialog_state
+_prune_auth_dialog_pages = _browser_dialogs._prune_auth_dialog_pages
+_drain_auth_dialog_tasks = _browser_dialogs._drain_auth_dialog_tasks
 _sanitize_dialog_message = _browser_dialogs._sanitize_dialog_message
 _classify_auth_dialog_message = _browser_dialogs._classify_auth_dialog_message
 _auth_dialog_status_message = _browser_dialogs._auth_dialog_status_message
@@ -182,6 +188,8 @@ async def acquire_market_cookies(
     pa_password=None,
     handle_pa_cookie_consent=False,
     pa_cookie_consent_callback=None,
+    clear_cookies_before_auth=False,
+    clear_market_session_before_auth=False,
     account_label="Steam Account",
     announce_opening=True,
 ):
@@ -206,32 +214,22 @@ async def acquire_market_cookies(
         async with async_playwright() as playwright:
             context = await _launch_persistent_chrome_context(playwright, profile_path)
             try:
-                page = context.pages[0] if context.pages else await context.new_page()
-                auth_dialog_state = _new_auth_dialog_state()
-                _install_auth_dialog_handlers(context, auth_dialog_state)
-                # Non-blocking notice on every auth pop-up so the user doesn't click into the page
-                # while it loads / the automation drives login. Added before the first navigation so
-                # add_init_script re-shows it on every page; it flips to a "manual action required"
-                # warning (see _set_setup_notice_warning) when PA asks for manual attention or auto-login gives up.
-                await _inject_setup_notice(context)
-                if bootstrap_url:
-                    await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
-                try:
-                    await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
-                except Exception:
-                    await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
-                return await _wait_for_market_cookies(
+                return await _acquire_market_cookies_in_context(
                     context,
                     status_callback,
-                    timeout_seconds,
+                    page=None,
+                    timeout_seconds=timeout_seconds,
+                    start_url=start_url,
+                    bootstrap_url=bootstrap_url,
                     auto_steam_login=auto_steam_login,
                     auto_pa_login=auto_pa_login,
                     pa_email=pa_email,
                     pa_password=pa_password,
                     handle_pa_cookie_consent=handle_pa_cookie_consent,
                     pa_cookie_consent_callback=pa_cookie_consent_callback,
+                    clear_cookies_before_auth=clear_cookies_before_auth,
+                    clear_market_session_before_auth=clear_market_session_before_auth,
                     account_label=account_label,
-                    auth_dialog_state=auth_dialog_state,
                 )
             finally:
                 await _close_browser_context(context, status_callback)
@@ -243,6 +241,90 @@ async def acquire_market_cookies(
     finally:
         if context is not None:
             await _close_browser_context(context, status_callback)
+
+
+async def _acquire_market_cookies_in_context(
+    context,
+    status_callback=None,
+    *,
+    page=None,
+    timeout_seconds=DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS,
+    start_url=AUTH_START_URL,
+    bootstrap_url=None,
+    auto_steam_login=False,
+    auto_pa_login=False,
+    pa_email=None,
+    pa_password=None,
+    handle_pa_cookie_consent=False,
+    pa_cookie_consent_callback=None,
+    clear_cookies_before_auth=False,
+    clear_market_session_before_auth=False,
+    account_label="Steam Account",
+    auth_dialog_state=None,
+    inject_setup_notice=True,
+):
+    """Run one marketplace authentication cycle in a caller-owned browser context.
+
+    The disposable public wrapper and the optional persistent PA worker share this function so
+    authentication behavior cannot drift. Context creation, parking, and shutdown remain the
+    caller's responsibility.
+    """
+    if clear_cookies_before_auth:
+        # Account-identity changes mark the PA profile unprepared. Clear its
+        # cookies in the same context that will authenticate so there is no
+        # second Chrome launch and no stale baseline session to accept.
+        await context.clear_cookies()
+    elif clear_market_session_before_auth:
+        # Test/recovery callers can invalidate only the marketplace web session while retaining
+        # the PA or Steam account login and consent state. The next market navigation must then
+        # traverse the session-issuance redirect instead of accepting the warm market cookie.
+        for cookie_name in sorted(MARKET_SESSION_COOKIE_NAMES):
+            await context.clear_cookies(name=cookie_name)
+        await _emit_status(
+            status_callback,
+            "Browser marketplace session cleared; account-login cookies were preserved for re-authentication.",
+            "info",
+        )
+
+    page = page if page is not None and not _page_is_closed(page) else None
+    if page is None:
+        pages = [candidate for candidate in getattr(context, "pages", []) or [] if not _page_is_closed(candidate)]
+        page = pages[0] if pages else await context.new_page()
+
+    if auth_dialog_state is None:
+        auth_dialog_state = _new_auth_dialog_state()
+    else:
+        _reset_auth_dialog_state(auth_dialog_state)
+    _install_auth_dialog_handlers(context, auth_dialog_state)
+
+    try:
+        # add_init_script persists for the lifetime of a context. Disposable callers install it
+        # for their one cycle; a retained worker installs it once when the context is created.
+        if inject_setup_notice:
+            await _inject_setup_notice(context)
+
+        if bootstrap_url:
+            await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
+        try:
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
+
+        return await _wait_for_market_cookies(
+            context,
+            status_callback,
+            timeout_seconds,
+            auto_steam_login=auto_steam_login,
+            auto_pa_login=auto_pa_login,
+            pa_email=pa_email,
+            pa_password=pa_password,
+            handle_pa_cookie_consent=handle_pa_cookie_consent,
+            pa_cookie_consent_callback=pa_cookie_consent_callback,
+            account_label=account_label,
+            auth_dialog_state=auth_dialog_state,
+        )
+    finally:
+        await _drain_auth_dialog_tasks(auth_dialog_state)
 
 
 async def prepare_steam_browser_profile(
@@ -378,6 +460,31 @@ async def clear_market_cookies_keep_steam_login(
                 pass
 
 
+async def _clear_pa_login_session_cookies_in_context(context):
+    """Clear PA account-login and marketplace-session cookies in an owned context.
+
+    Cookie-consent records and unrelated profile state are deliberately retained. Each cookie is
+    removed by its exact identity so a shared parent domain does not require wiping and restoring
+    consent or other unrelated cookies. Returns only a count; cookie values never leave the browser
+    helper.
+    """
+    all_cookies = await context.cookies()
+    targets = pa_login_session_cookie_targets(all_cookies)
+    cleared_identities = set()
+    for cookie in targets:
+        name = cookie.get("name")
+        domain = cookie.get("domain")
+        path = cookie.get("path") or "/"
+        if not name or not domain:
+            continue
+        identity = (name, domain, path)
+        if identity in cleared_identities:
+            continue
+        await context.clear_cookies(name=name, domain=domain, path=path)
+        cleared_identities.add(identity)
+    return len(cleared_identities)
+
+
 async def _wait_for_market_cookies(
     context,
     status_callback,
@@ -421,6 +528,7 @@ async def _wait_for_market_cookies(
     # but the app's authenticated calls do not require it.)
     captured_at_callback = []
     callback_done = asyncio.Event()
+    callback_read_tasks = set()
     async def _read_market_cookies_after_callback():
         try:
             cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
@@ -437,12 +545,19 @@ async def _wait_for_market_cookies(
     def _on_response(response):
         _state, is_callback = _classify_url(getattr(response, "url", ""))
         if is_callback:
-            asyncio.ensure_future(_read_market_cookies_after_callback())
+            task = asyncio.ensure_future(_read_market_cookies_after_callback())
+            callback_read_tasks.add(task)
+            task.add_done_callback(callback_read_tasks.discard)
 
     context_on = getattr(context, "on", None)
+    attached_listeners = []
     if callable(context_on):
-        context_on("request", _on_request)
-        context_on("response", _on_response)
+        for event_name, listener in (("request", _on_request), ("response", _on_response)):
+            try:
+                context_on(event_name, listener)
+            except Exception:
+                continue
+            attached_listeners.append((event_name, listener))
 
     async def _poll_loop():
         nonlocal callback_seen, auth_flow_seen, pa_credentials_auto_stopped
@@ -552,31 +667,51 @@ async def _wait_for_market_cookies(
     # lands first. The callback capture can complete while the poll loop is parked in a slow,
     # navigation-blocked context.cookies() read, so it is watched independently here rather than
     # from inside the loop.
-    poll_task = asyncio.ensure_future(_poll_loop())
-    callback_task = asyncio.ensure_future(callback_done.wait())
-    await asyncio.wait({poll_task, callback_task}, return_when=asyncio.FIRST_COMPLETED)
-
-    if captured_at_callback:
-        poll_task.cancel()
-        callback_task.cancel()
-        for task in (poll_task, callback_task):
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        await _emit_status(
-            status_callback,
-            "Session cookies captured; validating.",
-            "info",
-        )
-        return captured_at_callback[0]
-
-    callback_task.cancel()
+    poll_task = None
+    callback_task = None
     try:
-        await callback_task
-    except (asyncio.CancelledError, Exception):
+        poll_task = asyncio.ensure_future(_poll_loop())
+        callback_task = asyncio.ensure_future(callback_done.wait())
+        await asyncio.wait({poll_task, callback_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if captured_at_callback:
+            await _emit_status(
+                status_callback,
+                "Session cookies captured; validating.",
+                "info",
+            )
+            return captured_at_callback[0]
+
+        return poll_task.result()
+    finally:
+        tasks = [
+            task
+            for task in (
+                poll_task,
+                callback_task,
+                *tuple(callback_read_tasks),
+            )
+            if task is not None
+        ]
+        # Detach first so no new callback-cookie task can be scheduled while the current task
+        # snapshot is being canceled and awaited.
+        for event_name, listener in attached_listeners:
+            _remove_event_listener(context, event_name, listener)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _remove_event_listener(emitter, event_name, listener):
+    remove_listener = getattr(emitter, "remove_listener", None)
+    if not callable(remove_listener):
+        return
+    try:
+        remove_listener(event_name, listener)
+    except Exception:
         pass
-    return poll_task.result()
 
 
 async def _close_browser_context(context, status_callback=None):
@@ -592,6 +727,8 @@ async def _close_browser_context(context, status_callback=None):
             "Browser cookies were captured, but Chrome did not close cleanly. Close it manually if it remains open.",
             "warning",
         )
+        return False
+    return True
 
 
 async def _close_page_quickly(page):
@@ -929,6 +1066,9 @@ async def _maybe_run_pa_credentials_login_target(
     now,
     missing_notice_seconds,
 ):
+    if not _scope_is_pa_credentials_login_target(scope):
+        return PA_AUTO_LOGIN_SKIPPED
+
     key = PA_CREDENTIALS_LOGIN_KEY
     if dialog_state is not None and await _maybe_emit_auth_dialog_manual_attention(dialog_state, status_callback):
         return PA_AUTO_LOGIN_MANUAL_NEEDED
@@ -967,10 +1107,14 @@ async def _maybe_run_pa_credentials_login_target(
             )
 
     credentials_filled = await _fill_pa_credentials(scope, email, password)
-    if credentials_filled and await _click_first_available_selector(
-        scope,
-        PA_LOGIN_BUTTON_SELECTORS,
-        timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
+    if (
+        credentials_filled
+        and _scope_is_pa_credentials_login_target(scope)
+        and await _click_first_available_pa_selector(
+            scope,
+            PA_LOGIN_BUTTON_SELECTORS,
+            timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
+        )
     ):
         tracking["attempts"][key] = tracking["attempts"].get(key, 0) + 1
         # Count a technical retry only once a resubmit actually goes out, so a failed retry-fill
@@ -999,20 +1143,78 @@ async def _maybe_run_pa_credentials_login_target(
 
 
 async def _fill_pa_credentials(scope, email, password):
-    email_filled = await _fill_first_available_selector(
+    if not _scope_is_pa_credentials_login_target(scope):
+        return False
+    email_filled = await _fill_first_available_pa_selector(
         scope,
         PA_EMAIL_SELECTORS,
         str(email),
         timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
     )
-    if not email_filled:
+    if not email_filled or not _scope_is_pa_credentials_login_target(scope):
         return False
-    return await _fill_first_available_selector(
+    return await _fill_first_available_pa_selector(
         scope,
         PA_PASSWORD_SELECTORS,
         str(password),
         timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
     )
+
+
+async def _bound_pa_element(scope, selector, timeout):
+    if not _scope_is_pa_credentials_login_target(scope):
+        return None
+    try:
+        element = await scope.locator(selector).first.element_handle(timeout=timeout)
+    except Exception:
+        return None
+    if not _scope_is_pa_credentials_login_target(scope):
+        return None
+    return element
+
+
+async def _fill_first_available_pa_selector(scope, selectors, value, timeout):
+    for selector in selectors:
+        element = await _bound_pa_element(scope, selector, timeout)
+        if element is None:
+            if not _scope_is_pa_credentials_login_target(scope):
+                return False
+            continue
+        try:
+            # ElementHandle stays bound to the document in which it was resolved. If
+            # that document navigates after the origin check, this fails as detached
+            # instead of re-resolving the secret-bearing action on the new page.
+            await element.fill(value, timeout=timeout)
+        except Exception:
+            if not _scope_is_pa_credentials_login_target(scope):
+                return False
+            continue
+        return _scope_is_pa_credentials_login_target(scope)
+    return False
+
+
+async def _click_first_available_pa_selector(scope, selectors, timeout):
+    for selector in selectors:
+        element = await _bound_pa_element(scope, selector, timeout)
+        if element is None:
+            if not _scope_is_pa_credentials_login_target(scope):
+                return False
+            continue
+        try:
+            # This polling loop owns navigation detection. Waiting for navigation
+            # inside click() can raise after the browser already dispatched the
+            # submit, which would lose the pending-attempt bookkeeping and allow
+            # an immediate duplicate submit on the returned login page.
+            await element.click(timeout=timeout, no_wait_after=True)
+        except Exception:
+            if not _scope_is_pa_credentials_login_target(scope):
+                return False
+            continue
+        # A successful login click commonly navigates away before click() resolves.
+        # The handle was bound on the verified PA document, so that navigation is
+        # expected and must not erase the submitted/pending attempt bookkeeping.
+        return True
+    return False
 
 
 async def _pa_login_form_visible(scope):
@@ -1040,12 +1242,12 @@ async def _pa_password_field_empty(scope):
     return False
 
 
-def _pa_credentials_login_targets(page, state):
+def _pa_credentials_login_targets(page, _state):
     targets = []
     seen = set()
 
-    def add_target(scope, target_state):
-        if target_state != "pa":
+    def add_target(scope):
+        if not _scope_is_pa_credentials_login_target(scope):
             return
         key = id(scope)
         if key in seen:
@@ -1053,20 +1255,50 @@ def _pa_credentials_login_targets(page, state):
         seen.add(key)
         targets.append(scope)
 
-    add_target(page, _pa_credentials_login_target_state(state))
+    # Reclassify live URLs here instead of trusting the page state captured near
+    # the start of the poll. Consent/browser work can navigate to OTP meanwhile.
+    add_target(page)
     for frame in getattr(page, "frames", []) or []:
-        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
-        add_target(frame, _pa_credentials_login_target_state(frame_state))
+        add_target(frame)
 
     return targets
 
 
 def _pa_credentials_login_target_state(state):
+    # Saved credentials must only be submitted to an origin explicitly classified
+    # as Pearl Abyss. Unknown/loading pages are revisited on the next poll once
+    # their real URL is available.
     if state == "pa":
         return "pa"
-    if state is None:
-        return "pa"
     return None
+
+
+def _scope_is_pa_credentials_login_target(scope):
+    try:
+        url = getattr(scope, "url", "")
+    except Exception:
+        return False
+    if not _is_canonical_pa_credentials_url(url):
+        return False
+    state, _is_callback = _classify_url(url)
+    return _pa_credentials_login_target_state(state) == "pa"
+
+
+def _is_canonical_pa_credentials_url(url):
+    try:
+        parsed = urlparse(str(url or ""))
+    except (TypeError, ValueError):
+        return False
+    authority = parsed.netloc
+    return (
+        authority.isascii()
+        and parsed.scheme.lower() == "https"
+        and authority.lower()
+        in {
+            "account.pearlabyss.com",
+            "account.pearlabyss.com:443",
+        }
+    )
 
 
 def _steam_auto_login_targets(page, state):
@@ -1191,8 +1423,9 @@ def _classify_url(url):
         return "steam", False
 
     if host == "account.pearlabyss.com":
+        normalized_path = lower_path.rstrip("/") or "/"
         for marker in OTP_ROUTE_MARKERS:
-            if lower_path == marker.lower():
+            if normalized_path == (marker.lower().rstrip("/") or "/"):
                 return "otp", False
         return "pa", False
 

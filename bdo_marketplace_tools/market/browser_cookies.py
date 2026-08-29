@@ -25,6 +25,13 @@ STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES = (
     "steamcommunity.com",
     "steam-chat.com",
 )
+PA_ACCOUNT_COOKIE_DOMAIN_SUFFIXES = (
+    "pearlabyss.com",
+)
+COOKIE_CONSENT_NAME_MARKERS = (
+    "consent",
+    "cookiebot",
+)
 
 
 def _is_steam_auth_cookie(cookie):
@@ -37,6 +44,39 @@ def _is_steam_auth_cookie(cookie):
         domain == suffix or domain.endswith("." + suffix)
         for suffix in STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES
     )
+
+
+def _is_pa_account_cookie(cookie):
+    if not isinstance(cookie, dict):
+        return False
+    domain = (cookie.get("domain") or "").lstrip(".").lower()
+    if not domain:
+        return False
+    return any(
+        domain == suffix or domain.endswith("." + suffix)
+        for suffix in PA_ACCOUNT_COOKIE_DOMAIN_SUFFIXES
+    )
+
+
+def _is_cookie_consent_cookie(cookie):
+    if not isinstance(cookie, dict):
+        return False
+    name = str(cookie.get("name") or "").lower()
+    return any(marker in name for marker in COOKIE_CONSENT_NAME_MARKERS)
+
+
+def pa_login_session_cookie_targets(cookies):
+    """Return cookies whose removal forces PA login without removing consent state."""
+    targets = []
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
+            targets.append(cookie)
+            continue
+        if _is_pa_account_cookie(cookie) and not _is_cookie_consent_cookie(cookie):
+            targets.append(cookie)
+    return targets
 
 
 def _has_steam_login_cookie(cookies):

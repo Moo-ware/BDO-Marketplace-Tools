@@ -56,6 +56,10 @@ def _notice_icon_chip(icon_expression, background, *, size="36px", radius="10px"
 
 SETUP_NOTICE_SCRIPT = r"""
 (() => {
+  // The optional persistent PA worker parks on about:blank between auth cycles.
+  // The worker renders its own full-page status landing there; this auth notice
+  // runs again when that page later navigates to a real login or market document.
+  if (window.location.href === 'about:blank') return;
 __NOTICE_IDS__
   const SPIN_ICON = '<span style="box-sizing:border-box;width:18px;height:18px;border-radius:50%;' +
     'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
