@@ -102,13 +102,3 @@ RUNNING_QUIPS = (
 # the mascot's head; the animation reveals them one at a time then resets.
 MASCOT_ZZZ_TRAIL = ((2, 56, "z"), (1, 59, "z"), (0, 62, "Z"))
 
-TEST_LOG_MESSAGES = [
-    ("Synthetic scan completed: no outfits detected.", "info"),
-    ("Synthetic outfit detected in premium category.", "success"),
-    ("Synthetic purchase skipped: test spend cap reached.", "warning"),
-    ("Synthetic session refresh warning for layout testing.", "warning"),
-    ("Synthetic marketplace response error for log sizing.", "error"),
-    ("Synthetic purchase request succeeded for one outfit.", "success"),
-]
-
-

@@ -1,3 +1,4 @@
+import asyncio
 import random
 import time
 from typing import Optional
@@ -9,11 +10,10 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, Input, Label, RichLog, Select, Static
 
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
-from bdo_marketplace_tools.market.test_mode import LIVE_BUY_ERROR_TEST_TARGET, SINGLE_ITEM_TEST_TARGET
 from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.storage.browser_profile_cache import (
     format_storage_size,
@@ -31,6 +31,7 @@ from bdo_marketplace_tools.ui.display import (
     COLOR_WARNING,
     format_compact_number,
     format_compact_silver,
+    format_duration,
     format_percent,
     highlight,
     highlight_brand,
@@ -39,7 +40,6 @@ from bdo_marketplace_tools.ui.display import (
 )
 from bdo_marketplace_tools.ui.modals import (
     BuyDelayModal,
-    ConfirmLiveTestBuyScreen,
     ConfirmBuyModeScreen,
     CredentialsModal,
     DashboardModalScreen,
@@ -61,7 +61,6 @@ from bdo_marketplace_tools.ui.theme import (
     RUNNING_QUIPS,
     STATUS_DOT,
     STATUS_STYLES,
-    TEST_LOG_MESSAGES,
     rate_spectrum_style,
 )
 from bdo_marketplace_tools.storage import stats_db
@@ -123,18 +122,26 @@ class MarketplaceToolsApp(App[None]):
 
     ACTIVITY_TAIL_LINES = 4
 
-    def __init__(self, task_manager, api_handler, launch_mode: str = "live") -> None:
+    def __init__(self, task_manager, api_handler, devtools=None) -> None:
         super().__init__()
         self.theme = DEFAULT_THEME
         self.task_manager = task_manager
         self.api_handler = api_handler
-        self.launch_mode = launch_mode
-        self.task_manager.set_test_mode_enabled(self.is_test_mode)
+        # ``App.devtools`` is reserved by Textual for its own optional devtools client.
+        self.developer_tools = devtools
         self.current_view = "dashboard"
         self.status_message = ""
         self.log_filter = "all"
-        self._stats_trends_key: tuple[int, int] | None = None
-        self._stats_trends_error_key: tuple[int, int] | None = None
+        self._stats_trends_key: tuple[int, str] | None = None
+        self._stats_trends_error_key: tuple[int, str] | None = None
+        self._stats_trends_loading_key: tuple[int, str] | None = None
+        self._browser_storage_refresh_pending = False
+        self._browser_storage_error: str | None = None
+        self._browser_storage_error_generation: int | None = None
+        self._pa_credentials_loaded = False
+        self._pa_credentials_email: str | None = None
+        self._pa_credentials_password: str | None = None
+        self._pa_credentials_error: CredentialStoreError | None = None
         self._rendered_events: tuple | None = None
         self._rendered_tail: tuple | None = None
         self._dashboard_snapshot: tuple[str, ...] | None = None
@@ -188,27 +195,14 @@ class MarketplaceToolsApp(App[None]):
                     yield Static("", id="welcome-greeting")
                     yield Static("", id="buy-badges")
                 yield Static("", id="welcome-footer")
-            if self.is_test_mode:
+            if self.developer_tools is not None:
+                # Loaded only for developer-mode composition. Normal launches do not import
+                # or instantiate the optional diagnostic UI.
+                from bdo_marketplace_tools.ui.test_controls import TestControls
+
                 with Horizontal(id="body"):
                     yield Container(id="content")
-                    with VerticalScroll(id="test-controls"):
-                        yield Button("Add Test Log", id="add-test-log", compact=True)
-                        yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
-                        yield Button("Auto Reauth", id="toggle-auto-reauth", compact=True)
-                        yield Button("Expire Session", id="expire-test-session", compact=True)
-                        yield Button("Run Session Check", id="run-session-check", compact=True)
-                        yield Button("Reauth Check", id="run-reauth-check", compact=True)
-                        yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
-                        yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
-                        yield Button("Clear (Keep Steam)", id="clear-cookies-keep-steam", compact=True)
-                        yield Button("Start Test Scan", id="start-test-monitor", compact=True)
-                        yield Button("Start Test Buy", id="start-test-buy", compact=True)
-                        yield Button("Live 2.9B Buy", id="live-buy-error-probe", compact=True)
-                        yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
-                        yield Button("Fake Detection", id="fake-detection", compact=True)
-                        yield Button("Fake Multi Detect", id="fake-multi-detection", compact=True)
-                        yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
-                        yield Button("Fake Bundle x8", id="fake-bundled-buy", compact=True)
+                    yield TestControls(self.developer_tools)
             else:
                 yield Container(id="content")
         with Horizontal(id="statusbar"):
@@ -217,11 +211,39 @@ class MarketplaceToolsApp(App[None]):
 
     @property
     def is_test_mode(self) -> bool:
-        return self.launch_mode == "test"
+        return self.developer_tools is not None
 
     @property
     def is_simulated_session(self) -> bool:
-        return bool(getattr(self.task_manager, "simulated_session_enabled", False))
+        return bool(
+            self.developer_tools and self.developer_tools.simulated_session_enabled
+        )
+
+    def monitor_running(self) -> bool:
+        return self.task_manager.monitor_running() or bool(
+            self.developer_tools and self.developer_tools.probe_running
+        )
+
+    def monitor_status_label(self) -> str:
+        if self.developer_tools and self.developer_tools.probe_running:
+            return "Test Scan"
+        return self.task_manager.monitor_status_label()
+
+    def monitor_mode_label(self) -> str:
+        if self.developer_tools and self.developer_tools.probe_running:
+            return "Test buy" if self.developer_tools.probe_purchase_enabled else "Single item"
+        return self.task_manager.monitor_mode_label()
+
+    def runtime_label(self) -> str:
+        if (
+            self.developer_tools
+            and self.developer_tools.probe_running
+            and self.developer_tools.probe_started_at is not None
+        ):
+            return format_duration(
+                time.monotonic() - self.developer_tools.probe_started_at
+            )
+        return self.task_manager.runtime_label()
 
     async def on_mount(self) -> None:
         await self.show_view("dashboard")
@@ -231,14 +253,28 @@ class MarketplaceToolsApp(App[None]):
         self.set_interval(30.0, self.advance_running_quip)
         self.set_interval(0.8, self.advance_mascot_zzz)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
+        if (
+            not self.is_test_mode
+            and self.task_manager.pa_browser_keep_open
+            and not self.task_manager.uses_steam_browser_session()
+        ):
+            self.run_worker(
+                self.start_persisted_pa_browser_worker(),
+                name="pa-browser-worker-startup",
+                group="browser-worker",
+            )
 
     def on_resize(self, event) -> None:
         self.refresh_layout_density()
 
     async def on_unmount(self) -> None:
         await self.task_manager.stop_checker()
-        await self.task_manager.stop_single_item_test_checker()
+        if self.developer_tools is not None:
+            await self.developer_tools.shutdown()
         await self.task_manager.stop_login_status_checker()
+        await self.task_manager.stop_pa_browser_worker_best_effort(
+            "App shutdown could not finish Pearl Abyss Chrome worker cleanup"
+        )
         await self.task_manager.flush_stats_writes()
         self.api_handler.save_session()
 
@@ -274,15 +310,19 @@ class MarketplaceToolsApp(App[None]):
         await self.show_view(target)
 
     async def toggle_monitor_from_dashboard(self) -> None:
-        if self.task_manager.checker_enabled:
+        if self.monitor_running():
             await self.stop_monitor()
             return
 
         await self.start_monitor()
 
     async def stop_monitor(self, close_modal: bool = False) -> None:
-        if self.task_manager.single_item_test_checker_enabled and not self.task_manager.checker_enabled:
-            was_running = await self.task_manager.stop_single_item_test_checker()
+        if (
+            self.developer_tools
+            and self.developer_tools.probe_running
+            and not self.task_manager.checker_enabled
+        ):
+            was_running = await self.developer_tools.stop_single_item_probe()
             if was_running:
                 self.set_status("Single-item test monitor stopped.", "info")
             else:
@@ -301,6 +341,15 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
         if close_modal:
             self.close_active_dashboard_modal()
+
+    async def prepare_devtools_for_auth_reset(self) -> None:
+        """Stop optional diagnostics before production authentication state is reset."""
+        if self.developer_tools is None:
+            return
+        if self.developer_tools.probe_running:
+            await self.developer_tools.stop_single_item_probe()
+        if self.developer_tools.simulated_session_enabled:
+            self.developer_tools.set_simulated_session(False)
 
     async def show_view(self, view_name: str) -> None:
         self.current_view = view_name
@@ -433,10 +482,18 @@ class MarketplaceToolsApp(App[None]):
         return state, detail, level, email, password
 
     def pa_credential_state(self) -> tuple[str, str, str, Optional[str], Optional[str]]:
-        try:
-            email, password = load_credentials()
-        except CredentialStoreError as exc:
-            return "Credential Store Error", str(exc), "error", None, None
+        if not self._pa_credentials_loaded:
+            try:
+                email, password = load_credentials()
+            except CredentialStoreError as exc:
+                self._set_pa_credentials_cache(error=exc)
+            else:
+                self._set_pa_credentials_cache(email, password)
+
+        email = self._pa_credentials_email
+        password = self._pa_credentials_password
+        if self._pa_credentials_error is not None:
+            return "Credential Store Error", str(self._pa_credentials_error), "error", None, None
 
         if email and password:
             return "PA Account", mask_email(email), "gold", email, password
@@ -444,13 +501,19 @@ class MarketplaceToolsApp(App[None]):
             return "Password Needed", mask_email(email), "warning", email, password
         return "Not Set", "No account configured", "error", email, password
 
+    def _set_pa_credentials_cache(self, email=None, password=None, *, error=None) -> None:
+        self._pa_credentials_loaded = True
+        self._pa_credentials_email = email
+        self._pa_credentials_password = password
+        self._pa_credentials_error = error
+
     def session_status_state(self) -> tuple[str, str, str]:
         if self.is_simulated_session:
             return "TEST", "Simulated auth", "warning"
         if self.api_handler.login_status:
             return "ONLINE", "Authenticated", "success"
         # Offline while the monitor runs is a real fault; offline at rest is just "not started yet".
-        level = "error" if self.task_manager.monitor_running() else "idle"
+        level = "error" if self.monitor_running() else "idle"
         return "OFFLINE", "Refresh required", level
 
     def session_account_label(self) -> str:
@@ -471,8 +534,8 @@ class MarketplaceToolsApp(App[None]):
     def dashboard_snapshot(self) -> tuple[str, ...]:
         credential_status, credential_detail, credential_level, _, _ = self.credential_state()
         login_status, _, _ = self.session_status_state()
-        monitor_status = self.task_manager.monitor_status_label()
-        mode = self.task_manager.monitor_mode_label()
+        monitor_status = self.monitor_status_label()
+        mode = self.monitor_mode_label()
         purchase_rate = format_percent(
             self.task_manager.session_successful_purchases,
             self.task_manager.session_detected_outfits,
@@ -497,7 +560,7 @@ class MarketplaceToolsApp(App[None]):
             purchase_detail,
             format_compact_silver(self.task_manager.session_silver_spent),
             spend_detail,
-            self.task_manager.runtime_label(),
+            self.runtime_label(),
         )
 
     def status_text(self, value: str, level: str, show_dot: bool = True) -> Text:
@@ -532,7 +595,9 @@ class MarketplaceToolsApp(App[None]):
         # green when the mode can spend silver, neutral when it only watches.
         buying = (
             self.task_manager.purchase_submission_enabled
-            or self.task_manager.single_item_test_purchase_enabled
+            or bool(
+                self.developer_tools and self.developer_tools.probe_purchase_enabled
+            )
         )
         # Non-idle level flags buy mode; refresh_dashboard_tiles renders it as an amber
         # warning triangle (caution: spends silver) with neutral text, rather than coloring
@@ -588,7 +653,7 @@ class MarketplaceToolsApp(App[None]):
         except Exception:
             return
 
-        running = self.task_manager.monitor_running()
+        running = self.monitor_running()
         toggle.set_class(running, "toggle-stop")
         toggle.set_class(not running, "toggle-start")
         body = Table.grid(expand=True)
@@ -652,7 +717,7 @@ class MarketplaceToolsApp(App[None]):
             self.refresh_stats()
 
     def short_runtime_label(self) -> str:
-        label = self.task_manager.runtime_label()
+        label = self.runtime_label()
         if label.startswith("00:") and len(label) == 8:
             return label[3:]
         return label
@@ -664,7 +729,7 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_chrome_status(self) -> None:
         tm = self.task_manager
-        running = tm.monitor_running()
+        running = self.monitor_running()
         try:
             session_label, _detail, session_level = self.session_status_state()
             session_text = Text()
@@ -686,7 +751,7 @@ class MarketplaceToolsApp(App[None]):
                 f"{STATUS_DOT} " if buying else f"{IDLE_DOT} ",
                 style=STATUS_STYLES["success"] if buying else "#777777",
             )
-            bar.append(tm.monitor_mode_label(), style="#8f8f8f")
+            bar.append(self.monitor_mode_label(), style="#8f8f8f")
             bar.append(separator, style="#3a3a3a")
             bar.append("cap ", style="#6f6f6f")
             bar.append(self.spend_cap_short_label(), style="#d8d3c8")
@@ -855,7 +920,7 @@ class MarketplaceToolsApp(App[None]):
         # piece and were folded in live — they must not fire a second celebration).
         self._celebrated_purchases, self._reward_spent = self.observed_purchase_totals()
         self._quip_index = 0
-        self.refresh_welcome_footer(self.task_manager.monitor_running())
+        self.refresh_welcome_footer(self.monitor_running())
 
     # One ✦ badge per session buy, trailing the mascot's chatter (newest a shade brighter).
     # Individual stars up to the cap, then a compact "✦ ×N" so a long session can't overrun
@@ -962,7 +1027,7 @@ class MarketplaceToolsApp(App[None]):
     def advance_running_pulse(self) -> None:
         if not self.animations_enabled or self.current_view != "dashboard":
             return
-        if not self.task_manager.monitor_running():
+        if not self.monitor_running():
             return
         self._pulse_index = (self._pulse_index + 1) % len(self.RUNNING_PULSE_FRAMES)
         self.refresh_welcome_footer(True)
@@ -978,7 +1043,7 @@ class MarketplaceToolsApp(App[None]):
         if not self.animations_enabled or self.current_view != "dashboard":
             return
         # The mascot chatters in both states now — eager while running, dozy while idle.
-        running = self.task_manager.monitor_running()
+        running = self.monitor_running()
         pool = self.chatter_pool(running)
         if len(pool) < 2:
             return
@@ -994,7 +1059,7 @@ class MarketplaceToolsApp(App[None]):
         # wakes it. With animations off (tests), the plain logo stays neutral.
         if not self.animations_enabled:
             return BANNER_ART
-        if self.task_manager.monitor_running():
+        if self.monitor_running():
             return BANNER_ART
         return self._augment_zzz(BANNER_BLINK_ART)
 
@@ -1012,7 +1077,7 @@ class MarketplaceToolsApp(App[None]):
     def advance_mascot_zzz(self) -> None:
         if not self.animations_enabled or self.current_view != "dashboard":
             return
-        if self.task_manager.monitor_running():
+        if self.monitor_running():
             return
         # Freeze the sleep clock while a drowsy peek owns the banner. Otherwise the step
         # would advance under the blink guard (unpainted), swallowing z-reveals — most
@@ -1050,7 +1115,7 @@ class MarketplaceToolsApp(App[None]):
             return
         # Awake: a quick alert blink (eyes close briefly). Dozing: a slow drowsy peek
         # (eyes crack open briefly). The rest frame is the opposite in each state.
-        running = self.task_manager.monitor_running()
+        running = self.monitor_running()
         if not running:
             # The idle peek shares the 4s blink timer but should be rare — skip most
             # ticks so the sleeping eyes only crack open every ~8-12s.
@@ -1352,9 +1417,12 @@ class MarketplaceToolsApp(App[None]):
 
     def selected_account_mode(self) -> str:
         try:
-            return str(self.query_visible_one("#account-mode-select", Select).value)
+            selected_mode = str(self.query_visible_one("#account-mode-select", Select).value)
         except Exception:
             return self.task_manager.account_mode
+        if selected_mode not in {PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE}:
+            return self.task_manager.account_mode
+        return selected_mode
 
     def refresh_credentials_mode_controls(self) -> None:
         try:
@@ -1436,6 +1504,16 @@ class MarketplaceToolsApp(App[None]):
         await content.mount(update_card)
         update_card.border_title = "Updates"
 
+        pa_browser_card = Horizontal(
+            Static(id="settings-pa-browser-worker", classes="action-card-info"),
+            ModalAction("Open Browser", "settings-open-pa-browser", extra_classes="modal-action-compact"),
+            ModalAction("Keep Open: Off", "settings-toggle-pa-browser-worker", extra_classes="modal-action-compact"),
+            id="settings-pa-browser-card",
+            classes="action-card",
+        )
+        await content.mount(pa_browser_card)
+        pa_browser_card.border_title = "Persistent PA Browser"
+
         storage_card = Vertical(
             Static(id="settings-storage-facts", classes="action-card-line"),
             Horizontal(
@@ -1515,7 +1593,7 @@ class MarketplaceToolsApp(App[None]):
             (
                 ("channel", str(APP_CHANNEL).lower(), COLOR_INFO),
                 ("schema", str(SETTINGS_SCHEMA_VERSION), COLOR_INFO),
-                ("mode", self.launch_mode, STATUS_STYLES["warning"] if self.is_test_mode else COLOR_INFO),
+                ("mode", "test" if self.is_test_mode else "live", STATUS_STYLES["warning"] if self.is_test_mode else COLOR_INFO),
             )
         ):
             if index:
@@ -1549,17 +1627,118 @@ class MarketplaceToolsApp(App[None]):
         except Exception:
             pass
 
-        storage = tm.browser_storage_summary()
+        pa_browser_line = Text()
+        if tm.pa_browser_keep_open:
+            if tm.pa_browser_worker_has_resources and not tm.pa_browser_worker_owns_profile:
+                label = "Driver cleanup incomplete"
+                detail = "   ·   Browser driver cleanup is incomplete; retry the toggle or restart the app."
+            elif tm.uses_steam_browser_session() and tm.pa_browser_worker_owns_profile:
+                label = "Close Chrome manually"
+                detail = "   ·   The PA worker could not close; close its Chrome window manually."
+            elif tm.uses_steam_browser_session():
+                label = "Enabled for PA"
+                detail = "   ·   Starts when Pearl Abyss Account is selected."
+            elif tm.pa_browser_worker_running:
+                label = "Running"
+                detail = "   ·   Keep the dedicated Chrome window open and minimized."
+            else:
+                label = "Enabled · browser closed"
+                detail = "   ·   Background recovery stays paused. Use Open Browser to restart."
+            pa_browser_line.append(label, style=COLOR_INFO)
+            pa_browser_line.append(detail, style=COLOR_TEXT_MUTED)
+        else:
+            pa_browser_line.append("Off", style=COLOR_TEXT_MUTED)
+            pa_browser_line.append(
+                "   ·   Keep one persistent Chrome window, no pop-ups.",
+                style=COLOR_TEXT_MUTED,
+            )
+        try:
+            self.query_one("#settings-pa-browser-worker", Static).update(pa_browser_line)
+            open_browser_action = self.query_one("#settings-open-pa-browser", ModalAction)
+            open_browser_action.display = bool(
+                tm.pa_browser_keep_open
+                and not tm.uses_steam_browser_session()
+                and not tm.pa_browser_worker_running
+                and not (
+                    tm.pa_browser_worker_has_resources
+                    and not tm.pa_browser_worker_owns_profile
+                )
+            )
+            self.query_one("#settings-toggle-pa-browser-worker", ModalAction).update(
+                f"Keep Open: {'On' if tm.pa_browser_keep_open else 'Off'}"
+            )
+        except Exception:
+            pass
+
         storage_line = Text()
-        storage_line.append(f"{format_storage_size(storage.total_bytes)} used", style=COLOR_INFO)
-        storage_line.append("   ·   ", style=COLOR_TEXT_MUTED)
-        storage_line.append(
-            f"{format_storage_size(storage.disposable_bytes)} disposable", style=COLOR_TEXT_MUTED
-        )
+        storage = tm.browser_storage_summary()
+        if storage is None:
+            storage_generation = tm.browser_storage_generation
+            if (
+                self._browser_storage_error
+                and self._browser_storage_error_generation == storage_generation
+            ):
+                storage_line.append("Storage measurement unavailable", style=STATUS_STYLES["warning"])
+            else:
+                self._browser_storage_error = None
+                self._browser_storage_error_generation = None
+                storage_line.append("Measuring browser profile storage...", style=COLOR_TEXT_MUTED)
+                self.request_browser_storage_refresh()
+        else:
+            storage_line.append(f"{format_storage_size(storage.total_bytes)} used", style=COLOR_INFO)
+            storage_line.append("   ·   ", style=COLOR_TEXT_MUTED)
+            storage_line.append(
+                f"{format_storage_size(storage.disposable_bytes)} disposable", style=COLOR_TEXT_MUTED
+            )
         try:
             self.query_one("#settings-storage-facts", Static).update(storage_line)
         except Exception:
             pass
+
+    def request_browser_storage_refresh(self, *, force=False) -> None:
+        if self._browser_storage_refresh_pending:
+            return
+        if not force and self.task_manager.browser_storage_summary() is not None:
+            return
+
+        if force:
+            self._browser_storage_error = None
+            self._browser_storage_error_generation = None
+        self._browser_storage_refresh_pending = True
+        refresh = self.refresh_browser_storage_summary(force=force)
+        try:
+            self.run_worker(
+                refresh,
+                name="browser-storage-summary",
+                group="storage",
+            )
+        except Exception:
+            refresh.close()
+            self._browser_storage_refresh_pending = False
+            raise
+
+    async def refresh_browser_storage_summary(self, *, force=False) -> None:
+        generation = self.task_manager.browser_storage_generation
+        try:
+            await self.task_manager.refresh_browser_storage_summary(force=force)
+        except Exception as exc:
+            if generation == self.task_manager.browser_storage_generation:
+                detail = str(exc).strip() or exc.__class__.__name__
+                if (
+                    detail != self._browser_storage_error
+                    or generation != self._browser_storage_error_generation
+                ):
+                    self.task_manager.add_event(f"Browser storage measurement failed: {detail}", "warning")
+                self._browser_storage_error = detail
+                self._browser_storage_error_generation = generation
+        else:
+            self._browser_storage_error = None
+            self._browser_storage_error_generation = None
+        finally:
+            self._browser_storage_refresh_pending = False
+
+        if self.current_view == "settings":
+            self.refresh_settings_summary()
 
     def refresh_spend_summary(self) -> None:
         try:
@@ -1748,11 +1927,11 @@ class MarketplaceToolsApp(App[None]):
             )
         )
         self._stats_trends_key = None
+        self._stats_trends_error_key = None
         self.refresh_stats()
 
     def refresh_stats(self) -> None:
         tm = self.task_manager
-        tm.reload_lifetime_stats()
         detected = tm.session_detected_outfits
         bought = tm.session_successful_purchases
 
@@ -1789,16 +1968,54 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_stats_trends()
 
     def refresh_stats_trends(self) -> None:
-        # Trend queries only rerun when new history landed; the 1-second stats
-        # refresh otherwise leaves the charts alone.
-        key = self.task_manager.stats_history_revision
-        if key == self._stats_trends_key:
+        # Trend queries only rerun when new history landed. The query itself runs
+        # off the Textual event loop; the 1-second stats refresh only compares keys.
+        key = self.stats_trends_key()
+        if key in (
+            self._stats_trends_key,
+            self._stats_trends_error_key,
+            self._stats_trends_loading_key,
+        ):
             return
+        self._stats_trends_loading_key = key
+        stats_db_path = self.task_manager.stats_db_path
+        load = self.load_stats_trends(key, stats_db_path)
         try:
-            trends = stats_db.load_trends(30, path=self.task_manager.stats_db_path)
+            self.run_worker(
+                load,
+                name="stats-trends",
+                group="stats",
+            )
+        except Exception:
+            load.close()
+            self._stats_trends_loading_key = None
+            raise
+
+    def stats_trends_key(self) -> tuple[int, str]:
+        return self.task_manager.stats_history_revision, str(self.task_manager.stats_db_path)
+
+    async def load_stats_trends(self, key: tuple[int, str], stats_db_path) -> None:
+        try:
+            trends = await asyncio.to_thread(
+                stats_db.load_trends,
+                30,
+                path=stats_db_path,
+            )
         except Exception as exc:
-            self.show_stats_trends_error(exc, key)
+            if self.current_view == "stats" and key == self.stats_trends_key():
+                self.show_stats_trends_error(exc, key)
             return
+        finally:
+            if self._stats_trends_loading_key == key:
+                self._stats_trends_loading_key = None
+
+        if key != self.stats_trends_key():
+            if self.current_view == "stats":
+                self.refresh_stats_trends()
+            return
+        if self.current_view != "stats":
+            return
+
         try:
             self.query_one("#stats-chart-daily", DailyActivityChart).update_daily(trends["daily"])
             self.query_one("#stats-chart-weekday", Static).update(weekday_chart(trends["weekday"]))
@@ -1809,7 +2026,7 @@ class MarketplaceToolsApp(App[None]):
         self._stats_trends_key = key
         self._stats_trends_error_key = None
 
-    def show_stats_trends_error(self, exc: Exception, key: int) -> None:
+    def show_stats_trends_error(self, exc: Exception, key: tuple[int, str]) -> None:
         message = Text("Stats charts unavailable", style=STATUS_STYLES["warning"])
         try:
             self.query_one("#stats-chart-daily", DailyActivityChart).clear_daily()
@@ -1835,6 +2052,8 @@ class MarketplaceToolsApp(App[None]):
             "settings-reset-steam",
             "settings-check-update",
             "settings-toggle-update-startup",
+            "settings-open-pa-browser",
+            "settings-toggle-pa-browser-worker",
             "settings-save-cache-limit",
             "settings-clean-cache",
         }
@@ -1868,6 +2087,20 @@ class MarketplaceToolsApp(App[None]):
             )
         elif action_id == "settings-toggle-update-startup":
             self.toggle_update_startup_check()
+        elif action_id == "settings-open-pa-browser":
+            self.run_worker(
+                self.start_persisted_pa_browser_worker(),
+                name="open-pa-browser-worker",
+                group="actions",
+                exclusive=True,
+            )
+        elif action_id == "settings-toggle-pa-browser-worker":
+            self.run_worker(
+                self.toggle_pa_browser_worker(),
+                name="toggle-pa-browser-worker",
+                group="actions",
+                exclusive=True,
+            )
         elif action_id == "settings-save-cache-limit":
             self.save_browser_cache_limit_from_settings()
         elif action_id == "settings-clean-cache":
@@ -1914,18 +2147,6 @@ class MarketplaceToolsApp(App[None]):
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
-        elif button_id == "add-test-log":
-            await self.add_test_log()
-        elif button_id == "toggle-test-session":
-            await self.toggle_test_session()
-        elif button_id == "toggle-auto-reauth":
-            await self.toggle_test_steam_auto_reauth()
-        elif button_id == "expire-test-session":
-            await self.expire_test_session()
-        elif button_id == "run-session-check":
-            await self.run_test_session_check()
-        elif button_id == "run-reauth-check":
-            await self.run_test_reauthentication_check()
         elif button_id == "prepare-steam-profile":
             self.run_worker(
                 self.prepare_steam_browser_profile(),
@@ -1933,46 +2154,6 @@ class MarketplaceToolsApp(App[None]):
                 group="actions",
                 exclusive=True,
             )
-        elif button_id == "reset-steam-setup":
-            await self.reset_test_steam_setup_status()
-        elif button_id == "clear-browser-cookies":
-            if self._debug_action_allowed():
-                self.run_worker(
-                    self.clear_test_browser_cookies(),
-                    name="clear-browser-cookies",
-                    group="actions",
-                    exclusive=True,
-                )
-        elif button_id == "clear-cookies-keep-steam":
-            if self._debug_action_allowed():
-                self.run_worker(
-                    self.clear_test_cookies_keep_steam(),
-                    name="clear-cookies-keep-steam",
-                    group="actions",
-                    exclusive=True,
-                )
-        elif button_id == "start-test-monitor":
-            await self.start_single_item_test_monitor()
-        elif button_id == "start-test-buy":
-            await self.start_single_item_test_monitor(allow_purchase=True)
-        elif button_id == "live-buy-error-probe":
-            await self.start_live_buy_error_probe()
-        elif button_id == "stop-test-monitor":
-            await self.stop_single_item_test_monitor()
-        elif button_id == "fake-detection":
-            await self.fake_outfit_detection()
-        elif button_id == "fake-multi-detection":
-            await self.fake_multi_outfit_detection()
-        elif button_id == "fake-buy-success":
-            await self.fake_buy_success()
-        elif button_id == "fake-bundled-buy":
-            if self._debug_action_allowed():
-                self.run_worker(
-                    self.fake_bundled_buy_success(),
-                    name="fake-bundled-buy",
-                    group="debug-actions",
-                    exclusive=True,
-                )
 
     async def on_dashboard_tile_pressed(self, event: DashboardTile.Pressed) -> None:
         event.stop()
@@ -2041,6 +2222,7 @@ class MarketplaceToolsApp(App[None]):
             normalized_mode = str(account_mode)
             if normalized_mode == self.task_manager.account_mode:
                 return
+            await self.prepare_devtools_for_auth_reset()
             await self.task_manager.change_account_mode(normalized_mode)
         except ValueError:
             self.set_status("Select a valid login method.", "warning")
@@ -2222,7 +2404,7 @@ class MarketplaceToolsApp(App[None]):
             )
             return
 
-        if self.task_manager.single_item_test_checker_enabled:
+        if self.developer_tools and self.developer_tools.probe_running:
             self.set_status("Single-item test monitor is running. Stop it before changing buy mode.", "warning")
             self.sync_mode_switches(False)
             self.refresh_live_widgets()
@@ -2283,296 +2465,6 @@ class MarketplaceToolsApp(App[None]):
             except Exception:
                 pass
 
-    def _debug_action_allowed(self) -> bool:
-        if self.is_test_mode:
-            return True
-
-        self.set_status("Debug actions are only available in test mode.", "warning")
-        return False
-
-    async def add_test_log(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        message, level = random.choice(TEST_LOG_MESSAGES)
-        self.task_manager.add_event(message, level)
-        self.set_status("Synthetic event added.")
-        await self.return_to_dashboard()
-
-    async def toggle_test_session(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        if self.task_manager.single_item_test_checker_enabled:
-            self.set_status("Stop the single-item test monitor before changing simulated session state.", "warning")
-            await self.return_to_dashboard()
-            return
-
-        enabled = not self.is_simulated_session
-        self.task_manager.set_simulated_session(enabled)
-        if enabled:
-            self.set_status(
-                "Test session marked valid. Buy mode will use simulated purchase responses.",
-                "success",
-            )
-        else:
-            self.sync_mode_switches(False)
-            self.set_status("Test session marked invalid. Buy mode returned to watch only.", "warning")
-        self.refresh_modal_summaries()
-        await self.return_to_dashboard()
-
-    async def toggle_test_steam_auto_reauth(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        enabled = self.task_manager.debug_toggle_steam_auto_reauth()
-        if enabled is None:
-            self.set_status("Select Steam Account before toggling automatic re-authentication.", "warning")
-        elif enabled:
-            self.set_status("Steam automatic re-authentication debug override enabled.", "success")
-        else:
-            self.set_status("Steam automatic re-authentication debug override disabled.", "warning")
-        self.refresh_modal_summaries()
-        await self.return_to_dashboard()
-
-    async def expire_test_session(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        if self.task_manager.debug_invalidate_marketplace_session():
-            self.set_status("Test marketplace session cleared. Run Session Check or Reauth Check to test recovery.", "warning")
-            self.refresh_modal_summaries()
-        await self.return_to_dashboard()
-
-    async def run_test_reauthentication_check(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        recovered = await self.task_manager.debug_run_reauthentication_check()
-        if recovered:
-            self.set_status("Test re-authentication check succeeded.")
-        elif self.task_manager.uses_steam_browser_session():
-            self.set_status("Steam Account refresh required after test re-authentication check.")
-        else:
-            self.set_status("Test re-authentication check failed.")
-        self.refresh_modal_summaries()
-        await self.return_to_dashboard()
-
-    async def run_test_session_check(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        result = await self.task_manager.debug_run_session_check_now()
-        if result:
-            self.set_status("Session check complete: session valid or re-authenticated. See log.", "info")
-        else:
-            self.set_status("Session check: re-authentication required or failed. See log.", "warning")
-        self.refresh_modal_summaries()
-        await self.return_to_dashboard()
-
-    async def reset_test_steam_setup_status(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        if self.task_manager.debug_clear_steam_initial_setup_status():
-            self.set_status("Initial Steam setup status reset.", "warning")
-            self.refresh_credentials_summary()
-            self.refresh_settings_summary()
-            self.refresh_live_widgets()
-        else:
-            self.set_status("Initial Steam setup status reset failed.", "warning")
-
-    async def clear_test_browser_cookies(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        cleared = await self.task_manager.debug_clear_steam_browser_cookies()
-        if cleared:
-            self.set_status("Browser cookies cleared from the Steam profile.", "warning")
-        else:
-            self.set_status("Browser cookie clear failed.", "warning")
-
-    async def clear_test_cookies_keep_steam(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        cleared = await self.task_manager.debug_clear_market_cookies_keep_steam_login()
-        if cleared:
-            self.set_status("Cleared non-Steam cookies; kept Steam login. Run Reauth Check to test.", "warning")
-        else:
-            self.set_status("Cookie clear skipped (Steam Account mode only) or failed; see log.", "warning")
-
-    async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        if self.task_manager.single_item_test_checker_enabled:
-            self.set_status("Single-item test monitor already running; no additional task started.", "info")
-            await self.return_to_dashboard()
-            return
-
-        if self.task_manager.checker_enabled:
-            self.set_status("Stop the normal monitor before starting the single-item test monitor.", "warning")
-            await self.return_to_dashboard()
-            return
-
-        if allow_purchase:
-            if self.is_simulated_session:
-                self.set_status(
-                    "Disable the simulated test session before starting the live single-item buy test.",
-                    "warning",
-                )
-                await self.return_to_dashboard()
-                return
-
-            if not self.api_handler.login_status:
-                self.set_status(
-                    "Login required before starting the single-item buy test. Refresh the marketplace session first.",
-                    "warning",
-                )
-                await self.return_to_dashboard()
-                return
-
-            self.push_screen(
-                ConfirmBuyModeScreen(
-                    account=self.session_account_label(),
-                    polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
-                    spend_cap=format_compact_silver(self.task_manager.max_spend),
-                    buy_delay=self.task_manager.purchase_delay_range(),
-                ),
-                callback=self._handle_single_item_test_buy_confirmation,
-            )
-            return
-
-        await self._start_single_item_test_monitor_now(allow_purchase=False)
-
-    def _handle_single_item_test_buy_confirmation(self, confirmed: bool) -> None:
-        if not confirmed:
-            self.set_status("Single-item buy test canceled.", "info")
-            return
-        self.run_worker(
-            self._start_single_item_test_monitor_now(allow_purchase=True),
-            name="start-single-item-buy-test",
-            group="actions",
-            exclusive=True,
-        )
-
-    async def start_live_buy_error_probe(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        if self.is_simulated_session:
-            self.set_status("Disable the simulated test session before sending the live buy error probe.", "warning")
-            await self.return_to_dashboard()
-            return
-
-        if not self.api_handler.login_status:
-            self.set_status("Login required before sending the live buy error probe. Refresh the marketplace session first.", "warning")
-            await self.return_to_dashboard()
-            return
-
-        target = LIVE_BUY_ERROR_TEST_TARGET
-        self.push_screen(
-            ConfirmLiveTestBuyScreen(
-                item_id=target["main_key"],
-                price=format_compact_silver(int(target["max_buy_price"])),
-                account=self.session_account_label(),
-                buy_delay=self.task_manager.purchase_delay_range(),
-            ),
-            callback=self._handle_live_buy_error_probe_confirmation,
-        )
-
-    def _handle_live_buy_error_probe_confirmation(self, confirmed: bool) -> None:
-        if not confirmed:
-            self.set_status("Live buy error probe canceled.", "info")
-            return
-        self.run_worker(
-            self._run_live_buy_error_probe_now(),
-            name="live-buy-error-probe",
-            group="actions",
-            exclusive=True,
-        )
-
-    async def _run_live_buy_error_probe_now(self) -> None:
-        target = LIVE_BUY_ERROR_TEST_TARGET
-        self.set_status(
-            f"Submitting live buy error probe for item {target['main_key']} at {format_compact_silver(int(target['max_buy_price']))}.",
-            "warning",
-        )
-        submitted = await self.task_manager.debug_run_live_buy_error_probe()
-        if submitted:
-            self.set_status("Live buy error probe completed. Check Core logs for the marketplace response.", "warning")
-        else:
-            self.set_status("Live buy error probe did not run. Check Core logs for details.", "warning")
-        await self.return_to_dashboard()
-
-    async def _start_single_item_test_monitor_now(self, allow_purchase: bool = False) -> None:
-        item_name = SINGLE_ITEM_TEST_TARGET["name"]
-        started = await self.task_manager.start_single_item_test_checker(allow_purchase=allow_purchase)
-        if started:
-            if allow_purchase:
-                self.set_status(
-                    f"Single-item buy test started for {item_name}. Public detection uses the normal buy pipeline.",
-                    "warning",
-                )
-            else:
-                self.set_status(
-                    f"Single-item test monitor started for {item_name}. Public scan only; live buy calls are disabled.",
-                    "warning",
-                )
-        elif self.task_manager.single_item_test_checker_enabled:
-            self.set_status("Single-item test monitor already running; no additional task started.", "info")
-        else:
-            self.set_status("Single-item test monitor did not start.", "warning")
-        await self.return_to_dashboard()
-
-    async def stop_single_item_test_monitor(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        was_running = await self.task_manager.stop_single_item_test_checker()
-        if was_running:
-            self.set_status("Single-item test monitor stopped.", "info")
-        else:
-            self.set_status("Single-item test monitor already stopped.", "info")
-        await self.return_to_dashboard()
-
-    async def fake_outfit_detection(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        await self.task_manager.debug_fake_outfit_detection()
-        self.set_status("Fake detection processed through watch-only path.")
-        await self.return_to_dashboard()
-
-    async def fake_multi_outfit_detection(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        await self.task_manager.debug_fake_multi_outfit_detection()
-        self.set_status("Fake multi-listing detection processed.")
-        await self.return_to_dashboard()
-
-    async def fake_buy_success(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        await self.task_manager.debug_simulate_purchase_success()
-        self.set_status("Fake detection and purchase recorded.")
-        await self.return_to_dashboard()
-
-    async def fake_bundled_buy_success(self) -> None:
-        if not self._debug_action_allowed():
-            return
-
-        self.set_status("Fake bundled buy list running: 8 outfits.")
-        await self.return_to_dashboard()
-        await self.task_manager.debug_simulate_bundled_purchase_success(
-            progress_callback=self.refresh_live_widgets
-        )
-        self.refresh_live_widgets()
-        self.set_status("Fake bundled buy list recorded: 8 outfits.")
-
     async def prepare_steam_browser_profile(self) -> None:
         try:
             account_mode = self.selected_account_mode()
@@ -2614,8 +2506,7 @@ class MarketplaceToolsApp(App[None]):
 
         previous_email = self.api_handler.email
         session_identity_changed = bool(
-            self.api_handler.login_status
-            and (not previous_email or previous_email.strip().lower() != email.strip().lower())
+            not previous_email or previous_email.strip().lower() != email.strip().lower()
         )
         self.api_handler.email = email
         self.api_handler.password = password
@@ -2628,6 +2519,14 @@ class MarketplaceToolsApp(App[None]):
             self.set_pa_credentials_warning(f"Unable to save credentials: {exc}")
             return False
 
+        self._set_pa_credentials_cache(email, password)
+        if session_identity_changed:
+            # Persist the fail-closed browser-profile state before any awaited
+            # mode/reset cleanup. The next PA auth context clears cookies before
+            # navigating, so it cannot silently reuse the former account.
+            self.task_manager.invalidate_pa_browser_identity()
+        if session_identity_changed or self.task_manager.account_mode != PA_CREDENTIALS_MODE:
+            await self.prepare_devtools_for_auth_reset()
         mode_changed = await self.task_manager.change_account_mode(PA_CREDENTIALS_MODE)
         if session_identity_changed and not mode_changed:
             await self.task_manager.reset_authentication_context("Credentials changed")
@@ -2647,6 +2546,7 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Unable to clear saved credentials.")
             return
 
+        self._set_pa_credentials_cache()
         self.api_handler.email = None
         self.api_handler.password = None
         for input_id in ("email-input", "password-input"):
@@ -2660,6 +2560,7 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def clear_saved_session(self) -> None:
+        await self.prepare_devtools_for_auth_reset()
         cleared_now = await self.task_manager.reset_authentication_context("Manual session reset")
         self.sync_mode_switches(False)
         if cleared_now:
@@ -2709,6 +2610,42 @@ class MarketplaceToolsApp(App[None]):
         state = "on" if enabled else "off"
         self.set_settings_update_status(f"Startup update check turned {state}.")
         self.set_status(f"Startup update check turned {state}.", "info")
+        self.refresh_settings_summary()
+
+    async def start_persisted_pa_browser_worker(self) -> None:
+        started = await self.task_manager.ensure_pa_browser_worker_started(cleanup_browser_cache=True)
+        if started:
+            self.set_status("Pearl Abyss Chrome worker ready. Keep its window open and minimized.", "success")
+        elif (
+            self.task_manager.pa_browser_keep_open
+            and not self.task_manager.uses_steam_browser_session()
+            and not self.task_manager.pa_browser_worker_running
+        ):
+            self.set_status("Pearl Abyss Chrome worker could not start. See the event log.", "warning")
+        self.refresh_settings_summary()
+
+    async def toggle_pa_browser_worker(self) -> None:
+        was_enabled = self.task_manager.pa_browser_keep_open
+        enabled = await self.task_manager.set_pa_browser_keep_open(
+            not was_enabled
+        )
+        if was_enabled and enabled:
+            message = "PA Chrome worker could not be disabled. See the event log; retry, then restart the app if needed."
+            level = "error"
+        elif enabled and self.task_manager.uses_steam_browser_session():
+            message = "PA Chrome worker enabled. It will start when Pearl Abyss Account is selected."
+            level = "info"
+        elif enabled and self.task_manager.pa_browser_worker_running:
+            message = "PA Chrome worker enabled. Keep its window open and minimized."
+            level = "success"
+        elif enabled:
+            message = "PA Chrome worker enabled but not running. See the event log."
+            level = "warning"
+        else:
+            message = "PA Chrome worker disabled. Future logins will use the normal temporary browser."
+            level = "info"
+        self.set_settings_maintenance_status(message)
+        self.set_status(message, level)
         self.refresh_settings_summary()
 
     async def startup_update_check(self) -> None:
@@ -2795,8 +2732,15 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Settings are not available.", "warning")
             return
 
+        previous_mode = self.task_manager.account_mode
         try:
-            normalized_mode = self.task_manager.set_account_mode(str(account_mode))
+            selected_mode = str(account_mode)
+            if selected_mode != previous_mode:
+                await self.prepare_devtools_for_auth_reset()
+                await self.task_manager.change_account_mode(selected_mode)
+                normalized_mode = self.task_manager.account_mode
+            else:
+                normalized_mode = self.task_manager.set_account_mode(selected_mode)
         except ValueError:
             self.set_status("Select a valid session mode.", "warning")
             return
@@ -2816,7 +2760,7 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def start_monitor(self) -> None:
-        if self.task_manager.single_item_test_checker_enabled:
+        if self.developer_tools and self.developer_tools.probe_running:
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
             self.refresh_live_widgets()
             return
@@ -2878,7 +2822,7 @@ class MarketplaceToolsApp(App[None]):
             scope = self.task_manager.scan_scope_label().lower()
             self.set_status(f"Monitor started in {mode} — {scope}.")
             self.close_dashboard_modals()
-        elif self.task_manager.single_item_test_checker_enabled:
+        elif self.developer_tools and self.developer_tools.probe_running:
             self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
         elif self.task_manager.checker_enabled:
             self.set_status(f"Monitor already running in {mode}; no additional monitor task started.", "info")
@@ -2925,8 +2869,12 @@ class MarketplaceToolsApp(App[None]):
 
     async def action_quit_app(self) -> None:
         await self.task_manager.stop_checker()
-        await self.task_manager.stop_single_item_test_checker()
+        if self.developer_tools is not None:
+            await self.developer_tools.shutdown()
         await self.task_manager.stop_login_status_checker()
+        await self.task_manager.stop_pa_browser_worker_best_effort(
+            "App shutdown could not finish Pearl Abyss Chrome worker cleanup"
+        )
         await self.task_manager.flush_stats_writes()
         self.api_handler.save_session()
         self.exit()

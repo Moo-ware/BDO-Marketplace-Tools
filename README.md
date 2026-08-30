@@ -6,7 +6,7 @@
   <a href="https://www.python.org/downloads/">
     <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
   </a>
-  <img alt="Version 1.4.0-beta" src="https://img.shields.io/badge/Version-1.4.0--beta-blueviolet">
+  <img alt="Version 1.4.1-beta" src="https://img.shields.io/badge/Version-1.4.1--beta-blueviolet">
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
@@ -49,6 +49,7 @@
 - **Unified dashboard.** A single live view shows session status, current monitor activity, and a running feed of recent events.
 - **Activity and stats tracking.** A dedicated stats page records detections and purchases, busiest days, common listing hours, and the bot's online/offline coverage.
 - **Multi-account support.** Works with both Pearl Abyss launcher and Steam accounts (see Account Support below).
+- **Optional persistent PA browser.** Pearl Abyss users can keep one dedicated Chrome window open and minimized between session refreshes, while the existing disposable browser flow remains the default.
 - **Inventory view** for stored silver and Value Pack status — currently in progress.
 
 ### Technical Features

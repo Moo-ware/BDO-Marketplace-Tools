@@ -84,43 +84,6 @@ class ConfirmBuyModeScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ConfirmLiveTestBuyScreen(ModalScreen[bool]):
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
-    CSS = DashboardModalScreen.CSS
-    AUTO_FOCUS = None
-
-    def __init__(self, item_id: str, price: str, account: str, buy_delay: str) -> None:
-        super().__init__()
-        self.item_id = item_id
-        self.price = price
-        self.account = account
-        self.buy_delay = buy_delay
-
-    def compose(self) -> ComposeResult:
-        review = Table.grid(padding=(0, 2))
-        review.add_column(style="bold #6f6f6f", no_wrap=True)
-        review.add_column()
-        review.add_row("Account", self.account)
-        review.add_row("Item", self.item_id)
-        review.add_row("Price", self.price)
-        review.add_row("Buy delay", self.buy_delay)
-        with Vertical(id="confirm-dialog", classes="modal-card") as dialog:
-            dialog.border_title = "Confirm Live Test Buy"
-            dialog.border_subtitle = "esc"
-            yield Static("This sends one real marketplace buy request through the normal purchase pipeline:", classes="modal-note")
-            yield Static(review)
-            with Horizontal(id="confirm-actions", classes="modal-actions"):
-                yield ModalAction("Submit Test Buy", "confirm-live-test-buy")
-                yield Static("", classes="modal-actions-spacer")
-                yield ModalAction("Cancel", "cancel-live-test-buy")
-
-    def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
-        self.dismiss(event.action.action_id == "confirm-live-test-buy")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
-
-
 class MonitorModal(DashboardModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-card") as dialog:
@@ -256,6 +219,7 @@ class CredentialsModal(DashboardModalScreen):
                 mode_options,
                 value=app.task_manager.account_mode,
                 id="account-mode-select",
+                allow_blank=False,
             )
             yield Static(id="credentials-mode-note", classes="modal-note")
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):

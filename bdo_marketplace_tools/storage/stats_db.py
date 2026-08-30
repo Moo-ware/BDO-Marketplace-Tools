@@ -16,8 +16,9 @@ Timestamps are stored as unix epoch seconds and bucketed to local time in the
 query helpers, matching how the user experiences days and hours.
 
 Schema changes are tracked with SQLite's ``PRAGMA user_version``. Version 1 is
-the first SQLite stats schema; unversioned prototype databases are promoted in
-place without rewriting existing rows.
+the first SQLite stats schema; version 2 adds an ``occurred_at``-leading index
+for bounded trend queries. Older databases are promoted in place without
+rewriting existing rows.
 """
 
 import json
@@ -30,7 +31,7 @@ from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, STATS_DB_PATH
 
 DETECTION_EVENT = "detection"
 PURCHASE_EVENT = "purchase"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DEFAULT_LIFETIME_STATS = {
     "successful_purchases": 0,
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS outfit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_outfit_events_type_time
     ON outfit_events (event_type, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_outfit_events_occurred_at
+    ON outfit_events (occurred_at);
 CREATE TABLE IF NOT EXISTS daily_coverage (
     day TEXT PRIMARY KEY,
     scans INTEGER NOT NULL DEFAULT 0

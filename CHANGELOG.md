@@ -6,6 +6,43 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.4.1-beta - 2026-08-29
+
+### Added
+
+- Added an optional, default-off Persistent PA Browser that reuses one visible Chrome context between Pearl Abyss session refreshes. Between auth cycles it returns to a themed local status page that shows non-sensitive cookie-capture and server-validation state and can remain minimized.
+- Added an App Settings action to reopen a manually closed persistent PA browser without triggering authentication or a marketplace session check. Background recovery does not unexpectedly relaunch a worker the user closed.
+- Added developer-only selective marketplace-session expiry and PA cold-login controls that exercise the production recovery path while preserving the appropriate consent, profile, and credential state.
+
+### Changed
+
+- Pearl Abyss saved credentials now submit by pressing Enter on the document-bound password field instead of locating and clicking a login button. Retry bookkeeping remains bounded and follows observed login requests across slow navigation.
+- Purchase batches now retire only the affected item after a placed, duplicate, or unavailable pre-order, preserving request pacing while allowing unrelated detected outfits to continue.
+- Periodic UI refreshes now use in-memory credential and lifetime snapshots. Browser-profile measurements and Stats trend queries run in worker threads with cache invalidation and stale-result protection.
+- Settings schema is now `12` for the optional persistent PA browser preference.
+
+### Fixed
+
+- Restricted Pearl Abyss credential autofill to the canonical ASCII HTTPS account origin and current non-OTP login route, with document-bound elements and route/origin rechecks preventing stale navigation state from retargeting secret-bearing actions.
+- Made monitor and login-method stops cooperative around purchases: an in-flight request finishes and is recorded, inter-buy delays wake immediately, and no remaining attempt or wrong-mode recovery starts afterward.
+- Scoped session validation and browser refresh results to their authentication generation and starting account mode so late results cannot restore cleared cookies or stale login state after an account or login-method change.
+- Recorded partial Steam purchase successes without replaying completed attempts, limited purchase authentication recovery to one retry, and treated placed pre-orders as non-replayable marketplace state.
+- Made developer-mode Pearl Abyss expiry fail closed when browser-cookie clearing fails or is canceled, and cleared stale forced-expiry state when authentication context changes.
+- Ensured purchase-in-progress state is cleared when price adjustment or purchase normalization fails.
+
+### Performance
+
+- Added an `occurred_at`-leading SQLite index and an in-place stats schema upgrade so recent 30-day trend queries avoid scanning and sorting the complete outfit-event history.
+
+### Maintenance
+
+- Moved synthetic scenarios, simulated purchases, forced session expiry, the single-item probe, and their UI into separately composed developer-tools modules. Live startup now injects only neutral runtime, session-recovery, and purchase-execution services.
+- Added bounded cleanup, listener/task ownership, cookie/cache coordination, and retained teardown recovery for the persistent PA browser worker.
+
+### Tests
+
+- Added and expanded coverage for retained-browser lifecycle and cleanup, canonical-origin credential safety, Enter submission and retries, auth-generation races, cooperative purchase stopping, partial recovery accounting, pre-order continuation, developer-runtime separation, nonblocking UI snapshots, and the Stats index migration/query plan.
+
 ## 1.4.0-beta - 2026-08-27
 
 ### Added

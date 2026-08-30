@@ -1,13 +1,6 @@
-"""Test-mode marketplace probes.
+"""Data and response parsing for opt-in developer scenarios."""
 
-This module is intentionally separate from the production API handler. The
-Seleth Longsword path exists to validate the monitor and buy pipeline against a
-small live listing before switching the same architecture back to outfit rows.
-"""
-
-import requests
-
-from bdo_marketplace_tools.market.api_handler import PUBLIC_MARKET_HEADERS, MarketplaceResponseError
+from bdo_marketplace_tools.market.api_handler import MarketplaceResponseError
 
 
 SINGLE_ITEM_TEST_TARGET = {
@@ -30,38 +23,51 @@ LIVE_BUY_ERROR_TEST_TARGET = {
     "max_buy_price": "2900000000",
 }
 
+DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
+DEBUG_MULTI_OUTFIT_INITIAL_LISTING = [["debug-premium-outfit-a", "2", "2020000000"]]
+DEBUG_MULTI_OUTFIT_JOINED_LISTING = [
+    ["debug-premium-outfit-a", "2", "2020000000"],
+    ["debug-premium-outfit-b", "1", "2020000000"],
+]
+DEBUG_BUNDLED_OUTFIT_LISTING = [["debug-premium-outfit", "8", "2020000000"]]
+DEBUG_BUNDLED_PURCHASE_TICK_SECONDS = 5.0
+SIMULATED_SESSION_EMAIL = "test-session@example.local"
+
 
 def live_buy_error_test_listing(target=None):
     target = target or LIVE_BUY_ERROR_TEST_TARGET
     return [[target["main_key"], target["stock"], target["max_buy_price"]]]
 
 
-async def check_single_item_stock(api_handler, target=None):
-    target = target or SINGLE_ITEM_TEST_TARGET
-    context = f"{target['name']} public single-item stock check"
-    url = f"{api_handler._trade_url()}/Trademarket/GetWorldMarketSubList"
-    payload = {
-        "keyType": int(target.get("key_type", 0)),
-        "mainKey": int(target["main_key"]),
+def simulated_purchase_summary(buy_list, label="Test-mode purchase simulated"):
+    purchase_records = [
+        {
+            "item_id": item_id,
+            "price": int(price),
+            "count": int(stock),
+            "result_code": 0,
+        }
+        for item_id, stock, price in buy_list
+    ]
+    purchased_count = sum(record["count"] for record in purchase_records)
+    return {
+        "purchase_records": purchase_records,
+        "events": [
+            {
+                "level": "success",
+                "message": f"{label} for {purchased_count} outfit.",
+            }
+        ],
     }
-
-    response = await api_handler._request(
-        requests,
-        "POST",
-        url,
-        context,
-        json=payload,
-        headers=dict(PUBLIC_MARKET_HEADERS),
-    )
-    response_json = api_handler._json_response(response, context)
-    return parse_single_item_stock_response(response_json, target, context)
 
 
 def parse_single_item_stock_response(response_json, target, context):
     try:
         result_code = int(response_json["resultCode"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise MarketplaceResponseError(f"{context} response did not include a valid resultCode") from exc
+        raise MarketplaceResponseError(
+            f"{context} response did not include a valid resultCode"
+        ) from exc
 
     if result_code != 0:
         result_msg = response_json.get("resultMsg") or f"resultCode {result_code}"
@@ -100,17 +106,23 @@ def parse_single_item_stock_response(response_json, target, context):
         try:
             stock_count = int(parts[4])
         except (TypeError, ValueError) as exc:
-            raise MarketplaceResponseError(f"{context} target row had an invalid stock count") from exc
+            raise MarketplaceResponseError(
+                f"{context} target row had an invalid stock count"
+            ) from exc
 
         max_price = target["max_buy_price"]
         try:
             int(max_price)
         except (TypeError, ValueError) as exc:
-            raise MarketplaceResponseError(f"{context} target configuration had an invalid max buy price") from exc
+            raise MarketplaceResponseError(
+                f"{context} target configuration had an invalid max buy price"
+            ) from exc
 
         if stock_count <= 0:
             return []
 
         return [[target["main_key"], str(stock_count), max_price]]
 
-    raise MarketplaceResponseError(f"{context} response did not include the target enhancement row")
+    raise MarketplaceResponseError(
+        f"{context} response did not include the target enhancement row"
+    )
